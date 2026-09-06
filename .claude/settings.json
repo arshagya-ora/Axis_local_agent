@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python _manual_workflows.py)",
+      "Read(//tmp/**)",
+      "Bash(cd \"/d/Products/AXIS/Axis-phase-3/axis-agent\" && sed -n '1,80p' /tmp/workflow_out2.txt)",
+      "Bash(cd \"/d/Products/AXIS/Axis-phase-3/axis-agent\" && grep -n \"Workflow 2\" /tmp/workflow_out2.txt)",
+      "Bash(python -c \"import pydantic_ai; print\\(pydantic_ai.__file__\\)\")",
+      "Bash(pip show *)",
+      "Bash(uv run *)",
+      "Bash(uv run python -c ' *)",
+      "Bash(kill 877)",
+      "Bash(curl -s -o /dev/null -w \"post-kill check -> %{http_code}\\\\n\" http://127.0.0.1:8991/)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //PID 38340 //F)",
+      "Bash(curl -s -m 2 -o /dev/null -w \"post-kill check -> %{http_code}\\\\n\" http://127.0.0.1:8991/)",
+      "Bash(xargs grep -l \"POC\\\\|End-to-End\\\\|Long-Running\")",
+      "Bash(curl -s http://127.0.0.1:8990/board)",
+      "Bash(curl -s http://127.0.0.1:8990/upload)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(rm -rf /tmp/tmp.xYlkNx0Dhk /tmp/pah_dir.txt; find \"/d/Products/AXIS/Axis-phase-3/.claude/skills\" -maxdepth 1)",
+      "Bash(node --check extension/service-worker.js)",
+      "Bash(node --experimental-vm-modules -e \"import\\('./extension/service-worker.js'\\).catch\\(e=>console.log\\('expected chrome-undefined import error \\(module has top-level chrome deps, this is normal outside extension context\\):', e.message\\)\\)\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(node --check extension/sw/policy.js)",
+      "Bash(echo \"policy.js exit=$?\")"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
+    ]
+  }
+}

@@ -1,0 +1,282 @@
+:root {
+  /* Light Mode Colors */
+  --bg-color: #fbfaf7;
+  --text-color: #1f1f1f;
+  --border-color: #dedbd2;
+  --dt-color: #6b675e;
+  --button-bg: #ffffff;
+  --button-hover: #f1eee8;
+  --button-border: #bdb7aa;
+  
+  --status-connected-border: #6da66d;
+  --status-connected-color: #285f2a;
+  --status-connected-bg: #eaf6ea;
+  
+  --status-disconnected-border: #c98787;
+  --status-disconnected-color: #8a3030;
+  --status-disconnected-bg: #fff0f0;
+  
+  --accent-color: #285f2a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark Mode Colors - sleek slate-grey dark mode */
+    --bg-color: #121214;
+    --text-color: #e3e3e6;
+    --border-color: #2f2f35;
+    --dt-color: #9a98a0;
+    --button-bg: #1e1e22;
+    --button-hover: #2a2a30;
+    --button-border: #44444a;
+    
+    --status-connected-border: #3c7a3c;
+    --status-connected-color: #8ce68f;
+    --status-connected-bg: #132d15;
+    
+    --status-disconnected-border: #8b3c3c;
+    --status-disconnected-color: #ff9e9e;
+    --status-disconnected-bg: #2d1313;
+    
+    --accent-color: #4cd964;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--text-color);
+  background: var(--bg-color);
+  font: 13px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+main {
+  padding: 16px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+h2 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+section {
+  border-top: 1px solid var(--border-color);
+  padding: 14px 0;
+  transition: border-color 0.2s ease;
+}
+
+.status {
+  border: 1px solid;
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  transition: border-color 0.2s ease, color 0.2s ease, background-color 0.2s ease;
+}
+
+.connected {
+  border-color: var(--status-connected-border);
+  color: var(--status-connected-color);
+  background: var(--status-connected-bg);
+}
+
+.disconnected {
+  border-color: var(--status-disconnected-border);
+  color: var(--status-disconnected-color);
+  background: var(--status-disconnected-bg);
+}
+
+dl {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+dl div {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  gap: 8px;
+}
+
+dt {
+  color: var(--dt-color);
+  transition: color 0.2s ease;
+}
+
+dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+button {
+  min-height: 30px;
+  border: 1px solid var(--button-border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  color: var(--text-color);
+  background: var(--button-bg);
+  cursor: pointer;
+  transition: border-color 0.2s ease, color 0.2s ease, background-color 0.2s ease;
+}
+
+button:hover {
+  background: var(--button-hover);
+}
+
+pre {
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--button-bg);
+  white-space: pre-wrap;
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.permission-params {
+  max-height: 80px;
+  margin: 4px 0 0;
+  padding: 4px;
+  font-size: 10px;
+  border-radius: 4px;
+  background: var(--button-hover);
+}
+
+.setting-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.setting-item label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 500;
+}
+
+.setting-item input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--accent-color);
+}
+
+.primary-btn {
+  background: var(--accent-color);
+  color: var(--bg-color);
+  border-color: var(--accent-color);
+  font-weight: 600;
+}
+
+.primary-btn:hover {
+  filter: brightness(0.95);
+  background: var(--accent-color);
+}
+
+.port-settings {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+  border-bottom: 1px dashed var(--border-color);
+  padding-bottom: 12px;
+}
+
+.port-settings label {
+  font-weight: 600;
+  color: var(--text-color);
+}
+
+.port-input-group {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.native-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.port-input-group input[type="number"] {
+  flex: 1;
+  min-height: 30px;
+  border: 1px solid var(--button-border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: var(--text-color);
+  background: var(--button-bg);
+}
+
+.permission-card {
+  border: 1px solid var(--status-disconnected-border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--status-disconnected-bg);
+  margin-bottom: 16px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  transition: all 0.2s ease;
+}
+
+.permission-card h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--status-disconnected-color);
+}
+
+.permission-details {
+  font-size: 12px;
+  line-height: 1.4;
+  margin-bottom: 12px;
+  color: var(--text-color);
+}
+
+.permission-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.permission-actions button {
+  flex: 1;
+  font-size: 11px;
+  min-height: 28px;
+  padding: 2px 6px;
+}
+
+.danger-btn {
+  background: var(--status-disconnected-bg);
+  color: var(--status-disconnected-color);
+  border-color: var(--status-disconnected-border);
+}
+
+.danger-btn:hover {
+  filter: brightness(0.95);
+  background: var(--status-disconnected-bg);
+}

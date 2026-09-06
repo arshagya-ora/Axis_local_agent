@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Recurse -File | Select-Object -ExpandProperty FullName | ForEach-Object { $_.Replace\\(\\(Get-Location\\).Path + '\\\\', ''\\) })",
+      "Read(//d/Products/AXIS/Axis-phase-II/chrome-extension/src/background/agent/prompts/templates/**)",
+      "Read(//d/Products/AXIS/Axis-phase-II/chrome-extension/src/background/agent/prompts/**)",
+      "Read(//d/Products/AXIS/Axis-phase-II/chrome-extension/src/background/agent/messages/**)",
+      "Read(//d/Products/AXIS/Axis-phase-II/chrome-extension/src/background/agent/actions/**)",
+      "Bash(grep -n \"class Message\\\\b\" -A5 \"/c/Users/Arshagya Shrivastava/Downloads/browser-agent-bridge-main/oracle-axis/oracle_axis/llm/providers.py\")",
+      "Read(//c/Users/Arshagya Shrivastava/Downloads/browser-agent-bridge-main/oracle-axis/oracle_axis/llm/**)",
+      "Bash(python _smoke_test_vision.py)",
+      "Read(//c/Users/Arshagya Shrivastava/Downloads/browser-agent-bridge-main/oracle-axis/oracle_axis/bridge/actions/**)",
+      "Read(//c/Users/Arshagya Shrivastava/Downloads/browser-agent-bridge-main/oracle-axis/oracle_axis/agent/**)",
+      "Read(//c/Users/Arshagya Shrivastava/Downloads/browser-agent-bridge-main/oracle-axis/**)",
+      "Bash(python3 -c \"import pydantic, openai\")",
+      "Bash(pip show *)",
+      "Bash(python3 -c ' *)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Arshagya Shrivastava\\Downloads\\browser-agent-bridge-main\\oracle-axis\\config",
+      "C:\\Users\\Arshagya Shrivastava\\Downloads\\browser-agent-bridge-main\\oracle-axis\\oracle_axis\\llm",
+      "C:\\Users\\Arshagya Shrivastava\\Downloads\\browser-agent-bridge-main\\oracle-axis\\oracle_axis\\bridge",
+      "C:\\Users\\Arshagya Shrivastava\\Downloads\\browser-agent-bridge-main\\oracle-axis\\oracle_axis\\agent",
+      "C:\\Users\\Arshagya Shrivastava\\Downloads\\browser-agent-bridge-main\\oracle-axis",
+      "C:\\Users\\Arshagya Shrivastava\\Downloads\\browser-agent-bridge-main\\oracle-axis\\oracle_axis\\bridge\\actions"
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+This is the approved sample file for the Axis browsing-agent POC validation.
+
+It is a plain, harmless text file — safe to upload to the local test-fixture
+application's /upload page. It contains no real data, credentials, or
+personal information.

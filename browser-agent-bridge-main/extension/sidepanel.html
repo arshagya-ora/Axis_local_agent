@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Browser Agent Bridge</title>
+    <link rel="stylesheet" href="sidepanel.css">
+  </head>
+  <body>
+    <!-- Main Content Screen -->
+    <main id="main-content">
+      <!-- Permission Approval Card -->
+      <div id="permission-card" style="display: none;" class="permission-card">
+        <h3>⚠️ Authorization Request</h3>
+        <div id="permission-details" class="permission-details"></div>
+        <div class="permission-actions">
+          <button id="perm-allow-btn" class="primary-btn">Allow</button>
+          <button id="perm-session-allow-btn">Always</button>
+          <button id="perm-deny-btn" class="danger-btn">Deny</button>
+        </div>
+      </div>
+
+      <header>
+        <h1>Browser Agent Bridge</h1>
+        <span id="status" class="status disconnected">Disconnected</span>
+      </header>
+
+      <section>
+        <h2>Native Host</h2>
+        <dl>
+          <div>
+            <dt>Host</dt>
+            <dd id="host-name">-</dd>
+          </div>
+          <div>
+            <dt>Last checked</dt>
+            <dd id="last-checked">-</dd>
+          </div>
+          <div>
+            <dt>Error</dt>
+            <dd id="error">-</dd>
+          </div>
+        </dl>
+        <div class="native-actions">
+          <button id="bridge-toggle-btn" class="primary-btn">Start Bridge</button>
+          <button id="refresh">Refresh</button>
+        </div>
+      </section>
+      <section>
+        <h2>Settings</h2>
+        <!-- Port Setting (At the top) -->
+        <div class="setting-item port-settings">
+          <label for="bridge-port">Bridge Port:</label>
+          <div class="port-input-group">
+            <input type="number" id="bridge-port" min="1024" max="65535" value="8765">
+            <button id="save-port-btn">Save & Restart</button>
+          </div>
+        </div>
+
+        <!-- Bypass CSP -->
+        <div class="setting-item">
+          <label>
+            <input type="checkbox" id="bypass-csp">
+            Allow temporary CSP bypass for target site
+          </label>
+        </div>
+
+        <!-- Enable Runtime Approval -->
+        <div class="setting-item">
+          <label>
+            <input type="checkbox" id="enable-runtime-approval" checked>
+            Enable Runtime Approval
+          </label>
+        </div>
+
+      </section>
+    </main>
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>
