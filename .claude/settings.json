@@ -25,7 +25,15 @@
       "Bash(node --experimental-vm-modules -e \"import\\('./extension/service-worker.js'\\).catch\\(e=>console.log\\('expected chrome-undefined import error \\(module has top-level chrome deps, this is normal outside extension context\\):', e.message\\)\\)\")",
       "Bash(echo \"exit=$?\")",
       "Bash(node --check extension/sw/policy.js)",
-      "Bash(echo \"policy.js exit=$?\")"
+      "Bash(echo \"policy.js exit=$?\")",
+      "Bash(grep -E \"^\\\\[.*\\\\]\" ~/.oci/config)",
+      "Read(//c/Users/Arshagya Shrivastava/.oci/**)",
+      "Bash(python scripts/browser_contract.py --update)",
+      "Bash(python scripts/browser_contract.py --verify)",
+      "Bash(python -c ' *)",
+      "Bash(./.venv/Scripts/python.exe --version)",
+      "Bash(./.venv/Scripts/python.exe \"C:\\\\Users\\\\ARSHAG~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--Products-AXIS-Axis-phase-3\\\\fed208e5-e2c9-463f-85e0-25524744ee17\\\\scratchpad\\\\api_probe.py\")",
+      "Bash(env)"
     ],
     "additionalDirectories": [
       "\\tmp"

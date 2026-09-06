@@ -5,7 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.28.1",
-    "oci-openai>=1.1.0",
-    "pydantic-ai-slim[openai]>=2.40.0",
+    # Pinned for the axis-agent Pydantic AI/OCI POC and Phase 0 compatibility
+    # probe. See axis-agent/PHASE_0_BASELINE.md for the upgrade rule: bumping
+    # any of these requires the browser contract tests to pass and a new
+    # compatibility report to be compared against the previously accepted one.
+    "httpx==0.28.1",
+    "oci-openai==1.1.0",
+    "oci==2.185.1",
+    "openai==3.8.0",
+    "pydantic==2.13.5",
+    "pydantic-ai-slim[openai]==2.40.0",
 ]

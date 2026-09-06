@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Phase 0 compatibility-probe output (generated per run; not a frozen
+# artifact like axis-agent/contracts/browser_tool_contract.json)
+axis-agent/reports/
+
+# Local environment values (see axis-agent/.env.example for the template)
+axis-agent/.env
