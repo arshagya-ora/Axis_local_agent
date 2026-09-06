@@ -36,6 +36,7 @@ EXPECTED_TOOL_NAMES = (
     "browser_assert",
     "browser_capture_evidence",
     "browser_diagnose",
+    "browser_tabs",  # added in Phase 1.2's v2 contract; absent from the frozen v1 file
 )
 
 # Identifiers/selectors the model must never be able to supply directly —
@@ -97,12 +98,21 @@ class _EnvSandbox:
 # ---------------------------------------------------------------------------
 
 class TestSevenToolContract(unittest.TestCase):
-    def test_exactly_seven_tools_exposed(self):
-        self.assertEqual(len(bat.get_tool_definitions()), 7)
+    def test_exactly_eight_tools_exposed(self):
+        # Live code is v2-shaped as of Phase 1.2 (adds browser_tabs). The
+        # frozen v1 file's own seven-tool shape is checked separately below
+        # via its self-consistency hash, not by comparing it to live code.
+        self.assertEqual(len(bat.get_tool_definitions()), 8)
 
     def test_tool_names_unchanged(self):
         names = tuple(tool["function"]["name"] for tool in bat.get_tool_definitions())
         self.assertEqual(names, EXPECTED_TOOL_NAMES)
+
+    def test_frozen_v1_contract_still_has_exactly_seven_tools(self):
+        v1 = browser_contract.load_committed_snapshot("v1")
+        self.assertIsNotNone(v1, "Frozen v1 contract snapshot must still exist")
+        self.assertEqual(v1["toolCount"], 7)
+        self.assertNotIn("browser_tabs", v1["toolNames"])
 
     def test_no_raw_bridge_method_selection_in_schemas(self):
         for tool in bat.get_tool_definitions():

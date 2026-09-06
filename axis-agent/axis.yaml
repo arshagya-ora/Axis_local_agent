@@ -1,0 +1,137 @@
+# Axis Phase 1.2 configuration. Loaded by axis/config.py from the project
+# root by default; set AXIS_CONFIG_PATH to use a different file. Only
+# non-secret settings belong here — credentials/tokens stay in environment
+# variables (see .env.example) and are never read from this file.
+
+browser:
+  # AXIS has whole-browser access by default (see the Browser Agent Bridge's
+  # own unscopedTabAccess policy flag) — this must stay true; Phase 1.2 does
+  # not restore tab-group-only binding.
+  whole_browser_access: true
+  # Which tab bind_axis_run_deps() treats as the initial/informational one.
+  # "focused" = Chrome's currently active tab; not an access restriction —
+  # every other ordinary tab remains reachable via browser_tabs.
+  initial_tab: focused
+  max_open_tabs: 30
+  allow_response_body: false
+  # Recorded for forward-compatibility only: no tool schema in this layer
+  # accepts coordinates, so this has no effect yet (see browser_agent_tools.py).
+  allow_coordinate_fallback: false
+
+  firewall:
+    default: allow
+    allow_urls:
+      - "*"
+      # Explicit, narrow exception: chrome:// pages are blocked below via
+      # deny_schemes as a safe default (they can expose settings, saved
+      # passwords, extension internals, etc.), but the blank new-tab page is
+      # inert and was confirmed fine to use — these two patterns (Chrome
+      # renamed the page between versions) are the only chrome:// URLs this
+      # opens back up. A blanket "*" allow_urls entry never overrides
+      # deny_schemes; only an explicit same-scheme pattern like these does.
+      - "chrome://newtab/*"
+      - "chrome://new-tab-page/*"
+    deny_urls: []
+    deny_schemes:
+      - "chrome"
+      - "chrome-extension"
+      - "devtools"
+      - "javascript"
+    allow_methods:
+      - "*"
+    deny_methods:
+      - "cookies.get"
+      - "page.executeJavaScript"
+      - "policy.set"
+      - "extension.reload"
+
+limits:
+  max_requests: 60
+  max_tool_calls: 120
+  max_total_tokens: 500000
+  max_wall_clock_seconds: 900
+  max_retries: 3
+
+cli:
+  trace: verbose
+  show_model_text: true
+  show_tool_arguments: true
+  show_tool_results: true
+  show_usage: true
+  redact_sensitive_values: true
+
+# Phase 2: Planning, Task Intent, Effects, Guardrails, Approvals. Safe
+# defaults per the Phase 2 default approval policy; invalid values raise a
+# controlled AxisConfigError at startup, never a traceback.
+phase2:
+  planning:
+    enabled: true
+    required_for_mutations: true
+    max_items: 12
+
+  effects:
+    max_effects_per_run: 20
+    max_mutations_per_effect: 10
+
+  approvals:
+    read: allow
+    reversible_local: allow
+    external_effect: require
+    destructive_high_impact: require
+
+  reminders:
+    enabled: true
+    interval_requests: 5
+    max_fires: 4
+
+# Phase 3: durable Temporal-backed job execution. Invalid values raise a
+# controlled AxisConfigError at startup, never a traceback.
+# browser_mutation_max_attempts is fixed at 1: browser mutations are not
+# proven idempotent, so more than one attempt could blindly repeat an
+# ambiguous mutation.
+phase3:
+  temporal:
+    enabled: true
+    target: localhost:7233
+    namespace: default
+    task_queue: axis-agent
+    workflow_execution_timeout_seconds: 86400
+    model_activity_timeout_seconds: 180
+    browser_read_activity_timeout_seconds: 60
+    browser_mutation_activity_timeout_seconds: 120
+
+  retries:
+    model_max_attempts: 3
+    browser_read_max_attempts: 3
+    browser_mutation_max_attempts: 1
+
+  leases:
+    enabled: true
+    conflict_policy: wait
+    acquire_timeout_seconds: 30
+    # Must stay >= 1.25x browser_mutation_activity_timeout_seconds (150s here)
+    # so a lease can never expire mid-mutation; see axis/config.py's
+    # LEASE_SAFETY_MARGIN_RATIO cross-field validation.
+    duration_seconds: 150
+
+  recovery:
+    reconcile_unknown_effects: true
+
+  history:
+    max_run_segments: 100
+
+# Phase 4: the PySide6/QML desktop control surface's own presentation
+# settings only. It reuses phase3.temporal for the Temporal endpoint,
+# namespace and task queue, and browser/phase2 for every safety policy —
+# nothing here ever weakens scope, firewall, risk, approval, leases,
+# fencing, retries, acceptance, or version compatibility.
+phase4:
+  desktop:
+    enabled: true
+    poll_interval_ms: 750
+    reconnect_initial_delay_ms: 500
+    reconnect_max_delay_ms: 10000
+    max_timeline_items: 300
+    max_session_jobs: 20
+    theme: system
+    animations_enabled: true

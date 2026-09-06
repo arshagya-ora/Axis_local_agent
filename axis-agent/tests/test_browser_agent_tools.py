@@ -97,12 +97,15 @@ def observe_compact(tools, client, session_id, **overrides):
 # ---------------------------------------------------------------------------
 
 class TestToolRegistry(unittest.TestCase):
-    def test_exactly_seven_tools_exported(self):
+    def test_exactly_eight_tools_exported(self):
+        # v2 contract (Phase 1.2): the original seven semantic tools plus
+        # browser_tabs. v1's frozen 7-tool snapshot is checked separately
+        # (see tests/test_phase0_baseline.py) as a historical artifact.
         names = [t["function"]["name"] for t in bat.get_tool_definitions()]
-        self.assertEqual(len(names), 7)
+        self.assertEqual(len(names), 8)
         self.assertEqual(sorted(names), sorted([
             "browser_observe", "browser_act", "browser_navigate", "browser_wait",
-            "browser_assert", "browser_capture_evidence", "browser_diagnose",
+            "browser_assert", "browser_capture_evidence", "browser_diagnose", "browser_tabs",
         ]))
 
     def test_definitions_are_function_tool_shaped_with_no_duplicates(self):
@@ -117,12 +120,16 @@ class TestToolRegistry(unittest.TestCase):
             self.assertIn("parameters", fn)
 
     def test_schemas_use_additional_properties_false_and_required_session_id(self):
+        # browser_tabs is the one exception: 'list'/'create' don't need an
+        # existing handle, so browserSessionId is optional (required only
+        # for 'activate'/'close', checked at the argument level instead).
         for definition in bat.get_tool_definitions():
             params = definition["function"]["parameters"]
             self.assertEqual(params["type"], "object")
             self.assertIs(params["additionalProperties"], False)
             self.assertIn("browserSessionId", params["properties"])
-            self.assertIn("browserSessionId", params["required"])
+            if definition["function"]["name"] != "browser_tabs":
+                self.assertIn("browserSessionId", params["required"])
 
     def test_descriptions_cover_all_required_sections(self):
         required_sections = [
@@ -130,9 +137,16 @@ class TestToolRegistry(unittest.TestCase):
             "Required sequencing:", "Important limitations:", "Expected result:",
             "Recommended next step:",
         ]
+        # browser_tabs uses its own section labels, per its design brief.
+        browser_tabs_sections = [
+            "Purpose:", "When to use:", "When not to use:", "Capabilities:",
+            "Required workflow:", "Limitations:", "Expected result:",
+            "Common errors:", "Recommended next step:",
+        ]
         for definition in bat.get_tool_definitions():
             description = definition["function"]["description"]
-            for section in required_sections:
+            sections = browser_tabs_sections if definition["function"]["name"] == "browser_tabs" else required_sections
+            for section in sections:
                 self.assertIn(section, description, f"{definition['function']['name']} missing {section!r}")
 
     def test_property_descriptions_present(self):
@@ -187,12 +201,12 @@ class TestToolRegistry(unittest.TestCase):
         ]:
             self.assertIn(phrase, instructions, f"missing guidance: {phrase!r}")
 
-    def test_get_tool_handlers_maps_all_seven(self):
+    def test_get_tool_handlers_maps_all_eight(self):
         tools, _client, _sid = bind_tools()
         handlers = bat.get_tool_handlers(tools)
         self.assertEqual(sorted(handlers), sorted([
             "browser_observe", "browser_act", "browser_navigate", "browser_wait",
-            "browser_assert", "browser_capture_evidence", "browser_diagnose",
+            "browser_assert", "browser_capture_evidence", "browser_diagnose", "browser_tabs",
         ]))
         for name, fn in handlers.items():
             self.assertEqual(fn.__name__, name)
@@ -299,8 +313,11 @@ class TestForbiddenMethodProtection(unittest.TestCase):
 class TestSessionBinding(unittest.TestCase):
     def test_bind_active_managed_tab_success_hides_raw_tab_id_from_tools(self):
         tools, _client, session_id = bind_tools()
-        self.assertTrue(session_id.startswith("bs-"))
-        record = tools.browser_sessions[session_id]
+        # Opaque handle minting is now unified with the tab registry
+        # (browser_tabs uses the same _register_tab path), so every handle
+        # uses the "tab-" prefix regardless of which entry point minted it.
+        self.assertTrue(session_id.startswith("tab-"))
+        record = tools.tab_registry[session_id]
         self.assertEqual(record["tabId"], 456)
         self.assertEqual(record["bridgeSessionId"], "bridge-session-1")
         # Tool schemas never accept tabId/bridgeSessionId as input.
@@ -309,26 +326,56 @@ class TestSessionBinding(unittest.TestCase):
             self.assertNotIn("bridgeSessionId", definition["function"]["parameters"]["properties"])
 
     def test_bind_active_managed_tab_calls_tabs_list_with_focus_query(self):
-        # Regression test: binding must ask the bridge which tab is actually
-        # focused (active tab of the last-focused window), not just proxy
-        # "most recently updated managed session".
-        client = make_client(rpc_side_effect=default_bind_rpc)
+        # Regression test (strict/tab-group-isolation mode — the fast-path
+        # unscoped tabs.list is rejected here, as it would be by a bridge
+        # with unscopedTabAccess explicitly turned off): binding must ask
+        # the bridge which tab is actually focused (active tab of the
+        # last-focused window), not just proxy "most recently updated
+        # managed session".
+        def rpc(method, params=None, **_):
+            if method == "tabs.list" and "groupId" not in (params or {}).get("query", {}):
+                raise BrowserBridgeError("Access denied: tabs.list requires query.groupId for an Agent-managed tab group")
+            return default_bind_rpc(method, params)
+
+        client = make_client(rpc_side_effect=rpc)
         tools = bat.BrowserAgentTools(client)
         result = tools.bind_active_managed_tab()
         self.assertTrue(result["ok"], result)
 
         tabs_list_calls = [c for c in client.rpc.call_args_list if c[0][0] == "tabs.list"]
-        self.assertEqual(len(tabs_list_calls), 1)
-        query = tabs_list_calls[0][0][1]["query"]
+        self.assertEqual(len(tabs_list_calls), 2)  # rejected unscoped attempt + the groupId-scoped one
+        query = tabs_list_calls[-1][0][1]["query"]
         self.assertEqual(query["groupId"], 5)
         self.assertIs(query["active"], True)
         self.assertIs(query["lastFocusedWindow"], True)
+
+    def test_bind_active_managed_tab_uses_the_whole_browser_fast_path_by_default(self):
+        # The bridge's default (unscopedTabAccess: true) lets tabs.list be
+        # queried directly for the focused tab with no groupId — binding
+        # should use that in one round trip and never even call
+        # session.list/session.get.
+        def rpc(method, params=None, **_):
+            if method == "tabs.list":
+                query = (params or {}).get("query", {})
+                if query.get("active") is True and query.get("lastFocusedWindow") is True and "groupId" not in query:
+                    return {"tabs": [{"id": 42, "windowId": 1, "url": "https://unmanaged.example/"}]}
+                raise AssertionError(f"unexpected tabs.list query: {query}")
+            raise AssertionError(f"unexpected rpc call in fast-path bind: {method}")
+
+        client = make_client(rpc_side_effect=rpc)
+        tools = bat.BrowserAgentTools(client)
+        result = tools.bind_active_managed_tab()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"]["url"], "https://unmanaged.example/")
+        record = tools.tab_registry[result["browserSessionId"]]
+        self.assertEqual(record["tabId"], 42)
+        self.assertEqual(client.rpc.call_count, 1)
 
     def test_bind_active_managed_tab_returns_only_public_fields(self):
         # bind_active_managed_tab() itself must not hand tabId/windowId/
         # groupId/bridgeSessionId back to the caller — only browserSessionId
         # and the public url. The full record still lives in
-        # self.browser_sessions for internal use.
+        # self.tab_registry for internal use.
         client = make_client(rpc_side_effect=default_bind_rpc)
         tools = bat.BrowserAgentTools(client)
         result = tools.bind_active_managed_tab()
@@ -360,8 +407,11 @@ class TestSessionBinding(unittest.TestCase):
             if method == "session.get":
                 return session_details[params["sessionId"]]
             if method == "tabs.list":
-                group_id = params["query"]["groupId"]
-                if group_id == 20:
+                query = params["query"]
+                if "groupId" not in query:
+                    # Strict mode: the fast-path unscoped query is rejected.
+                    raise BrowserBridgeError("Access denied: tabs.list requires query.groupId for an Agent-managed tab group")
+                if query["groupId"] == 20:
                     return {"tabs": [{"id": 900, "windowId": 2, "groupId": 20, "url": "https://focused.example/"}]}
                 return {"tabs": []}
             raise AssertionError(method)
@@ -370,7 +420,7 @@ class TestSessionBinding(unittest.TestCase):
         tools = bat.BrowserAgentTools(client)
         result = tools.bind_active_managed_tab()
         self.assertTrue(result["ok"], result)
-        record = tools.browser_sessions[result["browserSessionId"]]
+        record = tools.tab_registry[result["browserSessionId"]]
         self.assertEqual(record["tabId"], 900)
         self.assertEqual(record["bridgeSessionId"], "session-b")
         self.assertEqual(result["data"]["url"], "https://focused.example/")
@@ -395,7 +445,7 @@ class TestSessionBinding(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], bat.NO_MANAGED_TAB)
         self.assertTrue(result["error"]["retryable"])
-        self.assertEqual(tools.browser_sessions, {})
+        self.assertEqual(tools.tab_registry, {})
 
     def test_bind_active_managed_tab_never_falls_back_to_main_tab_id(self):
         # Even though session.get reports a mainTabId, if tabs.list does not
@@ -429,6 +479,8 @@ class TestSessionBinding(unittest.TestCase):
         # tabs.list's groupId-scoped focus query, so it is skipped rather
         # than guessed at.
         def rpc(method, params=None, **_):
+            if method == "tabs.list" and "groupId" not in (params or {}).get("query", {}):
+                raise BrowserBridgeError("Access denied: tabs.list requires query.groupId for an Agent-managed tab group")
             if method == "session.list":
                 return {"sessions": [{"id": "tabbed-session", "tabIds": [1]}]}
             if method == "session.get":
@@ -448,12 +500,12 @@ class TestSessionBinding(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], bat.BRIDGE_UNAVAILABLE)
 
-    def test_tool_call_without_binding_returns_session_not_found(self):
+    def test_tool_call_without_binding_returns_tab_not_found(self):
         client = make_client()
         tools = bat.BrowserAgentTools(client)
         result = tools.browser_observe({"browserSessionId": "bs-does-not-exist"})
         self.assertFalse(result["ok"])
-        self.assertEqual(result["error"]["code"], bat.SESSION_NOT_FOUND)
+        self.assertEqual(result["error"]["code"], bat.TAB_NOT_FOUND)
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +881,7 @@ class TestBrowserAct(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["data"]["observationInvalidated"])
         self.assertTrue(tools.observations[data["observationId"]]["stale"])
-        self.assertEqual(tools.browser_sessions[session_id]["url"], "https://application.example.com/after")
+        self.assertEqual(tools.tab_registry[session_id]["url"], "https://application.example.com/after")
 
     def test_whatchanged_without_url_change_does_not_invalidate(self):
         tools, client, session_id = bind_tools()
@@ -983,7 +1035,7 @@ class TestBrowserWait(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["data"]["observationsInvalidated"])
         self.assertTrue(tools.observations[data["observationId"]]["stale"])
-        self.assertEqual(tools.browser_sessions[session_id]["url"], "https://application.example.com/next")
+        self.assertEqual(tools.tab_registry[session_id]["url"], "https://application.example.com/next")
 
     def test_url_condition_wait_invalidates_observations(self):
         tools, client, session_id = bind_tools()
@@ -1396,18 +1448,21 @@ class TestBrowserDiagnose(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestScopeProvider(unittest.TestCase):
-    def test_managed_tab_group_provider_allows_bound_session(self):
-        provider = bat.ManagedTabGroupScopeProvider()
-        decision = provider.authorize({
-            "browserSessionId": "bs-1", "bridgeSessionId": "bridge-1", "tabId": 5,
-        })
+    def test_whole_browser_provider_allows_a_registered_tab(self):
+        provider = bat.WholeBrowserScopeProvider()
+        decision = provider.authorize({"browserSessionId": "tab-1", "tabId": 5})
         self.assertTrue(decision.allowed)
-        self.assertEqual(decision.policy_id, "managed-tab-group")
+        self.assertEqual(decision.policy_id, "whole-browser")
 
-    def test_managed_tab_group_provider_denies_incomplete_context(self):
-        provider = bat.ManagedTabGroupScopeProvider()
-        decision = provider.authorize({"browserSessionId": None, "bridgeSessionId": None, "tabId": None})
+    def test_whole_browser_provider_denies_incomplete_context(self):
+        provider = bat.WholeBrowserScopeProvider()
+        decision = provider.authorize({"browserSessionId": None, "tabId": None})
         self.assertFalse(decision.allowed)
+
+    def test_managed_tab_group_scope_provider_is_a_compatibility_alias(self):
+        # Old imports referencing the tab-group-only name still work, and
+        # behave exactly like WholeBrowserScopeProvider now.
+        self.assertIs(bat.ManagedTabGroupScopeProvider, bat.WholeBrowserScopeProvider)
 
     def test_external_firewall_provider_is_unimplemented(self):
         provider = bat.ExternalFirewallScopeProvider()

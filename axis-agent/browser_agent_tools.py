@@ -2,7 +2,7 @@
 
 Wraps the Browser Agent Bridge's ~150-method JSON-RPC surface (see
 ``browser-agent-bridge-main/extension/service-worker.js``, the authoritative
-method registry) behind seven bounded, LLM-facing semantic tools:
+method registry) behind eight bounded, LLM-facing semantic tools:
 
     browser_observe          (browser.observe)
     browser_act               (browser.act)
@@ -38,7 +38,7 @@ tab group (see ``extension/sw/tab-scope.js`` and ``sessions.js``). This module
 adds an Axis Agent-side layer on top of that boundary: it never lets the LLM
 choose a raw method or tab, and it runs every call through a replaceable
 :class:`ScopeProvider` so a future external firewall can be substituted
-without changing the seven public tools.
+without changing the eight public tools.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ import json
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from browser_bridge_client import BrowserBridgeClient, BrowserBridgeError
@@ -76,9 +77,12 @@ REDACTED = "<redacted>"
 # evaluated and is false" from "the tool call itself failed".
 INVALID_ARGUMENT = "INVALID_ARGUMENT"
 UNKNOWN_TOOL = "UNKNOWN_TOOL"
-SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
+SESSION_NOT_FOUND = "SESSION_NOT_FOUND"  # deprecated alias of TAB_NOT_FOUND; kept for import compatibility
+TAB_NOT_FOUND = "TAB_NOT_FOUND"
+TAB_CLOSED = "TAB_CLOSED"
 NO_MANAGED_TAB = "NO_MANAGED_TAB"
 SCOPE_DENIED = "SCOPE_DENIED"
+FIREWALL_DENIED = "FIREWALL_DENIED"
 STALE_OBSERVATION = "STALE_OBSERVATION"
 REF_NOT_FOUND = "REF_NOT_FOUND"
 BRIDGE_UNAVAILABLE = "BRIDGE_UNAVAILABLE"
@@ -97,7 +101,7 @@ _SENSITIVE_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Methods the seven semantic tools must NEVER be able to route to, even if a
+# Methods the eight semantic tools must NEVER be able to route to, even if a
 # future mapping bug asked for one of them. Checked defensively before every
 # RPC in addition to the per-tool bridge-method mapping tables below.
 FORBIDDEN_METHODS = frozenset({
@@ -120,14 +124,12 @@ FORBIDDEN_METHODS = frozenset({
     "network.interceptors.clearEvents",
     "session.stop",
     "session.start",
-    "tabs.close",
-    "tabs.create",
 })
 
 # The only bridge methods this module ever calls. Cross-checked against the
 # per-tool mapping tables in a test to catch drift between the two.
 _ALLOWED_METHODS = frozenset({
-    "tabs.list", "session.list", "session.get",
+    "tabs.list", "tabs.create", "tabs.activate", "tabs.close", "session.list", "session.get",
     "page.accessibilityTree", "page.ariaSnapshot", "page.readText",
     "locator.clickRef", "locator.fillRef", "locator.pressRef", "locator.hoverRef",
     "locator.selectOptionRef", "locator.click", "locator.fill", "locator.press",
@@ -154,6 +156,63 @@ _ALLOWED_METHODS = frozenset({
 # save_data_url() helper instead), so _assert_method_allowed() never sees
 # them — _save_data_url() checks this allowlist explicitly for that reason.
 _ALLOWED_NATIVE_METHODS = frozenset({"native.saveDataUrl"})
+
+# Placeholder bridgeSessionId recorded by bind_active_managed_tab()'s
+# whole-browser fast path, where there is no genuine bridge-tracked session
+# behind the bound tab. Never sent in any RPC — the only thing that reads
+# it is ManagedTabGroupScopeProvider.authorize()'s own "is some session
+# bound at all" truthiness check.
+_UNSCOPED_BRIDGE_SESSION_MARKER = "unscoped"
+
+
+# =====================================================================
+# Firewall (URL/method allow-deny), configured by axis/config.py from
+# axis.yaml. Independent of the Browser Agent Bridge's own policy.js —
+# this is Axis Agent's own layer, applied before every RPC in
+# BrowserAgentTools._call_bridge, and never makes a network call itself.
+# =====================================================================
+
+@dataclass(frozen=True)
+class FirewallConfig:
+    """URL/method allow-deny policy. Deny rules always override allow rules
+    — a target matching both a deny and an allow pattern is denied. When
+    nothing matches either list, ``default`` decides."""
+
+    default: str = "allow"  # "allow" or "deny"
+    allow_urls: Tuple[str, ...] = ("*",)
+    deny_urls: Tuple[str, ...] = ()
+    deny_schemes: Tuple[str, ...] = ("chrome", "chrome-extension", "devtools", "javascript")
+    allow_methods: Tuple[str, ...] = ("*",)
+    deny_methods: Tuple[str, ...] = ()
+
+
+def _wildcard_to_regex(pattern: str) -> "re.Pattern[str]":
+    escaped = re.escape(pattern).replace(r"\*", ".*")
+    return re.compile(f"^{escaped}$", re.IGNORECASE)
+
+
+def _matches_any(value: str, patterns: Tuple[str, ...]) -> bool:
+    return any(_wildcard_to_regex(p).match(value) for p in patterns if p)
+
+
+def _url_scheme(url: str) -> str:
+    match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):", url or "")
+    return match.group(1).lower() if match else ""
+
+
+def _scheme_explicitly_allowed(url: str, scheme: str, allow_urls: Tuple[str, ...]) -> bool:
+    """A scheme in ``deny_schemes`` (e.g. "chrome") is a blunt default-deny
+    meant to stay closed even under a blanket ``allow_urls: ["*"]`` — the
+    catch-all "*" pattern never counts as an exception here. It opens back up
+    only for a URL matched by an explicit, same-scheme allow_urls pattern
+    (e.g. "chrome://newtab/*"), which an operator must add deliberately.
+    deny_urls/deny_methods are untouched by this and remain absolute."""
+    for pattern in allow_urls:
+        if pattern == "*":
+            continue
+        if _url_scheme(pattern) == scheme and _matches_any(url, (pattern,)):
+            return True
+    return False
 
 
 class BridgeMethodNotAllowedError(RuntimeError):
@@ -558,7 +617,7 @@ BROWSER_OBSERVE_PARAMS: Dict[str, Any] = {
     "properties": {
         "browserSessionId": {
             "type": "string",
-            "description": "Session id from bind_active_managed_tab(); not a Chrome tabId.",
+            "description": "An opaque AXIS tab handle returned by browser_tabs; never a raw Chrome tabId.",
         },
         "mode": {
             "type": "string",
@@ -611,7 +670,7 @@ BROWSER_ACT_PARAMS: Dict[str, Any] = {
     "properties": {
         "browserSessionId": {
             "type": "string",
-            "description": "Session id from bind_active_managed_tab(); not a Chrome tabId.",
+            "description": "An opaque AXIS tab handle returned by browser_tabs; never a raw Chrome tabId.",
         },
         "action": {
             "type": "string",
@@ -696,7 +755,7 @@ BROWSER_NAVIGATE_PARAMS: Dict[str, Any] = {
     "properties": {
         "browserSessionId": {
             "type": "string",
-            "description": "Session id from bind_active_managed_tab(); not a Chrome tabId.",
+            "description": "An opaque AXIS tab handle returned by browser_tabs; never a raw Chrome tabId.",
         },
         "operation": {
             "type": "string",
@@ -744,7 +803,7 @@ BROWSER_WAIT_PARAMS: Dict[str, Any] = {
     "properties": {
         "browserSessionId": {
             "type": "string",
-            "description": "Session id from bind_active_managed_tab(); not a Chrome tabId.",
+            "description": "An opaque AXIS tab handle returned by browser_tabs; never a raw Chrome tabId.",
         },
         "condition": {
             "type": "string",
@@ -810,7 +869,7 @@ BROWSER_ASSERT_PARAMS: Dict[str, Any] = {
     "properties": {
         "browserSessionId": {
             "type": "string",
-            "description": "Session id from bind_active_managed_tab(); not a Chrome tabId.",
+            "description": "An opaque AXIS tab handle returned by browser_tabs; never a raw Chrome tabId.",
         },
         "assertion": {
             "type": "string",
@@ -882,7 +941,7 @@ BROWSER_CAPTURE_EVIDENCE_PARAMS: Dict[str, Any] = {
     "properties": {
         "browserSessionId": {
             "type": "string",
-            "description": "Session id from bind_active_managed_tab(); not a Chrome tabId.",
+            "description": "An opaque AXIS tab handle returned by browser_tabs; never a raw Chrome tabId.",
         },
         "capture": {
             "type": "string",
@@ -942,7 +1001,7 @@ BROWSER_DIAGNOSE_PARAMS: Dict[str, Any] = {
     "properties": {
         "browserSessionId": {
             "type": "string",
-            "description": "Session id from bind_active_managed_tab(); not a Chrome tabId.",
+            "description": "An opaque AXIS tab handle returned by browser_tabs; never a raw Chrome tabId.",
         },
         "diagnostic": {
             "type": "string",
@@ -975,6 +1034,71 @@ BROWSER_DIAGNOSE_PARAMS: Dict[str, Any] = {
 }
 
 
+BROWSER_TABS_DESCRIPTION = (
+    "Purpose: Manage the Chrome tabs available to AXIS and obtain the trusted logical "
+    "browserSessionId handles every other browser tool requires. AXIS has access to every "
+    "ordinary tab the bridge exposes, not just one bound tab.\n\n"
+    "When to use: Discovering what tabs are open; opening a new tab for a task; switching "
+    "which tab is active/focused; closing a tab you created or finished with.\n\n"
+    "When not to use: Reading a tab's content (browser_observe); interacting with page "
+    "elements (browser_act); as a way to run arbitrary navigation (use browser_navigate on "
+    "the resulting handle instead of relying on 'create's url).\n\n"
+    "Capabilities: 'list' refreshes from the bridge and returns every available tab with its "
+    "handle, title, sanitized URL, and active state. 'create' opens a new tab (URL passes the "
+    "configured firewall) and returns its new handle. 'activate' switches Chrome's focus to an "
+    "existing handle. 'close' closes a handle's tab and invalidates only that tab's "
+    "observations.\n\n"
+    "Required workflow: Call 'list' before assuming any specific handle exists; use the exact "
+    "handle a prior 'list'/'create' returned for 'activate'/'close'; observe a tab again after "
+    "activating it before element-targeted actions, since refs are only valid for the tab and "
+    "observation that produced them.\n\n"
+    "Limitations: Never invent a handle or supply a raw Chrome tabId — only handles returned "
+    "by this tool are valid. A fabricated, stale, or already-closed handle returns "
+    "TAB_NOT_FOUND or TAB_CLOSED. The registry tracks a bounded number of tabs at once.\n\n"
+    "Expected result: 'list' returns tabs (each with browserSessionId/title/url/active); "
+    "'create'/'activate' return the affected browserSessionId and activated state; 'close' "
+    "returns the closed handle and, when the bridge reports one, the newly active tab.\n\n"
+    "Common errors: TAB_NOT_FOUND (unknown handle), TAB_CLOSED (handle already closed), "
+    "FIREWALL_DENIED (create's url blocked by policy), INVALID_ARGUMENT (missing "
+    "browserSessionId for activate/close).\n\n"
+    "Recommended next step: browser_observe the tab you just created or activated before "
+    "acting on it."
+)
+
+BROWSER_TABS_PARAMS: Dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Manage Chrome tabs available to AXIS. Use this tool to list, create, activate, or "
+        "close tabs and to obtain trusted logical browserSessionId handles for the other "
+        "browser tools. It never exposes raw Chrome identifiers."
+    ),
+    "properties": {
+        "operation": {
+            "type": "string",
+            "enum": ["list", "create", "activate", "close"],
+            "description": (
+                "Required operation. list returns available tabs and logical handles; create "
+                "opens a new tab; activate switches Chrome focus to an existing logical tab; "
+                "close closes a logical tab."
+            ),
+        },
+        "browserSessionId": {
+            "type": "string",
+            "description": (
+                "Opaque logical tab handle returned by browser_tabs list/create. Required for "
+                "activate and close. Never invent it and never provide a raw Chrome tabId."
+            ),
+        },
+        "url": {
+            "type": "string",
+            "description": "Optional initial URL for create. It must pass the configured firewall. Do not use it for activate or close.",
+        },
+    },
+    "required": ["operation"],
+    "additionalProperties": False,
+}
+
+
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {"type": "function", "function": {"name": "browser_observe", "description": BROWSER_OBSERVE_DESCRIPTION, "parameters": BROWSER_OBSERVE_PARAMS}},
     {"type": "function", "function": {"name": "browser_act", "description": BROWSER_ACT_DESCRIPTION, "parameters": BROWSER_ACT_PARAMS}},
@@ -983,12 +1107,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {"type": "function", "function": {"name": "browser_assert", "description": BROWSER_ASSERT_DESCRIPTION, "parameters": BROWSER_ASSERT_PARAMS}},
     {"type": "function", "function": {"name": "browser_capture_evidence", "description": BROWSER_CAPTURE_EVIDENCE_DESCRIPTION, "parameters": BROWSER_CAPTURE_EVIDENCE_PARAMS}},
     {"type": "function", "function": {"name": "browser_diagnose", "description": BROWSER_DIAGNOSE_DESCRIPTION, "parameters": BROWSER_DIAGNOSE_PARAMS}},
+    {"type": "function", "function": {"name": "browser_tabs", "description": BROWSER_TABS_DESCRIPTION, "parameters": BROWSER_TABS_PARAMS}},
 ]
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Return the seven agent-facing tool definitions in standard
-    function-tool format, ready to hand to an LLM function-calling API.
+    """Return the eight agent-facing tool definitions (contract v2) in
+    standard function-tool format, ready to hand to an LLM function-calling
+    API.
 
     Returns a deep copy of the module-level TOOL_DEFINITIONS so a caller
     that mutates the result (e.g. an SDK that annotates tool dicts in
@@ -1002,7 +1128,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
 #
 # Every public tool authorizes through a ScopeProvider before issuing an RPC.
 # This is the seam a future external firewall plugs into: swap the provider
-# passed to BrowserAgentTools() and none of the seven public tools change.
+# passed to BrowserAgentTools() and none of the eight public tools change.
 
 class ScopeDecision:
     """A scope authorization outcome. Mirrors the JSON shape from the design
@@ -1026,25 +1152,37 @@ class ScopeProvider:
         raise NotImplementedError
 
 
-class ManagedTabGroupScopeProvider(ScopeProvider):
-    """Current default scope provider.
+class WholeBrowserScopeProvider(ScopeProvider):
+    """Current default scope provider, for the whole-browser/multi-tab
+    runtime (see :meth:`BrowserAgentTools.refresh_tabs`).
 
-    Allows an operation once its browserSessionId has been resolved from a
-    verified Agent-managed bridge session/tab (see
-    :meth:`BrowserAgentTools.bind_active_managed_tab`). It performs no
-    additional per-method policy — the Browser Agent Bridge itself is the
-    final enforcement boundary for tab-group isolation (see
-    ``extension/sw/tab-scope.js`` / ``sessions.js``); this provider only
-    confirms Axis Agent has a legitimately bound session before it will even
-    attempt the call.
+    Authorizes an operation once its logical ``browserSessionId`` resolves
+    to a live entry in the trusted tab registry (``self.tab_registry``) —
+    i.e. the handle exists and maps to a real ``tabId``, which
+    :meth:`BrowserAgentTools._require_tab` already re-validates on every
+    call (rejecting fabricated, stale, or closed handles). This provider
+    performs no separate per-method policy of its own: the bridge's own
+    isolation rules (``extension/sw/tab-scope.js`` / ``sessions.js``) and
+    Axis's own URL/method firewall (:class:`FirewallConfig`, checked in
+    :meth:`BrowserAgentTools._call_bridge`) are the actual enforcement —
+    this only confirms Axis Agent has a legitimately registered tab before
+    it will even attempt the call. There is no Agent-managed-tab-group
+    restriction here; AXIS intentionally has access to every ordinary tab
+    the bridge exposes.
     """
 
-    POLICY_ID = "managed-tab-group"
+    POLICY_ID = "whole-browser"
 
     def authorize(self, context: Dict[str, Any]) -> ScopeDecision:
-        if not context.get("browserSessionId") or not context.get("bridgeSessionId") or context.get("tabId") is None:
-            return ScopeDecision(False, "No Agent-managed browser session is bound.", self.POLICY_ID)
+        if not context.get("browserSessionId") or context.get("tabId") is None:
+            return ScopeDecision(False, "No registered browser tab for this handle.", self.POLICY_ID)
         return ScopeDecision(True, None, self.POLICY_ID)
+
+
+# Compatibility alias: code written against the old tab-group-only runtime
+# may still import this name. Its behavior is now WholeBrowserScopeProvider's
+# — there is no more managed-tab-group concept to describe accurately.
+ManagedTabGroupScopeProvider = WholeBrowserScopeProvider
 
 
 class ExternalFirewallScopeProvider(ScopeProvider):
@@ -1053,7 +1191,7 @@ class ExternalFirewallScopeProvider(ScopeProvider):
     Intentionally unimplemented — wiring an external firewall (network
     calls, policy storage, an administration UI) is out of scope for this
     tool layer. Swap this in for ManagedTabGroupScopeProvider once a
-    firewall is available; no change to the seven public tools is required
+    firewall is available; no change to the eight public tools is required
     because every tool already routes its RPC through
     ``BrowserAgentTools.scope_provider.authorize()``.
     """
@@ -1210,9 +1348,12 @@ def _bound_text(text: str, limit: int = MAX_TEXT_CHARS) -> Tuple[str, bool]:
 # =====================================================================
 
 class BrowserAgentTools:
-    """Binds one Agent-managed Chrome tab and exposes the seven semantic
-    browser tools against it. See the module docstring for the overall
-    design and the README for a worked example.
+    """Exposes the eight semantic browser tools (including ``browser_tabs``)
+    against every ordinary Chrome tab the Browser Agent Bridge can see.
+    Maintains its own trusted registry of logical tab handles
+    (``self.tab_registry``) so the model never sees a raw Chrome tabId,
+    windowId, groupId, snapshotId, or bridge session id. See the module
+    docstring for the overall design and the README for a worked example.
     """
 
     def __init__(
@@ -1220,14 +1361,19 @@ class BrowserAgentTools:
         bridge_client: BrowserBridgeClient,
         scope_provider: Optional[ScopeProvider] = None,
         allow_response_body: bool = False,
+        firewall_config: Optional[FirewallConfig] = None,
+        max_open_tabs: int = 30,
     ):
         self.bridge_client = bridge_client
-        self.scope_provider: ScopeProvider = scope_provider or ManagedTabGroupScopeProvider()
+        self.scope_provider: ScopeProvider = scope_provider or WholeBrowserScopeProvider()
         self.allow_response_body = allow_response_body
+        self.firewall_config = firewall_config or FirewallConfig()
+        self.max_open_tabs = max_open_tabs
 
         # Lightweight in-memory state (see class docstring / README —
-        # deliberately not persisted, not a database).
-        self.browser_sessions: Dict[str, Dict[str, Any]] = {}
+        # deliberately not persisted, not a database). Keyed by the opaque
+        # logical handle ("bs-..."/"tab-..."), never a raw Chrome tabId.
+        self.tab_registry: Dict[str, Dict[str, Any]] = {}
         self.observations: Dict[str, Dict[str, Any]] = {}
 
     # -- internal: bridge call safety net --------------------------------
@@ -1258,11 +1404,49 @@ class BrowserAgentTools:
         self._assert_method_allowed(method)
         return self.bridge_client.rpc(method, params)
 
+    def _check_firewall(self, session_id: Optional[str], method: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Applied before every operation (see FirewallConfig). Checks the
+        method name and, when a URL is involved, both an explicit target
+        URL (navigate/create) and the tab currently being acted on's live
+        URL — deny rules win over allow rules; ``default`` decides anything
+        neither list matches. Returns an error envelope, or None to allow."""
+        config = self.firewall_config
+        if _matches_any(method, config.deny_methods):
+            return _err(session_id, FIREWALL_DENIED, f"Method blocked by firewall policy: {method}", False)
+        method_allowed = _matches_any(method, config.allow_methods) or config.default == "allow"
+        if not method_allowed:
+            return _err(session_id, FIREWALL_DENIED, f"Method not permitted by firewall policy: {method}", False)
+
+        candidate_urls = []
+        target_url = params.get("url") if isinstance(params, dict) else None
+        if isinstance(target_url, str) and target_url:
+            candidate_urls.append(target_url)
+        if isinstance(session_id, str):
+            tab = self.tab_registry.get(session_id)
+            if tab and isinstance(tab.get("url"), str) and tab["url"]:
+                candidate_urls.append(tab["url"])
+
+        for url in candidate_urls:
+            scheme = _url_scheme(url)
+            if scheme and _matches_any(scheme, config.deny_schemes) and not _scheme_explicitly_allowed(url, scheme, config.allow_urls):
+                return _err(session_id, FIREWALL_DENIED, f"URL scheme blocked by firewall policy: {scheme}", False)
+            if _matches_any(url, config.deny_urls):
+                return _err(session_id, FIREWALL_DENIED, "URL blocked by firewall policy.", False)
+            url_allowed = _matches_any(url, config.allow_urls) or config.default == "allow"
+            if not url_allowed:
+                return _err(session_id, FIREWALL_DENIED, "URL not permitted by firewall policy.", False)
+        return None
+
     def _call_bridge(
         self, session_id: Optional[str], method: str, params: Dict[str, Any]
     ) -> Tuple[Any, Optional[Dict[str, Any]]]:
         """Run one RPC and translate any failure into the common error
-        envelope. Returns (result, None) on success or (None, error_response)."""
+        envelope. Returns (result, None) on success or (None, error_response).
+        The configured URL/method firewall is checked first, before the RPC
+        allowlist or the bridge is ever touched."""
+        firewall_error = self._check_firewall(session_id, method, params)
+        if firewall_error:
+            return None, firewall_error
         try:
             return self._rpc(method, params), None
         except BridgeMethodNotAllowedError as error:
@@ -1351,39 +1535,64 @@ class BrowserAgentTools:
         )
 
     def bind_active_managed_tab(self) -> Dict[str, Any]:
-        """Find Chrome's actually-focused tab (the active tab of the
-        last-focused window) and, only if it belongs to an Agent-managed
-        bridge session, mint an Axis Agent browserSessionId for it. Must be
-        called (and succeed) before any of the seven tools can be used for a
-        given session. Never falls back to an unmanaged tab, a session's
-        mainTabId, or "the most recently updated session" as a proxy for
-        what the user is actually looking at.
+        """Bind Chrome's actually-focused tab (the active tab of the
+        last-focused window) and mint an Axis Agent browserSessionId for
+        it. Kept for backward compatibility; prefer browser_tabs(list) plus a
+        handle from its result. Must be called (and succeed) before any tool can
+        be used for a given session.
 
-        The bridge's tab-isolation gate (assertRpcTabIsolation in
-        extension/service-worker.js) requires tabs.list's query to already
-        carry a known Agent-managed groupId — there is no unscoped "list
-        every tab" escape hatch, by design. So this cannot first ask Chrome
-        "what tab is focused?" and then check whether it happens to be
-        managed; instead, for each managed session it already knows about
-        (from session.list/session.get), it asks the bridge the narrower,
-        in-bounds question "is *this* group's active tab also the active
-        tab of Chrome's last-focused window?" via:
+        Two paths, tried in order:
 
-            tabs.list({"query": {"groupId": <managed groupId>,
-                                  "active": True, "lastFocusedWindow": True}})
+        1. **Whole-browser fast path** — the bridge's own default
+           (``unscopedTabAccess: true`` in ``extension/sw/policy.js``)
+           grants whole-browser access, so ``tabs.list`` can be queried
+           directly for Chrome's focused tab with no ``groupId`` at all:
 
-        Chrome has exactly one last-focused window and exactly one active
-        tab per window, so at most one managed group can ever satisfy that
-        query at a time — the first (and only) match is Chrome's actual
-        focused tab, confirmed to be Agent-managed, with no ambiguity. A managed
-        session with no numeric groupId (tab-based only) cannot be checked
-        this way and is skipped, since there is no bridge-compliant way to
-        confirm its focus state.
+               tabs.list({"query": {"active": True, "lastFocusedWindow": True}})
+
+           This binds whatever tab the user is actually looking at the
+           moment this is called — it no longer needs to already belong to
+           a bridge-tracked session, since the bridge itself no longer
+           restricts access to one. (There is no genuine bridge session
+           behind this tab, so ``bridgeSessionId`` is recorded as the
+           sentinel ``_UNSCOPED_BRIDGE_SESSION_MARKER`` — that value is
+           never sent in any RPC, it only has to be non-empty for
+           ``ManagedTabGroupScopeProvider``'s own "is a session bound at
+           all" check.)
+        2. **Strict fallback** — only reached if the fast path's unscoped
+           ``tabs.list`` is rejected, i.e. an operator has explicitly
+           restored ``policy.set({"unscopedTabAccess": false})`` and
+           tab-group isolation is enforced again. In that mode
+           ``assertRpcTabIsolation`` (``extension/service-worker.js``)
+           requires ``tabs.list``'s query to already carry a known
+           Agent-managed ``groupId``, so this cannot ask "what tab is
+           focused?" directly; instead, for each managed session already
+           known (``session.list``/``session.get``), it asks the bridge
+           the narrower, in-bounds question "is *this* group's active tab
+           also the active tab of Chrome's last-focused window?" Chrome has
+           exactly one last-focused window and one active tab per window,
+           so at most one managed group can ever satisfy that query at a
+           time. Never falls back to an unmanaged tab, a session's
+           mainTabId, or "the most recently updated session" in this
+           stricter mode — a managed session with no numeric ``groupId``
+           (tab-based only) is skipped, since there is no bridge-compliant
+           way to confirm its focus state either.
 
         Only browserSessionId and the public url are returned in ``data``;
         the internal tabId/windowId/groupId/bridgeSessionId stay in
-        ``self.browser_sessions`` and are never handed back to the caller.
+        ``self.tab_registry`` and are never handed back to the caller.
         """
+        direct, direct_error = self._call_bridge(
+            None, "tabs.list", {"query": {"active": True, "lastFocusedWindow": True}},
+        )
+        if not direct_error:
+            active_tab = self._first_tab_with_id((direct or {}).get("tabs"))
+            if active_tab is not None:
+                return self._mint_browser_session(active_tab, _UNSCOPED_BRIDGE_SESSION_MARKER)
+
+        # Strict fallback: the bridge rejected an unscoped tabs.list, so
+        # tab-group isolation must be enabled. Fall back to matching each
+        # known managed session's group against Chrome's actual focus.
         result, error_response = self._call_bridge(None, "session.list", {})
         if error_response:
             return error_response
@@ -1408,40 +1617,132 @@ class BrowserAgentTools:
             )
             if focus_error:
                 continue
-            focused_tabs = (focused or {}).get("tabs") or []
-            active_tab = next(
-                (t for t in focused_tabs if isinstance(t, dict) and isinstance(t.get("id"), int)), None,
-            )
+            active_tab = self._first_tab_with_id((focused or {}).get("tabs"))
             if active_tab is None:
                 continue  # this managed group is not where Chrome's focus currently is
 
-            browser_session_id = f"bs-{uuid.uuid4().hex[:12]}"
-            record = {
-                "browserSessionId": browser_session_id,
-                "bridgeSessionId": bridge_session_id,
-                "tabId": active_tab["id"],
-                "windowId": active_tab.get("windowId"),
-                "groupId": active_tab.get("groupId", group_id),
-                "url": active_tab.get("url"),
-            }
-            self.browser_sessions[browser_session_id] = record
-            return _ok(browser_session_id, {"browserSessionId": browser_session_id, "url": record["url"]})
+            return self._mint_browser_session(active_tab, bridge_session_id, fallback_group_id=group_id)
 
         return _err(
             None, NO_MANAGED_TAB,
             "The currently focused Chrome tab is not part of an Agent-managed browser session.", True,
         )
 
-    def _require_session(self, session_id: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        if not isinstance(session_id, str) or session_id not in self.browser_sessions:
+    @staticmethod
+    def _first_tab_with_id(tabs: Any) -> Optional[Dict[str, Any]]:
+        return next(
+            (t for t in (tabs or []) if isinstance(t, dict) and isinstance(t.get("id"), int)), None,
+        )
+
+    def _mint_browser_session(
+        self, active_tab: Dict[str, Any], bridge_session_id: str, fallback_group_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        browser_session_id = self._register_tab(active_tab, fallback_group_id=fallback_group_id)
+        record = self.tab_registry[browser_session_id]
+        record["bridgeSessionId"] = bridge_session_id
+        return _ok(browser_session_id, {"browserSessionId": browser_session_id, "url": record["url"]})
+
+    def _require_tab(self, session_id: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if not isinstance(session_id, str) or session_id not in self.tab_registry:
             return None, _err(
                 session_id if isinstance(session_id, str) else None,
-                SESSION_NOT_FOUND,
-                f"No bound browser session found for browserSessionId {session_id!r}. "
-                f"Call bind_active_managed_tab() before using any browser tool.",
+                TAB_NOT_FOUND,
+                f"No known tab for browserSessionId {session_id!r}. Call browser_tabs with "
+                f"operation='list' to see currently available tabs and their handles.",
                 False,
             )
-        return self.browser_sessions[session_id], None
+        tab = self.tab_registry[session_id]
+        if tab.get("closed"):
+            return None, _err(session_id, TAB_CLOSED, f"Tab {session_id!r} has been closed.", False)
+        return tab, None
+
+    # -- tab registry (whole-browser, multi-tab) -----------------------------
+
+    def _register_tab(self, raw_tab: Dict[str, Any], fallback_group_id: Optional[int] = None) -> str:
+        """Register (or refresh) one raw bridge tab dict, reusing an
+        existing handle for the same live tabId. Returns the handle."""
+        tab_id = raw_tab["id"]
+        existing_handle = next(
+            (h for h, r in self.tab_registry.items() if r.get("tabId") == tab_id and not r.get("closed")), None,
+        )
+        handle = existing_handle or f"tab-{uuid.uuid4().hex[:10]}"
+        self.tab_registry[handle] = {
+            "browserSessionId": handle,
+            "bridgeSessionId": self.tab_registry.get(handle, {}).get("bridgeSessionId", _UNSCOPED_BRIDGE_SESSION_MARKER),
+            "tabId": tab_id,
+            "windowId": raw_tab.get("windowId"),
+            "groupId": raw_tab.get("groupId", fallback_group_id),
+            "url": raw_tab.get("url"),
+            "title": raw_tab.get("title"),
+            "active": bool(raw_tab.get("active")),
+            "closed": False,
+        }
+        return handle
+
+    @staticmethod
+    def _sanitize_url_for_model(url: Optional[str]) -> Optional[str]:
+        """Strip an obviously secret-shaped query parameter (token/key/
+        password/...) out of a URL before it's shown to the model — the
+        rest of the URL (host/path) is left intact since these are the
+        user's own already-open tabs, not attacker-controlled input."""
+        if not isinstance(url, str) or "?" not in url:
+            return url
+        base, _, query = url.partition("?")
+        kept = []
+        for pair in query.split("&"):
+            key = pair.split("=", 1)[0]
+            if key and _SENSITIVE_KEY_PATTERN.search(key):
+                continue
+            kept.append(pair)
+        return base if not kept else f"{base}?{'&'.join(kept)}"
+
+    def _sanitize_tab(self, handle: str) -> Dict[str, Any]:
+        record = self.tab_registry[handle]
+        return {
+            "browserSessionId": handle,
+            "title": record.get("title"),
+            "url": self._sanitize_url_for_model(record.get("url")),
+            "active": bool(record.get("active")),
+            "closed": bool(record.get("closed")),
+        }
+
+    def _clear_tab_observations(self, handle: str) -> None:
+        stale_ids = [oid for oid, obs in self.observations.items() if obs.get("browserSessionId") == handle]
+        for oid in stale_ids:
+            del self.observations[oid]
+
+    def refresh_tabs(self) -> Dict[str, Any]:
+        """Query the bridge for every ordinary tab across the whole
+        browser and (re)populate the trusted registry: reuse an existing
+        handle for a tabId already known, mint a new one otherwise, and
+        mark any previously-registered handle whose tabId no longer
+        exists as closed (its observations are also cleared). Returns the
+        standard envelope with the sanitized tab list in ``data.tabs``."""
+        result, error_response = self._call_bridge(None, "tabs.list", {"query": {}})
+        if error_response:
+            return error_response
+        raw_tabs = [t for t in (result or {}).get("tabs") or [] if isinstance(t, dict) and isinstance(t.get("id"), int)]
+        live_tab_ids = {t["id"] for t in raw_tabs}
+
+        for handle, record in self.tab_registry.items():
+            if not record.get("closed") and record.get("tabId") not in live_tab_ids:
+                record["closed"] = True
+                self._clear_tab_observations(handle)
+
+        registered_count = sum(1 for r in self.tab_registry.values() if not r.get("closed"))
+        handles: List[str] = []
+        for raw in raw_tabs:
+            existing_handle = next(
+                (h for h, r in self.tab_registry.items() if r.get("tabId") == raw["id"] and not r.get("closed")), None,
+            )
+            if existing_handle is None and registered_count >= self.max_open_tabs:
+                continue  # registry cap reached; this tab is visible to Chrome but not tracked
+            handle = self._register_tab(raw)
+            if existing_handle is None:
+                registered_count += 1
+            handles.append(handle)
+
+        return _ok(None, {"tabs": [self._sanitize_tab(h) for h in handles]})
 
     # -- observation state --------------------------------------------------
 
@@ -1532,6 +1833,69 @@ class BrowserAgentTools:
         return params
 
     # ------------------------------------------------------------------
+    # Tool: browser_tabs
+    # ------------------------------------------------------------------
+
+    def browser_tabs(self, args: Any) -> Dict[str, Any]:
+        cleaned, error = _validate_args(BROWSER_TABS_PARAMS, args)
+        if error:
+            return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
+        operation = cleaned["operation"]
+
+        if operation == "list":
+            return self.refresh_tabs()
+
+        if operation == "create":
+            url = cleaned.get("url") or "about:blank"
+            result, error_response = self._call_bridge(None, "tabs.create", {"url": url, "active": True})
+            if error_response:
+                return error_response
+            raw_tab = result.get("tab") if isinstance(result, dict) and isinstance(result.get("tab"), dict) else result
+            if not isinstance(raw_tab, dict) or not isinstance(raw_tab.get("id"), int):
+                return _err(None, BRIDGE_ERROR, "The bridge did not return the created tab.", False)
+            handle = self._register_tab(raw_tab)
+            return _ok(handle, {"browserSessionId": handle, "activated": True, **self._sanitize_tab(handle)})
+
+        if operation == "activate":
+            handle = cleaned.get("browserSessionId")
+            if not isinstance(handle, str) or not handle:
+                return _err(None, INVALID_ARGUMENT, "operation 'activate' requires 'browserSessionId'.", False)
+            tab, error_response = self._require_tab(handle)
+            if error_response:
+                return error_response
+            result, error_response = self._call_bridge(handle, "tabs.activate", {"tabId": tab["tabId"]})
+            if error_response:
+                return error_response
+            for other_handle, record in self.tab_registry.items():
+                record["active"] = (other_handle == handle)
+            return _ok(handle, {"browserSessionId": handle, "activated": True, **self._sanitize_tab(handle)})
+
+        if operation == "close":
+            handle = cleaned.get("browserSessionId")
+            if not isinstance(handle, str) or not handle:
+                return _err(None, INVALID_ARGUMENT, "operation 'close' requires 'browserSessionId'.", False)
+            tab, error_response = self._require_tab(handle)
+            if error_response:
+                return error_response
+            result, error_response = self._call_bridge(handle, "tabs.close", {"tabId": tab["tabId"]})
+            if error_response:
+                return error_response
+            tab["closed"] = True
+            self._clear_tab_observations(handle)
+            data: Dict[str, Any] = {"browserSessionId": handle, "closed": True}
+            # Best-effort: the bridge's tabs.close response doesn't itself
+            # report a new active tab, so refresh and surface one if there
+            # now is a different active tab among the remaining registered ones.
+            refreshed = self.refresh_tabs()
+            if refreshed.get("ok"):
+                new_active = next((t for t in refreshed["data"]["tabs"] if t.get("active") and t["browserSessionId"] != handle), None)
+                if new_active:
+                    data["newActiveTab"] = new_active
+            return _ok(handle, data)
+
+        return _err(None, INVALID_ARGUMENT, f"Unknown operation {operation!r}.", False)
+
+    # ------------------------------------------------------------------
     # Tool 1: browser_observe
     # ------------------------------------------------------------------
 
@@ -1540,7 +1904,7 @@ class BrowserAgentTools:
         if error:
             return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
         session_id = cleaned["browserSessionId"]
-        session, error_response = self._require_session(session_id)
+        session, error_response = self._require_tab(session_id)
         if error_response:
             return error_response
 
@@ -1726,7 +2090,7 @@ class BrowserAgentTools:
         if error:
             return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
         session_id = cleaned["browserSessionId"]
-        session, error_response = self._require_session(session_id)
+        session, error_response = self._require_tab(session_id)
         if error_response:
             return error_response
 
@@ -1786,7 +2150,7 @@ class BrowserAgentTools:
         if error:
             return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
         session_id = cleaned["browserSessionId"]
-        session, error_response = self._require_session(session_id)
+        session, error_response = self._require_tab(session_id)
         if error_response:
             return error_response
 
@@ -1865,7 +2229,7 @@ class BrowserAgentTools:
         if error:
             return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
         session_id = cleaned["browserSessionId"]
-        session, error_response = self._require_session(session_id)
+        session, error_response = self._require_tab(session_id)
         if error_response:
             return error_response
 
@@ -2008,7 +2372,7 @@ class BrowserAgentTools:
         if error:
             return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
         session_id = cleaned["browserSessionId"]
-        session, error_response = self._require_session(session_id)
+        session, error_response = self._require_tab(session_id)
         if error_response:
             return error_response
 
@@ -2071,7 +2435,7 @@ class BrowserAgentTools:
         if error:
             return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
         session_id = cleaned["browserSessionId"]
-        session, error_response = self._require_session(session_id)
+        session, error_response = self._require_tab(session_id)
         if error_response:
             return error_response
 
@@ -2211,7 +2575,7 @@ class BrowserAgentTools:
         if error:
             return _err(_safe_session_id(args), INVALID_ARGUMENT, error, False)
         session_id = cleaned["browserSessionId"]
-        session, error_response = self._require_session(session_id)
+        session, error_response = self._require_tab(session_id)
         if error_response:
             return error_response
 
@@ -2275,6 +2639,7 @@ def get_tool_handlers(browser_tools: "BrowserAgentTools") -> Dict[str, Callable[
         "browser_assert": browser_tools.browser_assert,
         "browser_capture_evidence": browser_tools.browser_capture_evidence,
         "browser_diagnose": browser_tools.browser_diagnose,
+        "browser_tabs": browser_tools.browser_tabs,
     }
 
 
@@ -2282,15 +2647,25 @@ def get_tool_handlers(browser_tools: "BrowserAgentTools") -> Dict[str, Callable[
 # Agent instructions
 # =====================================================================
 
-BROWSER_AGENT_INSTRUCTIONS = """You control one approved Chrome tab through seven semantic browser tools:
-browser_observe, browser_act, browser_navigate, browser_wait, browser_assert,
-browser_capture_evidence, and browser_diagnose. There is no eighth tool and no way to call a
-raw bridge method, run arbitrary JavaScript, or select a different tab.
+BROWSER_AGENT_INSTRUCTIONS = """You control the whole browser through eight semantic browser tools:
+browser_tabs, browser_observe, browser_act, browser_navigate, browser_wait, browser_assert,
+browser_capture_evidence, and browser_diagnose. There is no ninth tool and no way to call a
+raw bridge method, run arbitrary JavaScript, or discover a raw Chrome tabId/windowId/groupId.
 
-The browser is restricted to the bound Agent-managed tab group. Do not assume that arbitrary
-existing Chrome tabs are accessible — only the tab bound to your browserSessionId is reachable.
+Every ordinary tab open in the browser is reachable — you are not restricted to one bound tab.
+Use browser_tabs (operation='list') to see currently available tabs and their opaque
+browserSessionId handles, 'create' to open a new tab, 'activate' to switch focus to one, and
+'close' to close one. Never invent a browserSessionId or supply a raw Chrome tabId — use only a
+handle a browser_tabs call actually returned. A fabricated, stale, or already-closed handle
+fails with TAB_NOT_FOUND or TAB_CLOSED.
+
+Every other tool's browserSessionId argument identifies which tab it acts on. Observations and
+refs are isolated per tab: a ref minted by browser_observe on one tab is never valid on another,
+and switching tabs never carries refs across. Re-observe the tab you just activated before any
+element-targeted action on it.
 
 Tool selection:
+  Discover/open/switch/close tabs   -> browser_tabs
   Understand the current page        -> browser_observe
   Perform one interaction            -> browser_act
   Open, reload, or change history    -> browser_navigate
@@ -2346,5 +2721,5 @@ by browser_assert.
 
 Never request arbitrary JavaScript execution, raw bridge methods, cookie access, extension
 reload, policy changes, CSP/header/user-agent changes, or unrestricted network interception —
-none of these are reachable through any of the seven tools, no matter how you phrase a request.
+none of these are reachable through any of the eight tools, no matter how you phrase a request.
 """

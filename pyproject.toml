@@ -1,7 +1,7 @@
 [project]
-name = "axis-phase-3"
+name = "axis-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Axis: a typed Pydantic AI browser agent with whole-browser multi-tab control of the Browser Agent Bridge."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,5 +14,22 @@ dependencies = [
     "oci==2.185.1",
     "openai==3.8.0",
     "pydantic==2.13.5",
-    "pydantic-ai-slim[openai]==2.40.0",
+    "pydantic-ai-slim[openai,temporal]==2.40.0",
+    # Phase 2: Harness capabilities (Planning, ToolGuardrail, SystemReminders).
+    # Newest release on PyPI at pin time; requires pydantic-ai-slim>=2.38.0,
+    # satisfied by the pin above. Bumping this is subject to the same rule
+    # as the pydantic-ai-slim pin (see the comment above).
+    "pydantic-ai-harness==0.29.0",
+    # Phase 3: Temporal durability backend. pydantic-ai-slim's `temporal`
+    # extra requires temporalio>=1.24.0; newest release on PyPI at pin time,
+    # with a win_amd64 wheel. Same upgrade rule as the pins above.
+    "temporalio==1.32.0",
+    "PyYAML==6.0.3",
+    "pyside6==6.8.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
 ]
