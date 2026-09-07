@@ -920,9 +920,41 @@ async function ensureContentScripts(tabId, frameId = 0) {
 }
 
 function waitForTabComplete(tabId, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const started = Date.now();
   return new Promise((resolve, reject) => {
     let done = false;
-    const timer = setTimeout(() => finish(new Error('Timed out waiting for tab load')), timeoutMs);
+    const timer = setTimeout(async () => {
+      // Every other page.wait* timeout (navigation, network idle, text, ...)
+      // carries a structured error.code + error.diagnostic (see page.js's
+      // createPageWaitTimeoutError) so the caller can see what state the page
+      // was actually in. This one previously threw a bare Error with neither,
+      // leaving callers with no signal beyond "it timed out". Match the same
+      // shape here: a stuck tab (still 'loading', or on an unexpected URL —
+      // e.g. an auth/interstitial redirect, or a client-side route change
+      // that never re-fires a 'complete' status) is now visible instead of
+      // silent.
+      let currentStatus = null;
+      let currentUrl = null;
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        currentStatus = tab.status || null;
+        currentUrl = tab.url || null;
+      } catch {
+        // Tab may have closed or been replaced mid-wait; leave diagnostic fields null.
+      }
+      const elapsedMs = Date.now() - started;
+      const error = new Error(
+        `page.waitForLoad timed out after ${elapsedMs}ms: tab did not reach 'complete' `
+        + `(status=${currentStatus ?? '<unknown>'}, url=${currentUrl ?? '<unknown>'})`
+      );
+      error.name = 'PageWaitForLoadTimeout';
+      error.code = 'PAGE_WAIT_FOR_LOAD_TIMEOUT';
+      error.diagnostic = {
+        type: 'PageWaitForLoadTimeout', method: 'page.waitForLoad',
+        elapsedMs, timeoutMs, currentStatus, currentUrl,
+      };
+      finish(error);
+    }, timeoutMs);
     const listener = (updatedTabId, changeInfo) => {
       if (updatedTabId === tabId && changeInfo.status === 'complete') finish();
     };

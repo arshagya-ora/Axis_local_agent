@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 from pydantic_ai import RunContext
 from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai_harness.guardrails import GuardrailResult, ToolGuardrail, ToolResultInfo
-from pydantic_ai_harness.planning import InMemoryPlanStore, PlanItem, Planning, TaskStatus
+from pydantic_ai_harness.planning import InMemoryPlanStore, PlanItem, PlanStatusUpdate, Planning, TaskStatus
 from pydantic_ai_harness.planning._toolset import PlanningToolset
 from temporalio import activity
 from temporalio.common import RetryPolicy
@@ -136,7 +136,16 @@ class _DurablePlanningToolset(PlanningToolset[AxisDurableDeps]):
     async def update_task_status(self, ctx: RunContext[AxisDurableDeps], task_id: str, status: TaskStatus) -> Any:
         return await self._write_result(ctx, await super().update_task_status(ctx, task_id, status))
 
-    async def update_task_statuses(self, ctx: RunContext[AxisDurableDeps], updates: list[Any]) -> Any:
+    async def update_task_statuses(self, ctx: RunContext[AxisDurableDeps], updates: list[PlanStatusUpdate]) -> Any:
+        # The type hint here is what the framework introspects to build this
+        # *overridden* method's own tool schema/argument validator (Harness
+        # registers `self.update_task_statuses`, which Python's MRO resolves
+        # to this override, not the base class's) — a looser `list[Any]`
+        # here previously left `updates` as raw unvalidated dicts, not real
+        # `PlanStatusUpdate` instances, which crashed the arg-stage guardrail
+        # in axis.agent._guard_task_status_update (`u.task_id`/`u.status`
+        # on a dict) with an unhandled AttributeError the first time a
+        # durable job actually called `update_task_statuses`.
         return await self._write_result(ctx, await super().update_task_statuses(ctx, updates))
 
     async def remove_task(self, ctx: RunContext[AxisDurableDeps], task_id: str) -> Any:
@@ -533,7 +542,13 @@ def build_durable_tool_guardrail(config: AxisConfig, logger: RunEventLogger) -> 
     return ToolGuardrail(guard=shared_guard, result_guard=result_guard, tools=None)
 
 
-def build_durable_agent(config: AxisConfig, model: Any) -> tuple[Any, TemporalDurability]:
+def build_durable_agent(
+    config: AxisConfig, model: Any, *, event_logger: Optional[RunEventLogger] = None,
+) -> tuple[Any, TemporalDurability]:
+    """`event_logger` lets a caller (the worker entry point) wire in a live
+    printer so tool/model/lease/plan events actually print somewhere —
+    tests and any other caller that omits it keep the previous silent
+    default, so this is purely additive."""
     durability = TemporalDurability(
         deps_type=AxisDurableDeps,
         model_activity_config=ActivityConfig(
@@ -541,7 +556,7 @@ def build_durable_agent(config: AxisConfig, model: Any) -> tuple[Any, TemporalDu
             retry_policy=RetryPolicy(maximum_attempts=config.phase3.retries.model_max_attempts),
         ),
     )
-    logger = RunEventLogger()
+    logger = event_logger or RunEventLogger()
     browser = build_browser_capability(
         logger, handler_adapter=durable_browser_handler,
         activity_metadata=lambda name: _activity_metadata(config, name),

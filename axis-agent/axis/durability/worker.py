@@ -5,7 +5,18 @@ import asyncio
 import hashlib
 import json
 import logging
+import sys
+from pathlib import Path
 from typing import Any, Iterable, Optional
+
+# `_resolve_version_manifest` below imports the `scripts/browser_contract.py`
+# module by its bare name. Test runs get this for free from
+# `tests/conftest.py`; a real worker process needs it added here instead.
+AGENT_DIR = Path(__file__).resolve().parent.parent.parent
+SCRIPTS_DIR = AGENT_DIR / "scripts"
+for _path in (AGENT_DIR, SCRIPTS_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
 from temporalio.client import Client
@@ -14,7 +25,7 @@ from temporalio.worker import Worker
 from axis.agent import AXIS_SAFETY_INSTRUCTIONS, build_model
 from axis.config import AxisConfig, AxisConfigError, load_axis_config
 from axis.durability.activities import (
-    acquire_browser_lease, capture_version_manifest, emit_durable_event,
+    acquire_browser_lease, capture_version_manifest, configure_durable_event_printer, emit_durable_event,
     get_worker_runtime_info, refresh_browser_binding, release_browser_lease,
     renew_browser_lease, select_browser_rebind_candidate, set_worker_runtime_info,
 )
@@ -22,10 +33,26 @@ from axis.durability.leases import BrowserLeaseWorkflow
 from axis.durability.models import DurableRuntimeSettings, WorkerRuntimeInfo
 from axis.durability.runtime import build_durable_agent, set_durable_agent
 from axis.durability.workflow import AxisJobWorkflow
+from axis.events import RunEventLogger, build_console_event_printer
 from axis.models import AxisTaskResult
 from provider_config import ProviderConfigError, load_provider_config
 
 _error_logger = logging.getLogger("axis.errors")
+
+
+def _configure_worker_logging() -> None:
+    """A worker process has no interactive CLI trace config to read, and
+    unlike `axis.cli` nothing else in this process ever calls
+    `logging.basicConfig` — without this, every `logging.getLogger(...)`
+    call anywhere in the codebase (including `axis.events`' own raw JSON
+    line per event) is silently dropped, which is exactly why a durable
+    job's execution has been invisible. Root-level INFO with a plain
+    timestamped format is a debugging default, not a production log
+    pipeline; adjust via the standard `logging` config if you need less.
+    """
+    if logging.getLogger().handlers:
+        return  # already configured by the embedding process (e.g. a test)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 # Bump on any implementation change to durable behavior (lease lifecycle,
 # rebind flow, retry classification, continuation context, version
 # enforcement, planning consistency) so a worker running old code is never
@@ -95,7 +122,11 @@ def registered_components(durability: Any) -> tuple[list[Any], list[Any]]:
     return workflows, activities
 
 
-async def run_worker(config: Optional[AxisConfig] = None, model: Optional[Any] = None) -> None:
+async def run_worker(
+    config: Optional[AxisConfig] = None, model: Optional[Any] = None, *, verbose: bool = True,
+) -> None:
+    if verbose:
+        _configure_worker_logging()
     try:
         axis_config = config or load_axis_config()
     except AxisConfigError as exc:
@@ -111,7 +142,17 @@ async def run_worker(config: Optional[AxisConfig] = None, model: Optional[Any] =
             raise SystemExit(f"axis-agent worker cannot start: {exc}") from exc
         model, openai_client = build_model(provider_config)
 
-    agent, durability = build_durable_agent(axis_config, model)
+    # One live printer feeds BOTH the agent-run event logger (tool/model
+    # events, emitted directly from inside activities running in this
+    # process) and the durable event logger (job/lease/reconciliation/rebind
+    # lifecycle events, emitted via the `emit_durable_event` activity) — so
+    # every AXIS event this worker produces prints to this terminal, not
+    # only a subset. Pass verbose=False to run silent (tests do this).
+    printer = build_console_event_printer() if verbose else None
+    event_logger = RunEventLogger(printer=printer)
+    configure_durable_event_printer(printer)
+
+    agent, durability = build_durable_agent(axis_config, model, event_logger=event_logger)
     set_durable_agent(agent)
     set_worker_runtime_info(WorkerRuntimeInfo(
         manifest=_resolve_version_manifest(axis_config), settings=_runtime_settings(axis_config),
@@ -126,6 +167,13 @@ async def run_worker(config: Optional[AxisConfig] = None, model: Optional[Any] =
         client, task_queue=axis_config.phase3.temporal.task_queue,
         workflows=workflows, activities=activities,
     )
+    if verbose:
+        print(
+            f"[axis.worker] ready — target={axis_config.phase3.temporal.target} "
+            f"namespace={axis_config.phase3.temporal.namespace} "
+            f"task_queue={axis_config.phase3.temporal.task_queue}"
+        )
+        print("[axis.worker] watching for jobs; every tool call, model turn, and durable lifecycle event prints below.")
     try:
         await worker.run()
     finally:

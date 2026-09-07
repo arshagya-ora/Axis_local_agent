@@ -115,8 +115,20 @@ class RunEventLogger:
     def tool_started(self, run_id: str, tool_name: str, tab_handle: Optional[str] = None) -> None:
         self._emit(AxisEvent(run_id=run_id, event_type="tool_started", tool_name=tool_name, tab_handle=tab_handle))
 
-    def tool_completed(self, run_id: str, tool_name: str, duration_ms: Optional[float] = None, success: bool = True, tab_handle: Optional[str] = None) -> None:
-        self._emit(AxisEvent(run_id=run_id, event_type="tool_completed", tool_name=tool_name, duration_ms=duration_ms, success=success, tab_handle=tab_handle))
+    def tool_completed(
+        self, run_id: str, tool_name: str, duration_ms: Optional[float] = None, success: bool = True,
+        tab_handle: Optional[str] = None, error_code: Optional[str] = None,
+    ) -> None:
+        """`error_code` is the tool result's own `error.code` (e.g.
+        `LEASE_NOT_HELD`, `VERSION_INCOMPATIBLE`, `BROWSER_REBIND_REQUIRED`,
+        `STALE_OBSERVATION`) — safe to print (it's a stable enum-like
+        string, never raw exception text or page content) and is what
+        actually explains a near-instant `FAILED` that would otherwise look
+        unexplained in the terminal."""
+        self._emit(AxisEvent(
+            run_id=run_id, event_type="tool_completed", tool_name=tool_name, duration_ms=duration_ms,
+            success=success, tab_handle=tab_handle, detail=error_code,
+        ))
 
     def assertion_result(self, run_id: str, passed: bool, tab_handle: Optional[str] = None) -> None:
         self._emit(AxisEvent(run_id=run_id, event_type="assertion_result", success=passed, tab_handle=tab_handle))
@@ -203,3 +215,67 @@ class RunEventLogger:
 
     def acceptance_failed(self, run_id: str, criterion_id: Optional[str] = None) -> None:
         self._emit(AxisEvent(run_id=run_id, event_type="acceptance_failed", data={"criterionId": criterion_id}))
+
+
+def build_console_event_printer(
+    *, show_model_text: bool = True, show_tool_arguments: bool = True, show_usage: bool = True,
+    stream: Optional[Any] = None,
+) -> Callable[[Dict[str, Any]], None]:
+    """A live, human-readable event printer — shared by `axis.cli` (verbose
+    trace mode) and the Temporal worker (`axis.durability.worker`), so both
+    the interactive CLI and a durable job print execution as it happens in
+    the same format. Any event type without a dedicated branch below still
+    prints (type + whatever safe detail/data it carries) — nothing is ever
+    silently dropped, which matters most for durability-specific events
+    (`job_started`, `browser_lease_acquired`, `job_waiting_for_approval`,
+    `reconciliation_*`, `job_failed` with its `error_code` in `detail`,
+    etc.) that `axis.cli`'s original printer never had branches for because
+    they can only happen in a durable run."""
+
+    def printer(event: Dict[str, Any]) -> None:
+        kind = event["eventType"]
+        prefix = f"[{kind}]"
+        if kind == "tool_started":
+            print(f"{prefix} {event.get('toolName')} (tab={event.get('tabHandle')})", file=stream)
+        elif kind == "tool_completed":
+            status = "ok" if event.get("success") else "FAILED"
+            error_code = event.get("detail")
+            suffix = f" [{error_code}]" if error_code else ""
+            print(f"{prefix} {event.get('toolName')} {status}{suffix} ({event.get('durationMs')}ms)", file=stream)
+        elif kind == "model_text" and show_model_text:
+            print(f"{prefix} {event.get('detail')}", file=stream)
+        elif kind == "model_reasoning" and show_model_text:
+            print(f"[reasoning] {event.get('detail')}", file=stream)
+        elif kind == "usage" and show_usage:
+            data = event.get("data") or {}
+            print(f"{prefix} requests={data.get('requests')} toolCalls={data.get('toolCalls')} totalTokens={data.get('totalTokens')}", file=stream)
+        elif kind == "limit_reached":
+            data = event.get("data") or {}
+            print(f"{prefix} {data.get('kind')} used={data.get('used')} limit={data.get('limit')}", file=stream)
+        elif kind in ("tab_created", "tab_activated", "tab_closed"):
+            print(f"{prefix} {event.get('tabHandle')}", file=stream)
+        elif kind in ("observation_created", "observation_invalidated"):
+            print(f"{prefix} tab={event.get('tabHandle')} {event.get('detail') or ''}".rstrip(), file=stream)
+        elif kind == "assertion_result":
+            print(f"{prefix} passed={event.get('success')} tab={event.get('tabHandle')}", file=stream)
+        elif kind == "evidence_saved":
+            print(f"{prefix} {event.get('detail')}", file=stream)
+        elif kind == "retry":
+            print(f"{prefix} {event.get('detail')}", file=stream)
+        elif kind in ("run_started", "run_completed", "run_failed", "run_cancelled", "model_request_started", "model_response_received"):
+            print(prefix, file=stream)
+        elif kind == "tool_started" and not show_tool_arguments:
+            pass
+        else:
+            # Generic fallback for every durable-only / future event type —
+            # run_id first so concurrent jobs in one worker log are still
+            # distinguishable at a glance.
+            extras = " ".join(
+                f"{name}={value}" for name, value in (
+                    ("detail", event.get("detail")), ("data", event.get("data")),
+                    ("success", event.get("success")), ("tab", event.get("tabHandle")),
+                ) if value is not None
+            )
+            print(f"{prefix} run={event.get('runId')} {extras}".rstrip(), file=stream)
+
+    return printer

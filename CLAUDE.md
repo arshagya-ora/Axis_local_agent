@@ -18,6 +18,7 @@ Implement the smallest production-worthy solution that satisfies the current tas
 * Avoid duplicate implementations and unnecessary compatibility wrappers.
 * Prefer readable code over clever code.
 * Ask a question only when the answer would materially change the implementation.
+* Never think IN terms of work arounds. always think in terms of fundamental fixes and real root cause finding
 
 ## Phase discipline
 
@@ -146,6 +147,7 @@ Before considering work complete:
 * Never weaken, delete, skip, or rewrite a valid test merely to make implementation pass.
 * Run live canaries only when the required non-production environment is configured.
 * Never fabricate a test or canary result.
+* Never think IN terms of work arounds. always think in terms of fundamental fixes and real root cause finding
 
 For every change, report the exact commands executed and their actual results.
 
@@ -165,10 +167,7 @@ For every change, report the exact commands executed and their actual results.
 A task is complete only when:
 
 * The requested behavior is implemented.
-* The implementation stays within the requested phase.
-* Relevant tests pass.
-* Existing tests and frozen contracts remain valid.
-* Security boundaries are preserved.
+* Never think IN terms of work arounds. always think in terms of fundamental fixes and real root cause finding
 * No secrets or sensitive identifiers were introduced.
 * No unnecessary architecture or dependencies were added.
 * The final response states:

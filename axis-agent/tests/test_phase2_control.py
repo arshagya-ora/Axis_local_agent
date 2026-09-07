@@ -209,6 +209,30 @@ class TestEffectPreparation(unittest.TestCase):
         updated = ledger.mark_failed(record.effect_id)
         self.assertEqual(updated.status, "failed")
 
+    def test_known_not_applied_failure_refunds_budget_even_at_limit(self):
+        """A pre-dispatch rejection (e.g. STALE_OBSERVATION) proves the
+        attempt never touched the page: even with a mutation budget of 1,
+        the effect must stay retryable without a fresh axis_prepare_effect
+        call — this is what stops a single stale ref from permanently
+        stranding the plan step behind EFFECT_REQUIRED."""
+        ledger = EffectLedger()
+        record = ledger.prepare(effect_key="e1", plan_task_id="t1", risk="read", summary="s", allowed_tools=["browser_act"], allowed_actions=["fill"], max_browser_mutations=1, acceptance_criterion_ids=["c1"])
+        ledger.mark_started(record.effect_id)
+        updated = ledger.mark_failed(record.effect_id, known_not_applied=True)
+        self.assertEqual(updated.status, "prepared")
+        self.assertEqual(updated.browser_mutation_count, 0)
+        # The refunded effect can be started again — proof it is not stuck.
+        restarted = ledger.mark_started(record.effect_id)
+        self.assertEqual(restarted.status, "executing")
+        self.assertEqual(restarted.browser_mutation_count, 1)
+
+    def test_known_not_applied_never_underflows_budget(self):
+        ledger = EffectLedger()
+        record = ledger.prepare(effect_key="e1", plan_task_id="t1", risk="read", summary="s", allowed_tools=["browser_act"], allowed_actions=["fill"], max_browser_mutations=1, acceptance_criterion_ids=["c1"])
+        # Refund without a prior mark_started (count already 0) must clamp at 0, not go negative.
+        updated = ledger.mark_failed(record.effect_id, known_not_applied=True)
+        self.assertEqual(updated.browser_mutation_count, 0)
+
 
 class TestRiskClassification(unittest.TestCase):
     def test_read_and_control_are_not_effect_gated(self):

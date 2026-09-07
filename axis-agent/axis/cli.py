@@ -40,7 +40,7 @@ from axis.agent import (  # noqa: E402
 )
 from axis.approvals import prompt_for_approval, resolve_approval  # noqa: E402
 from axis.config import AxisConfig, AxisConfigError, load_axis_config  # noqa: E402
-from axis.events import RunEventLogger  # noqa: E402
+from axis.events import RunEventLogger, build_console_event_printer  # noqa: E402
 from axis.models import AxisRunDeps, AxisTaskResult  # noqa: E402
 from browser_agent_tools import BrowserAgentTools, FirewallConfig  # noqa: E402
 from browser_bridge_client import BrowserBridgeClient  # noqa: E402
@@ -65,44 +65,16 @@ def _make_printer(cli_config) -> Any:
     """A live event printer for axis.events.RunEventLogger — prints
     execution as it happens, not only after completion. Logical AXIS tab
     handles are safe to show even in verbose mode; nothing here ever prints
-    a raw Chrome tabId/windowId/groupId (events never carry one)."""
+    a raw Chrome tabId/windowId/groupId (events never carry one). Delegates
+    the actual formatting to the shared printer also used by the Temporal
+    worker (`axis.durability.worker`), so CLI and durable-job output read
+    the same way."""
     if cli_config.trace == "quiet":
         return None
-
-    def printer(event: Dict[str, Any]) -> None:
-        kind = event["eventType"]
-        if kind in ("tool_started",) and not cli_config.show_tool_arguments:
-            pass
-        prefix = f"[{kind}]"
-        if kind == "tool_started":
-            print(f"{prefix} {event.get('toolName')} (tab={event.get('tabHandle')})")
-        elif kind == "tool_completed":
-            status = "ok" if event.get("success") else "FAILED"
-            print(f"{prefix} {event.get('toolName')} {status} ({event.get('durationMs')}ms)")
-        elif kind == "model_text" and cli_config.show_model_text:
-            print(f"{prefix} {event.get('detail')}")
-        elif kind == "model_reasoning" and cli_config.show_model_text:
-            print(f"[reasoning] {event.get('detail')}")
-        elif kind == "usage" and cli_config.show_usage:
-            data = event.get("data") or {}
-            print(f"{prefix} requests={data.get('requests')} toolCalls={data.get('toolCalls')} totalTokens={data.get('totalTokens')}")
-        elif kind == "limit_reached":
-            data = event.get("data") or {}
-            print(f"{prefix} {data.get('kind')} used={data.get('used')} limit={data.get('limit')}")
-        elif kind in ("tab_created", "tab_activated", "tab_closed"):
-            print(f"{prefix} {event.get('tabHandle')}")
-        elif kind in ("observation_created", "observation_invalidated"):
-            print(f"{prefix} tab={event.get('tabHandle')} {event.get('detail') or ''}".rstrip())
-        elif kind == "assertion_result":
-            print(f"{prefix} passed={event.get('success')} tab={event.get('tabHandle')}")
-        elif kind == "evidence_saved":
-            print(f"{prefix} {event.get('detail')}")
-        elif kind == "retry":
-            print(f"{prefix} {event.get('detail')}")
-        elif kind in ("run_started", "run_completed", "run_failed", "run_cancelled", "model_request_started", "model_response_received"):
-            print(prefix)
-
-    return printer
+    return build_console_event_printer(
+        show_model_text=cli_config.show_model_text, show_tool_arguments=cli_config.show_tool_arguments,
+        show_usage=cli_config.show_usage,
+    )
 
 
 def _print_result(result) -> None:
@@ -167,6 +139,7 @@ async def _handle_durable_command(
     state (`client`, `handle`, `job_id`) — a plain dict so this function
     can update it without a class. Returns True if `user_input` was a
     durable command (handled, whether it succeeded or not)."""
+    from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
     from temporalio.client import Client
 
     from axis.durability import client as durability_client
@@ -175,6 +148,11 @@ async def _handle_durable_command(
             durable["client"] = await Client.connect(
                 axis_config.phase3.temporal.target,
                 namespace=axis_config.phase3.temporal.namespace,
+                # Same plugin the worker registers (axis/durability/worker.py) —
+                # without it, values like AxisJobState round-trip through
+                # Temporal's default (non-Pydantic-aware) converter, which
+                # works but warns on every Pydantic v2 model it sees.
+                plugins=[PydanticAIPlugin()],
             )
         return durable["client"]
 

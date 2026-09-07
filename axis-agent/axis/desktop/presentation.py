@@ -98,6 +98,12 @@ class DesktopJobSnapshot(BaseModel):
     can_resume: bool = False
     can_cancel: bool = False
     is_terminal: bool = False
+    # True while a pause has been requested (the workflow's paused flag is
+    # set) but the current agent turn has not yet yielded, so the durable
+    # status still reads "running". Without this the UI has a dead zone:
+    # can_pause goes false immediately, can_resume stays false, and the
+    # user sees "Running" with no feedback that the pause landed.
+    pause_pending: bool = False
 
 
 # status_code -> (display label, visual "kind" for QML styling, primary action hint)
@@ -234,6 +240,7 @@ def project_job_state(state: AxisJobState) -> DesktopJobSnapshot:
         can_resume=(state.status == "paused"),
         can_cancel=(not is_terminal and not state.cancel_requested),
         is_terminal=is_terminal,
+        pause_pending=(state.paused and state.status != "paused" and not is_terminal),
     )
 
 
@@ -254,6 +261,10 @@ def diff_timeline_entries(previous: Optional[DesktopJobSnapshot], current: Deskt
         return entries
     if previous.status_code != current.status_code:
         entries.append(DesktopTimelineEntry(kind="status", text=f"Status changed to {current.display_status}"))
+    if not previous.pause_pending and current.pause_pending:
+        entries.append(DesktopTimelineEntry(
+            kind="status", text="Pause requested — AXIS will pause after the current step finishes",
+        ))
     if len(current.plan_items) != len(previous.plan_items):
         entries.append(DesktopTimelineEntry(kind="plan", text="Plan updated"))
     else:
@@ -265,7 +276,7 @@ def diff_timeline_entries(previous: Optional[DesktopJobSnapshot], current: Deskt
     if previous.pending_approval is not None and current.pending_approval is None:
         entries.append(DesktopTimelineEntry(kind="approval", text="Approval resolved"))
     if previous.pending_question is None and current.pending_question is not None:
-        entries.append(DesktopTimelineEntry(kind="question", text="The agent is asking a question"))
+        entries.append(DesktopTimelineEntry(kind="question", text=current.pending_question.question))
     if not previous.rebind_required and current.rebind_required:
         entries.append(DesktopTimelineEntry(kind="rebind", text="Browser rebind required"))
     if previous.rebind_required and not current.rebind_required:

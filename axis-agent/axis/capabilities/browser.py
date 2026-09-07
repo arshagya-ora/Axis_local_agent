@@ -42,7 +42,7 @@ if str(AGENT_DIR) not in sys.path:
 from pydantic_ai import RunContext, Tool  # noqa: E402
 from pydantic_ai.capabilities import Capability  # noqa: E402
 
-from axis.effects import criterion_matches_assertion, requires_effect  # noqa: E402
+from axis.effects import PRE_DISPATCH_BROWSER_ERROR_CODES, criterion_matches_assertion, requires_effect  # noqa: E402
 from axis.events import RunEventLogger  # noqa: E402
 from axis.models import AxisRunDeps, TOOL_EXECUTION_ERROR  # noqa: E402
 from browser_agent_tools import (  # noqa: E402
@@ -59,6 +59,27 @@ CAPABILITY_DESCRIPTION = (
 
 _SESSION_ID_FIELD = "browserSessionId"
 _error_logger = logging.getLogger("axis.errors")
+# Deliberately separate from `axis.events` (the redacted, replay-safe event
+# stream shared by the CLI and durable workflow): this logger exists only
+# for local terminal debugging and is the one place the bridge's own
+# error message and diagnostic payload — which can contain page-derived
+# text such as a selector or element description — are ever printed. Never
+# read by workflow/replay code, never part of what a durable event carries,
+# and never shown in the desktop UI; it only prints wherever this worker/
+# CLI process's own `logging` is configured to show it.
+_bridge_debug_logger = logging.getLogger("axis.debug.bridge")
+
+
+def _log_bridge_failure_detail(tool_name: str, kwargs: Dict[str, Any], result: Dict[str, Any]) -> None:
+    if not isinstance(result, dict) or result.get("ok") or not isinstance(result.get("error"), dict):
+        return
+    error = result["error"]
+    action_or_operation = kwargs.get("action") or kwargs.get("operation")
+    _bridge_debug_logger.info(
+        "%s%s failed: code=%s retryable=%s message=%s diagnostic=%r",
+        tool_name, f" ({action_or_operation})" if action_or_operation else "",
+        error.get("code"), error.get("retryable"), error.get("message"), error.get("diagnostic"),
+    )
 
 # browser_act actions that change page/business state and therefore require
 # a later passing browser_assert before a task can be reported "completed".
@@ -74,6 +95,16 @@ def _tab_handle_of(kwargs: Dict[str, Any], result: Dict[str, Any]) -> Optional[s
         return handle
     value = kwargs.get(_SESSION_ID_FIELD)
     return value if isinstance(value, str) else None
+
+
+def _result_error_code(result: Dict[str, Any]) -> Optional[str]:
+    """The tool result's own stable error code (e.g. `LEASE_NOT_HELD`,
+    `VERSION_INCOMPATIBLE`, `BROWSER_REBIND_REQUIRED`) for a failed call, or
+    `None` on success — safe to log/print, never raw exception text."""
+    if not isinstance(result, dict) or result.get("ok"):
+        return None
+    error = result.get("error")
+    return error.get("code") if isinstance(error, dict) else None
 
 
 def _update_run_state_and_emit(
@@ -158,7 +189,16 @@ def _apply_effect_outcome(tool_name: str, kwargs: Dict[str, Any], result: Dict[s
                     deps.effect_ledger.mark_executed_unverified(effect.effect_id, trusted_session)
                     logger.effect_executed_unverified(deps.run_id)
             else:
-                deps.effect_ledger.mark_failed(effect.effect_id)
+                code = (result.get("error") or {}).get("code") if isinstance(result, dict) else None
+                # A pre-dispatch rejection (e.g. STALE_OBSERVATION — the ref
+                # never resolved to a live element) proves this attempt never
+                # touched the page: refund the mutation budget mark_started
+                # already spent on it instead of treating it like a real,
+                # possibly-applied mutation. Any other failure keeps the
+                # original conservative (budget-consuming) handling, since we
+                # cannot prove the page was untouched.
+                known_not_applied = code in PRE_DISPATCH_BROWSER_ERROR_CODES
+                deps.effect_ledger.mark_failed(effect.effect_id, known_not_applied=known_not_applied)
                 logger.effect_failed(deps.run_id)
         return
     if tool_name == "browser_assert" and isinstance(result, dict) and result.get("ok"):
@@ -259,8 +299,9 @@ def _make_tool_function(
             duration_ms = round((time.perf_counter() - start) * 1000, 1)
             event_logger.tool_completed(
                 ctx.deps.run_id, tool_name, duration_ms, success,
-                tab_handle=_tab_handle_of(kwargs, result),
+                tab_handle=_tab_handle_of(kwargs, result), error_code=_result_error_code(result),
             )
+            _log_bridge_failure_detail(tool_name, kwargs, result)
             return result
 
         return call_sync
@@ -292,7 +333,11 @@ def _make_tool_function(
                 _update_run_state_and_emit(tool_name, kwargs, result, ctx.deps, event_logger)
                 _apply_effect_outcome(tool_name, kwargs, result, ctx.deps, event_logger)
         duration_ms = round((time.perf_counter() - start) * 1000, 1)
-        event_logger.tool_completed(ctx.deps.run_id, tool_name, duration_ms, success, tab_handle=_tab_handle_of(kwargs, result))
+        event_logger.tool_completed(
+            ctx.deps.run_id, tool_name, duration_ms, success,
+            tab_handle=_tab_handle_of(kwargs, result), error_code=_result_error_code(result),
+        )
+        _log_bridge_failure_detail(tool_name, kwargs, result)
         return result
 
     return call_handler

@@ -693,7 +693,18 @@ class AxisJobWorkflow:
                 await self._release_lease()
                 await self._emit({"completed": "job_completed", "failed": "job_failed", "cancelled": "job_cancelled"}[self._status])
                 return output
-        except Exception:
+        except Exception as exc:
+            # `workflow.logger` (not a plain module logger) is the
+            # replay-safe way to log from inside workflow code — it only
+            # actually emits on the attempt that really executed this line,
+            # never redundantly on deterministic replay. Exception type AND
+            # message here (not type-only): this is the one place a caught
+            # exception was previously reported to the user as nothing more
+            # than "UNEXPECTED_ERROR", with no way to find out what it
+            # actually was.
+            workflow.logger.error(
+                "AxisJobWorkflow failed with an unexpected exception: %s: %s", type(exc).__name__, exc,
+            )
             await self._release_lease()
             self._status = "failed"
             self._last_error_code = "UNEXPECTED_ERROR"

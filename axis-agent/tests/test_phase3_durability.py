@@ -1582,5 +1582,52 @@ class TestContinueAsNewRetainsContext(unittest.TestCase):
         run_async(body())
 
 
+class TestBulkPlanStatusUpdateThroughDurableGuardrail(unittest.TestCase):
+    def test_update_task_statuses_does_not_crash_the_workflow(self):
+        """Regression test: `_DurablePlanningToolset.update_task_statuses`
+        previously overrode the tool with a looser `updates: list[Any]`
+        signature than the real `list[PlanStatusUpdate]`, which is what the
+        framework introspects to build THIS tool's own argument validator
+        (Harness registers the bound, overridden method). That left each
+        item as a raw unvalidated dict, and axis.agent's arg-stage guard
+        (`u.task_id`/`u.status`) crashed the workflow with an unhandled
+        AttributeError the first time a durable job actually called
+        `update_task_statuses` with a real (non-empty) list — which no
+        prior test exercised."""
+        scope_key = "scope-bulk-status-update"
+        tools, client = _seed_mock_browser_tools(scope_key)
+        step = {"n": 0}
+
+        def scripted(messages, info):
+            step["n"] += 1
+            n = step["n"]
+            if n == 1:
+                return ModelResponse(parts=[ToolCallPart(tool_name="browser_tabs", args={"operation": "list"})])
+            if n == 2:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="browser_observe", args={"browserSessionId": _active_tab_handle(messages)},
+                )])
+            if n == 3:
+                return ModelResponse(parts=[ToolCallPart(tool_name="write_plan", args={"items": [
+                    {"id": "t1", "content": "Step one", "status": "in_progress"},
+                    {"id": "t2", "content": "Step two", "status": "pending"},
+                ]})])
+            if n == 4:
+                return ModelResponse(parts=[ToolCallPart(tool_name="update_task_statuses", args={"updates": [
+                    {"task_id": "t1", "status": "completed"},
+                    {"task_id": "t2", "status": "in_progress"},
+                ]})])
+            return _final_result_call(info, status="completed", summary="done", verification_summary="observed")
+
+        async def body():
+            async with _DurableTestHarness(scripted, leases_enabled=False) as h:
+                handle = await h.start_job(scope_key=scope_key)
+                result = await handle.result()
+                self.assertEqual(result.status, "completed")
+                self.assertNotEqual(result.error_code, "UNEXPECTED_ERROR")
+
+        run_async(body())
+
+
 if __name__ == "__main__":
     unittest.main()

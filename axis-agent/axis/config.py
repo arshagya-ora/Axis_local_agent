@@ -129,7 +129,14 @@ class Phase3RecoveryConfig:
 
 @dataclass(frozen=True)
 class Phase3HistoryConfig:
-    max_run_segments: int = 100
+    # 100 let workflow history grow past 8MB and >800KB per-turn payloads in
+    # observed runs, which pushed workflow task processing past Temporal's
+    # task-timeout window (TMPRL1103 payload warnings, then "task not found"/
+    # "query not found" errors as tasks expired before the worker replied).
+    # 20 checkpoints (continue_as_new) well before that, at the cost of more
+    # frequent history resets. Retune against real per-turn payload sizes for
+    # the target site if this is still too high (or needlessly low).
+    max_run_segments: int = 20
 
 
 @dataclass(frozen=True)

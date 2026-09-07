@@ -46,9 +46,9 @@ browser:
       - "extension.reload"
 
 limits:
-  max_requests: 60
-  max_tool_calls: 120
-  max_total_tokens: 500000
+  max_requests: 600
+  max_tool_calls: 1200
+  max_total_tokens: 50000000
   max_wall_clock_seconds: 900
   max_retries: 3
 
@@ -118,7 +118,11 @@ phase3:
     reconcile_unknown_effects: true
 
   history:
-    max_run_segments: 100
+    # Lowered from 100: observed runs hit >800KB per-turn payloads and 8MB+
+    # workflow history well before 100 segments, causing workflow task
+    # processing to exceed Temporal's task-timeout window. Retune against
+    # real per-turn payload sizes if needed.
+    max_run_segments: 20
 
 # Phase 4: the PySide6/QML desktop control surface's own presentation
 # settings only. It reuses phase3.temporal for the Temporal endpoint,

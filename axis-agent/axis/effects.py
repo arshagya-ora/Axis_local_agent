@@ -511,15 +511,37 @@ class EffectLedger:
             status = "unknown_after_crash"
         return self._set(effect_id, status=status, outcome=outcome, execution_stage=stage)
 
-    def mark_failed(self, effect_id: str) -> EffectRecord:
-        """A single call attempt failed. If the mutation budget still has
-        room, the effect returns to ``prepared`` so a corrective retry
-        (e.g. re-observe after a stale ref, then retry the same logical
-        action) is still permitted against this same effect — only once
+    def mark_failed(self, effect_id: str, *, known_not_applied: bool = False) -> EffectRecord:
+        """A single call attempt failed.
+
+        ``known_not_applied=True`` means the bridge proved *this specific
+        attempt* never touched the page — its error code is one of
+        ``PRE_DISPATCH_BROWSER_ERROR_CODES`` (e.g. a stale ref rejected
+        before the fill/click ever reached the element). ``mark_started``
+        optimistically counts every attempt against the mutation budget the
+        moment the handler is entered, before the outcome is known; a
+        pre-dispatch rejection refunds that count and resets execution_stage
+        so the same prepared effect is fully reusable — no re-preparation
+        required — since nothing was actually attempted against the page.
+        This does not weaken the crash/unknown-outcome safety story: a
+        result whose code is *not* in that audited allowlist still can't
+        prove the page was untouched, so it falls through to the original,
+        budget-consuming path below.
+
+        Otherwise, if the mutation budget still has room, the effect
+        returns to ``prepared`` so a corrective retry (e.g. re-observe after
+        an ambiguous failure, then retry the same logical action) is still
+        permitted against this same effect — only once
         ``max_browser_mutations`` is exhausted does the effect become
         terminally ``failed``. Either way, a retry never happens
         automatically: the model must issue a new tool call itself."""
         current = self.get(effect_id)
+        if known_not_applied:
+            return self._set(
+                effect_id, status="prepared",
+                browser_mutation_count=max(0, current.browser_mutation_count - 1),
+                execution_stage="authorized" if current.approval_id else "validated",
+            )
         if current.browser_mutation_count >= current.max_browser_mutations:
             return self._set(effect_id, status="failed")
         return self._set(effect_id, status="prepared")

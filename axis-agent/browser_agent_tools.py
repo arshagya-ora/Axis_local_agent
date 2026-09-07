@@ -341,10 +341,22 @@ _STALE_REF_HINTS = (
     "accessibility ref not found or stale",
 )
 
+# Observed in the wild: a ref that no longer resolves can also surface as an
+# unhandled null/undefined property access inside the extension's own ref
+# lookup (e.g. "Cannot read properties of null (reading 'element')") instead
+# of the clean messages above — the extension throwing this class of error
+# before it can format its own "not found or stale" text. This is the same
+# underlying condition (the fix belongs in the extension: guard the lookup
+# and throw the clean message instead of crashing), but until that lands we
+# classify it the same way here rather than leaking the raw JS exception.
+_STALE_REF_CRASH_RE = re.compile(
+    r"cannot read propert(?:y|ies) of (?:null|undefined) \(reading '(?:element|node|ref|boundingBox|ownerDocument)'\)"
+)
+
 
 def _looks_like_stale_ref_error(message: str) -> bool:
     lower = message.lower()
-    return any(hint in lower for hint in _STALE_REF_HINTS)
+    return any(hint in lower for hint in _STALE_REF_HINTS) or bool(_STALE_REF_CRASH_RE.search(lower))
 
 
 def _bridge_error_response(browser_session_id: Optional[str], error: BrowserBridgeError) -> Dict[str, Any]:
@@ -2219,7 +2231,21 @@ class BrowserAgentTools:
             params["text"] = expected
             return method, params
 
-        if condition in ("navigation", "page_load", "network_idle", "popup", "dialog"):
+        if condition == "network_idle":
+            # The bridge's own defaults (extension/sw/page.js pageWaitForNetworkIdle)
+            # require idleMs=500 of true silence and maxInflight=0 in-flight requests.
+            # Real pages with continuous low-level background traffic (analytics
+            # beacons, polling, keep-alive pings) never accumulate 500ms of silence,
+            # so every call times out at 30s+ even when the page is functionally
+            # settled (observed: inflight=0 but msSinceLastActivity repeatedly < 500).
+            # Loosen both knobs — still bounded, still a real (if softer) idle
+            # check — rather than let the model burn its full timeout on pages
+            # that will never satisfy the bridge's strict default.
+            params["idleMs"] = 250
+            params["maxInflight"] = 1
+            return method, params
+
+        if condition in ("navigation", "page_load", "popup", "dialog"):
             return method, params
 
         raise _ToolArgError(_err(session_id, INVALID_ARGUMENT, f"Unknown condition {condition!r}.", False))

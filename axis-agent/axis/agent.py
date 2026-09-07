@@ -139,7 +139,9 @@ _STATIC_REMINDER_TEXTS = (
     "A browser action or wait does not prove completion.",
     "Prepare an effect before a state-changing browser call.",
     "Approval does not replace scope authorization.",
-    "Do not repeat denied or ambiguously failed mutations.",
+    "Never blindly reissue a denied or outcome-unknown mutation. A diagnosed, "
+    "retryable failure (e.g. a stale ref) is different: re-observe, prepare a "
+    "fresh effect for the same plan step, and retry — do not abandon the step.",
     "Use browser_assert to satisfy acceptance criteria.",
     "Do not claim completion while required criteria or effects are unresolved.",
 )
@@ -209,12 +211,22 @@ def _criterion_required(intent, criterion_id: str) -> bool:
     return criterion is not None and criterion.required
 
 
+def _field(item: Any, name: str) -> Any:
+    """`item` is normally a validated object (e.g. `PlanStatusUpdate`) by
+    the time a guard sees it, but must never crash this guard if it ever
+    arrives as a plain dict instead (a tool's own argument type hint
+    controls whether the framework actually constructs that object — see
+    `axis.durability.runtime._DurablePlanningToolset.update_task_statuses`'s
+    docstring for a concrete case where this used to not hold)."""
+    return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+
 def _guard_task_status_update(deps: AxisRunDeps, name: str, args: Dict[str, Any], logger: RunEventLogger) -> GuardrailResult:
     ledger = EffectLedger(deps.control_state.effects)
     if name == "update_task_status":
         updates = [(args.get("task_id"), args.get("status"))]
     else:
-        updates = [(u.task_id, u.status) for u in args.get("updates", [])]
+        updates = [(_field(u, "task_id"), _field(u, "status")) for u in args.get("updates", [])]
     for task_id, status in updates:
         status_str = status.value if hasattr(status, "value") else str(status)
         record = ledger.get_for_task(task_id) if task_id else None
@@ -285,7 +297,32 @@ async def _guard_effectful_browser_call(
 
     effect = ledger.get_for_task(active_task.task_id)
     if effect is None or effect.status not in ("prepared", "awaiting_approval", "approved", "starting", "executing", "executed_unverified"):
-        return GuardrailResult.block(f"{EFFECT_REQUIRED}: prepare an effect for plan step {active_task.task_id!r} before mutating.")
+        unresolved = set(unresolved_proposed_effects(intent, ledger))
+        candidate = next(
+            (p for p in intent.proposed_effects
+             if p.effect_key in unresolved and tool in p.allowed_tools
+             and (action is None or not p.allowed_actions or action in p.allowed_actions)),
+            None,
+        )
+        # `retry` (ModelRetry) rather than `block` (SkipToolExecution): a plain
+        # block's refusal text is just another tool result the model is free to
+        # ignore and re-attempt identically (observed live: the same blocked
+        # browser_act retried 3 times verbatim against this exact message).
+        # ModelRetry carries the framework's own retry semantics and counts
+        # against the agent's bounded retry budget, so persistent
+        # non-compliance now fails the run cleanly instead of wandering for
+        # several more turns before giving up on its own.
+        if candidate is not None:
+            return GuardrailResult.retry(
+                f"{EFFECT_REQUIRED}: call axis_prepare_effect(effectKey={candidate.effect_key!r}, "
+                f"planTaskId={active_task.task_id!r}) before retrying this {tool} call."
+            )
+        return GuardrailResult.retry(
+            f"{EFFECT_REQUIRED}: no proposed effect in the current Task Intent covers {tool!r} for plan step "
+            f"{active_task.task_id!r}. Call axis_set_task_intent with a proposed_effects entry whose "
+            f"allowed_tools includes {tool!r}, then axis_prepare_effect(effectKey=<that effect_key>, "
+            f"planTaskId={active_task.task_id!r})."
+        )
 
     def reject_before_dispatch(message: str) -> GuardrailResult:
         """Persist the conservative outcome for a guarded mutation attempt."""
@@ -350,6 +387,9 @@ async def _guard_effectful_browser_call(
     return GuardrailResult.approve()
 
 
+_guard_debug_logger = logging.getLogger("axis.debug.guard")
+
+
 def build_axis_guard(approvals: Phase2ApprovalsConfig, logger: RunEventLogger):
     async def guard(ctx: RunContext[AxisRunDeps], call: ToolCallInfo) -> GuardrailResult:
         name = call.name
@@ -358,18 +398,31 @@ def build_axis_guard(approvals: Phase2ApprovalsConfig, logger: RunEventLogger):
         if name in ("axis_set_task_intent", "axis_prepare_effect"):
             return GuardrailResult.allow()
         if name in ("update_task_status", "update_task_statuses"):
-            return _guard_task_status_update(ctx.deps, name, args, logger)
-        if name in ("write_plan", "remove_task"):
-            return _guard_plan_mutation(ctx.deps, name, args)
-        if name in ("read_plan", "add_task"):
-            return GuardrailResult.allow()
+            verdict = _guard_task_status_update(ctx.deps, name, args, logger)
+        elif name in ("write_plan", "remove_task"):
+            verdict = _guard_plan_mutation(ctx.deps, name, args)
+        elif name in ("read_plan", "add_task"):
+            verdict = GuardrailResult.allow()
+        else:
+            action = args.get("action")
+            operation = args.get("operation")
+            if not requires_effect(name, action=action, operation=operation):
+                verdict = GuardrailResult.allow()
+            else:
+                verdict = await _guard_effectful_browser_call(
+                    ctx, name, action, operation, args, call.tool_call_id, approvals, logger,
+                )
 
-        action = args.get("action")
-        operation = args.get("operation")
-        if not requires_effect(name, action=action, operation=operation):
-            return GuardrailResult.allow()
-
-        return await _guard_effectful_browser_call(ctx, name, action, operation, args, call.tool_call_id, approvals, logger)
+        # Every guard-authored string here is a fixed template with only
+        # already-safe values interpolated (task/effect ids the model
+        # itself assigned, risk labels, status enums) — never raw page
+        # content or a bridge identifier — so this is safe to log in full.
+        # This is what actually explains a tool exhausting its retries
+        # (`UnexpectedModelBehavior: Tool '...' exceeded max retries`): the
+        # guard's own reason for repeatedly rejecting the call.
+        if verdict.action != "allow":
+            _guard_debug_logger.info("guard %s(%s): %s", name, verdict.action, verdict.message)
+        return verdict
 
     return guard
 

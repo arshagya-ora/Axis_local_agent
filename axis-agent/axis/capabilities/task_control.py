@@ -70,7 +70,17 @@ _PROPOSED_EFFECT_SCHEMA: Dict[str, Any] = {
         "risk": {"type": "string", "enum": ["read", "reversible_local", "external_effect", "destructive_high_impact"]},
         "allowed_tools": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8},
         "allowed_actions": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-        "max_browser_mutations": {"type": "integer", "minimum": 1, "maximum": 20},
+        "max_browser_mutations": {
+            "type": "integer", "minimum": 1, "maximum": 20,
+            "description": (
+                "Mutation budget for this effect. A failed attempt (e.g. a stale ref) still "
+                "consumes one unit and returns to 'prepared' for a corrective retry only while "
+                "budget remains; once exhausted the effect terminates as 'failed' and a fresh "
+                "axis_prepare_effect call is required before mutating again. Set to 1 only for a "
+                "truly single-shot action; prefer 2-3 for an interactive step (e.g. fill+press) "
+                "so one transient bridge error doesn't force a full re-prepare round trip."
+            ),
+        },
         "acceptance_criterion_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20},
     },
     "required": ["effect_key", "summary", "risk", "allowed_tools", "max_browser_mutations", "acceptance_criterion_ids"],

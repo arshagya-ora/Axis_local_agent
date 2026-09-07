@@ -25,7 +25,7 @@ dependencies = [
     # with a win_amd64 wheel. Same upgrade rule as the pins above.
     "temporalio==1.32.0",
     "PyYAML==6.0.3",
-    "pyside6==6.8.3",
+    "pyside6==6.7.3",
 ]
 
 [dependency-groups]

@@ -23,6 +23,18 @@ _durable_event_logger = RunEventLogger()
 _worker_runtime_info: Optional[WorkerRuntimeInfo] = None
 
 
+def configure_durable_event_printer(printer: Optional[Any]) -> None:
+    """Wire a live printer (see `axis.events.build_console_event_printer`)
+    into the process-local durable event logger — called once by
+    `axis.durability.worker.run_worker` so every `emit_durable_event`
+    activity call (job/lease/reconciliation/rebind lifecycle events emitted
+    by `AxisJobWorkflow`) actually prints somewhere. Left unconfigured
+    (silent, matching the historical default) for test processes that never
+    call this."""
+    global _durable_event_logger
+    _durable_event_logger = RunEventLogger(printer=printer)
+
+
 class EmitEventRequest(BaseModel):
     run_id: str
     event_type: str
