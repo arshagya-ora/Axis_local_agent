@@ -43,7 +43,7 @@ if str(AGENT_DIR) not in sys.path:
 
 import browser_agent_tools as bat  # noqa: E402
 
-BROWSER_CONTRACT_VERSION = "2.0.0"  # the active (v2) contract version
+BROWSER_CONTRACT_VERSION = "2.1.0"  # the active (v2) contract version
 CONTRACT_PATH_V1 = AGENT_DIR / "contracts" / "browser_tool_contract.json"
 CONTRACT_PATH_V2 = AGENT_DIR / "contracts" / "browser_tool_contract_v2.json"
 CONTRACT_PATH = CONTRACT_PATH_V2  # back-compat name for anything importing the old symbol

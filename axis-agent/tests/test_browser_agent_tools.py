@@ -301,7 +301,8 @@ class TestForbiddenMethodProtection(unittest.TestCase):
         mapped = set(bat.OBSERVE_METHOD_MAP.values()) | set(bat.NAV_METHOD_MAP.values()) \
             | set(bat.WAIT_METHOD_MAP.values()) | set(bat.ASSERT_METHOD_MAP.values()) \
             | set(bat.CAPTURE_METHOD_MAP.values()) | set(bat.DIAGNOSTIC_METHOD_MAP.values()) \
-            | set(bat.ACT_REF_METHODS.values()) | set(bat.ACT_LOCATOR_METHODS.values()) | {bat.ACT_SCROLL_METHOD}
+            | set(bat.ACT_REF_METHODS.values()) | set(bat.ACT_LOCATOR_METHODS.values()) \
+            | {bat.ACT_SCROLL_METHOD, bat.ACT_FOCUSED_PRESS_METHOD}
         self.assertEqual(mapped - bat._ALLOWED_METHODS, set())
         self.assertEqual(mapped & bat.FORBIDDEN_METHODS, set())
 
@@ -716,6 +717,17 @@ class TestBrowserAct(unittest.TestCase):
         })
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], bat.INVALID_ARGUMENT)
+
+    def test_press_without_target_uses_focused_element(self):
+        tools, client, session_id = bind_tools(
+            rpc_side_effect=lambda method, params=None, **_: {"ok": True},
+        )
+        client.rpc.reset_mock()
+        result = tools.browser_act({
+            "browserSessionId": session_id, "action": "press", "key": "Enter",
+        })
+        self.assertTrue(result["ok"], result)
+        client.rpc.assert_called_once_with("keyboard.press", {"tabId": 456, "key": "Enter"})
 
     def test_hover_ref_mapping(self):
         tools, client, session_id = bind_tools()

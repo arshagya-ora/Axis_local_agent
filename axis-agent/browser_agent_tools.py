@@ -132,7 +132,7 @@ _ALLOWED_METHODS = frozenset({
     "tabs.list", "tabs.create", "tabs.activate", "tabs.close", "session.list", "session.get",
     "page.accessibilityTree", "page.ariaSnapshot", "page.readText",
     "locator.clickRef", "locator.fillRef", "locator.pressRef", "locator.hoverRef",
-    "locator.selectOptionRef", "locator.click", "locator.fill", "locator.press",
+    "locator.selectOptionRef", "locator.click", "locator.fill", "locator.press", "keyboard.press",
     "locator.selectOption", "locator.check", "locator.uncheck",
     "locator.setInputFiles", "locator.dragTo", "dom.hover", "dom.scroll",
     "page.navigate", "page.reload", "page.goBack", "page.goForward",
@@ -660,8 +660,8 @@ BROWSER_ACT_DESCRIPTION = (
     "confirming success (browser_assert — a successful act does not itself prove it); "
     "collecting evidence (browser_capture_evidence).\n\n"
     "Important capabilities: Prefers a 'ref' from the latest browser_observe; falls back "
-    "to a bounded 'locator'. Returns 'whatChanged' (URL/focus/popup deltas) when the "
-    "bridge reports one.\n\n"
+    "to a bounded 'locator'. A targetless 'press' sends its key to the currently focused "
+    "element. Returns 'whatChanged' (URL/focus/popup deltas) when the bridge reports one.\n\n"
     "Required sequencing: Observe first for ref-based actions; use only current refs. "
     "After acting, check 'observationInvalidated' — if true, observe again before the "
     "next ref-based action.\n\n"
@@ -688,8 +688,9 @@ BROWSER_ACT_PARAMS: Dict[str, Any] = {
             "type": "string",
             "enum": ["click", "fill", "press", "hover", "select", "check", "uncheck", "upload", "drag", "scroll"],
             "description": (
-                "click/fill/press/hover/select act on one element via 'ref' (preferred) or "
-                "'locator'. check/uncheck/upload/drag require 'locator' (drag also "
+                "click/fill/hover/select act on one element via 'ref' (preferred) or "
+                "'locator'. press may omit both to target the currently focused element. "
+                "check/uncheck/upload/drag require 'locator' (drag also "
                 "'targetLocator') — no ref path exists for these four. scroll uses "
                 "'deltaX'/'deltaY', not a ref."
             ),
@@ -700,9 +701,9 @@ BROWSER_ACT_PARAMS: Dict[str, Any] = {
         },
         "ref": {
             "type": "string",
-            "description": "A ref token from the latest browser_observe. Preferred for click/fill/press/hover/select; not usable for check/uncheck/upload/drag.",
+            "description": "A ref token from the latest browser_observe. Preferred for click/fill/hover/select and optional for press; not usable for check/uncheck/upload/drag.",
         },
-        "locator": _locator_schema("Fallback/requirement for click/fill/press/hover/select/check/uncheck/upload; the drag source."),
+        "locator": _locator_schema("Fallback/requirement for click/fill/hover/select/check/uncheck/upload; optional for press; the drag source."),
         "targetLocator": _locator_schema("The drag destination. Required for 'drag'; unused otherwise."),
         "value": {
             "type": "string",
@@ -710,7 +711,7 @@ BROWSER_ACT_PARAMS: Dict[str, Any] = {
         },
         "key": {
             "type": "string",
-            "description": "Key or shortcut (e.g. 'Enter', 'Control+A'). Required for 'press'; ignored otherwise.",
+            "description": "Key or shortcut (e.g. 'Enter', 'Control+A'). Required for 'press'; with no ref/locator it targets the focused element.",
         },
         "options": {
             "type": "array",
@@ -1307,6 +1308,7 @@ ACT_LOCATOR_METHODS = {
     "upload": "locator.setInputFiles",
     "drag": "locator.dragTo",
 }
+ACT_FOCUSED_PRESS_METHOD = "keyboard.press"
 # Actions with no ref-based bridge method at all, so 'ref' is always rejected
 # for them: upload/drag (locator.setInputFilesRef/locator.dragToRef don't
 # exist), and check/uncheck (the bridge has no checkRef/uncheckRef — only
@@ -2031,10 +2033,11 @@ class BrowserAgentTools:
             key = args.get("key")
             if not isinstance(key, str) or not key:
                 raise _ToolArgError(_err(session_id, INVALID_ARGUMENT, "action 'press' requires a non-empty string 'key'.", False))
-            require_ref_or_locator()
             if resolved_ref is not None:
                 return "locator.pressRef", self._ref_params(tab_id, resolved_ref, timeout_ms, {"key": key})
-            return "locator.press", {"tabId": tab_id, "timeoutMs": timeout_ms, "key": key, "locator": require_locator()}
+            if locator is not None:
+                return "locator.press", {"tabId": tab_id, "timeoutMs": timeout_ms, "key": key, "locator": locator}
+            return ACT_FOCUSED_PRESS_METHOD, {"tabId": tab_id, "key": key}
 
         if action == "hover":
             if resolved_ref is not None:

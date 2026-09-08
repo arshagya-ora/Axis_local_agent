@@ -1,22 +1,29 @@
-# Axis Phase 1.2 configuration. Loaded by axis/config.py from the project
-# root by default; set AXIS_CONFIG_PATH to use a different file. Only
-# non-secret settings belong here — credentials/tokens stay in environment
-# variables (see .env.example) and are never read from this file.
+# AXIS configuration — the single file that defines every configurable value
+# for the planner/navigator agent. Read once, by axis.models.AxisConfig.load();
+# there is no configuration framework and nothing else parses this file.
 
 browser:
   # AXIS has whole-browser access by default (see the Browser Agent Bridge's
   # own unscopedTabAccess policy flag) — this must stay true; Phase 1.2 does
   # not restore tab-group-only binding.
   whole_browser_access: true
-  # Which tab bind_axis_run_deps() treats as the initial/informational one.
+  # Which tab the orchestrator binds to on its first browser step.
   # "focused" = Chrome's currently active tab; not an access restriction —
   # every other ordinary tab remains reachable via browser_tabs.
   initial_tab: focused
-  max_open_tabs: 30
+  # Under whole_browser_access every pre-existing tab is registered on the
+  # first tabs.list, before AXIS opens anything of its own — this cap has to
+  # comfortably exceed your normal open-tab count, not just what AXIS itself
+  # needs. Raise it if you regularly run with many tabs open.
+  max_open_tabs: 60
   allow_response_body: false
   # Recorded for forward-compatibility only: no tool schema in this layer
-  # accepts coordinates, so this has no effect yet (see browser_agent_tools.py).
+  # accepts coordinates, so this has no effect yet (see browser_tools.py).
   allow_coordinate_fallback: false
+  # Where browser_capture_evidence writes artifacts; null = the bridge default.
+  artifact_directory: null
+  # Directories locator uploads may read from. Empty = uploads are refused.
+  upload_roots: []
 
   firewall:
     default: allow
@@ -45,17 +52,55 @@ browser:
       - "policy.set"
       - "extension.reload"
 
-limits:
-  max_requests: 600
-  max_tool_calls: 1200
-  max_total_tokens: 50000000
-  max_wall_clock_seconds: 900
-  max_retries: 3
+provider:
+  # Credentials, endpoint, and model come from AXIS_OCI_* in the environment
+  # (see provider_config.py / .env.example). These only override them.
+  model: null
+  base_url: null
+  # OCI GenAI exposes an OpenAI-compatible Responses API.
+  api: responses
+  # Extra pydantic_ai ModelSettings applied to the shared model instance.
+  settings: {}
 
-cli:
-  trace: verbose
-  show_model_text: true
-  show_tool_arguments: true
-  show_tool_results: true
-  show_usage: true
-  redact_sensitive_values: true
+run:
+  # Planner cadence: one planner pass every N navigator steps, plus every
+  # event listed in the orchestrator (goal reached, blocked, follow-up, ...).
+  planner_interval_steps: 3
+  # Browser tool calls the navigator may make inside one navigator step.
+  max_actions_per_step: 3
+  max_total_steps: 30
+  max_model_requests: 60
+  max_browser_actions: 90
+  max_consecutive_failures: 3
+  # Observation taken programmatically before every navigator step.
+  observation_mode: compact
+  observation_max_nodes: 1000
+  # Screenshots are off by default: only the safe evidence alias would ever
+  # reach the model, and the capture still costs a bridge round trip.
+  include_screenshot: false
+  tool_timeout_seconds: 120.0
+
+tools:
+  # The ordinary navigator set is browser_tabs / observe / act / navigate /
+  # wait / assert. These two are opt-in.
+  capture_evidence: false
+  diagnose: false
+  # Pydantic AI's ToolSearch capability. With six visible tools discovery
+  # earns nothing, so it is off; turning it on hides the opt-in tools above
+  # behind defer_loading=True so the navigator has to search for them.
+  tool_search: false
+  # Actions the orchestrator's approval callback is consulted for.
+  approval_required_actions:
+    - upload
+    - drag
+
+memory:
+  max_recent_actions: 8
+  max_completed_goals: 8
+  max_followups: 5
+  max_extracted_data: 8
+
+# Where each Pydantic AI AgentSpec is defined (loaded with Agent.from_file);
+# this file only points at them. Relative to this file's directory.
+planner_spec_path: axis/planner_agent.yaml
+navigator_spec_path: axis/navigator_agent.yaml

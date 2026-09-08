@@ -71,7 +71,18 @@
       "Bash(python -c \"import axis.durability.agent, axis.durability.activities, axis.durability.workflow, axis.durability.plan_cache\")",
       "Bash(grep -n \"WorkflowAlreadyStartedError\\\\|already_exists\\\\|AlreadyStarted\" -r \"/c/Users/ARSHAG~1/AppData/Local/Temp/temporal_inspect/extracted/temporalio\" 2>/dev/null | head -10)",
       "Bash(grep -n \"^def \\\\|^async def \\\\|elif user_input\\\\|elif line\\\\|== \\\\\"/\\\\|startswith\\(\\\\\"/\\\\\"\\)\" \"d:/Products/AXIS/Axis-phase-3/axis-agent/axis/cli.py\")",
-      "Bash(echo \"---compileall exit: $?\")"
+      "Bash(echo \"---compileall exit: $?\")",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(grep -n 'strict\\\\|oneOf\\\\|anyOf\\\\|$ref\\\\|json_schema\\\\|schema' axis-agent/README.md)",
+      "Bash(git restore *)",
+      "Bash(../.venv/Scripts/python.exe scripts/browser_contract.py --update --version v2)",
+      "Bash(../.venv/Scripts/python.exe -m pytest tests -q)",
+      "Bash(../.venv/Scripts/python.exe -c \"import anyio\")",
+      "Bash(../.venv/Scripts/python.exe -m pytest tests/test_axis_agent.py -q)",
+      "WebFetch(domain:pydantic.dev)",
+      "Bash(timeout 60 ../.venv/Scripts/python.exe -c ' *)",
+      "Bash(timeout 30 env PYTHONIOENCODING=utf-8 ../.venv/Scripts/python.exe -c ' *)",
+      "Bash(grep -rn \"\\\\\\\\\\\\\\\\ufffd\\\\|mangled\\\\|120 results\" axis-agent/tests)"
     ],
     "additionalDirectories": [
       "\\tmp"

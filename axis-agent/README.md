@@ -1,8 +1,7 @@
 # Axis Agent — Browser Tool Layer
 
-A minimal Python tool layer that lets an LLM-based agent drive one
-already-running, Agent-managed Chrome tab through
-[Browser Agent Bridge](../browser-agent-bridge-main), using seven bounded
+A minimal Python tool layer that lets an LLM-based agent drive Chrome tabs
+through [Browser Agent Bridge](../browser-agent-bridge-main), using eight bounded
 natural-language tools instead of the bridge's ~150-method raw JSON-RPC
 surface.
 
@@ -15,10 +14,11 @@ axis-agent/
     └── test_browser_agent_tools.py
 ```
 
-## The seven tools
+## The eight tools
 
 | Tool | Purpose | Not for |
 | --- | --- | --- |
+| `browser_tabs` | List, create, activate, or close tabs through opaque handles | Reading or interacting with page content |
 | `browser_observe` | Read the page; mint `ref`s | Modifying the page, verifying success |
 | `browser_act` | One interaction (click/fill/press/hover/select/check/uncheck/upload/drag/scroll) | Discovery, navigation, verification |
 | `browser_navigate` | Open a URL / reload / back / forward | Clicking a link, verifying the destination |
@@ -27,7 +27,7 @@ axis-agent/
 | `browser_capture_evidence` | Screenshot / snapshot / PDF / trace artifacts | Routine observation |
 | `browser_diagnose` | Console / network / DOM / trace investigation | Normal interaction |
 
-The LLM only ever sees these seven names (see `get_tool_definitions()`); it
+The LLM only ever sees these eight names (see `get_tool_definitions()`); it
 never selects a raw bridge method, a Chrome `tabId`/`windowId`/`groupId`, a
 `snapshotId`, or a `frameId` — those are resolved internally from a
 `browserSessionId` and (for element actions) a `ref` minted by
@@ -49,7 +49,7 @@ if not bound["ok"]:
 browser_session_id = bound["browserSessionId"]
 
 # Hand these to your LLM function-calling loop:
-tool_defs = get_tool_definitions()           # 7 {"type": "function", ...} entries
+tool_defs = get_tool_definitions()           # 8 {"type": "function", ...} entries
 handlers = get_tool_handlers(tools)          # name -> bound method
 system_prompt = BROWSER_AGENT_INSTRUCTIONS
 
@@ -87,7 +87,7 @@ Every tool returns the same envelope:
   default `ManagedTabGroupScopeProvider` only confirms the session was
   legitimately bound; a future `ExternalFirewallScopeProvider` (defined but
   intentionally `NotImplementedError`) can be swapped in via the
-  constructor's `scope_provider=` argument with **no change to the seven
+  constructor's `scope_provider=` argument with **no change to the eight
   public tools or their schemas**.
 - **The bridge remains the enforcement boundary.** Tab-group isolation is
   already enforced inside the extension (`extension/sw/tab-scope.js`,
@@ -179,7 +179,7 @@ each layer one job instead of restating the same rule everywhere:
 | | mode=text | `page.readText` |
 | `browser_act` | click (ref / locator) | `locator.clickRef` / `locator.click` |
 | | fill | `locator.fillRef` / `locator.fill` |
-| | press | `locator.pressRef` / `locator.press` |
+| | press (ref / locator / currently focused element) | `locator.pressRef` / `locator.press` / `keyboard.press` |
 | | hover (ref / locator) | `locator.hoverRef` / `dom.hover` † |
 | | select | `locator.selectOptionRef` / `locator.selectOption` |
 | | check / uncheck | `locator.check` / `locator.uncheck` — **locator only**; `ref` is always rejected ‡ |
