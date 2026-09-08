@@ -267,14 +267,24 @@ class StepGate:
             self.active_tab_changed_to = data["openedTab"]
             self._interrupt("the popup tab is now the active browser context")
         elif tool == "browser_tabs" and operation in {"activate", "close", "create"}:
-            # Record which tab is now active. Without this the orchestrator
-            # keeps observing the tab the navigator just left, so the model
-            # has to spend a whole extra step re-activating the new one.
+            # Record which tab is now active so the orchestrator's next
+            # automatic observation follows the navigator instead of the tab
+            # it left.
             if operation in {"activate", "create"} and success:
                 new_tab = result.get("tab") or data.get("tab")
                 if isinstance(new_tab, str):
                     self.active_tab_changed_to = new_tab
-            self._interrupt("the active tab changed")
+            # Creating or activating a tab does NOT end the step. Every tool
+            # takes an explicit tab alias and BrowserRuntime.resolve_ref keys
+            # refs per tab, so a queued action aimed at another tab is either
+            # deliberate or safely rejected — it can never silently land on
+            # the wrong page. Interrupting here instead cost a whole model
+            # round trip per tab, turning "open three tabs and read them"
+            # into thirteen steps of create/activate ping-pong.
+            # Closing still interrupts: it can destroy the very tab the
+            # remaining actions target.
+            if operation == "close":
+                self._interrupt("a tab was closed")
 
         record = ActionRecord(
             tool=tool,

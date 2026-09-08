@@ -278,6 +278,52 @@ async def test_a_tabs_list_result_survives_into_planner_context_across_steps():
     )
 
 
+async def test_opening_several_tabs_does_not_cost_one_step_each():
+    """Regression: creating/activating a tab used to interrupt the step, so
+    "open three tabs" burned three model round trips of create/activate
+    ping-pong. Refs are keyed per tab and every tool takes an explicit tab
+    alias, so queued actions cannot land on the wrong page and the step can
+    safely continue."""
+    config = AxisConfig.load()
+    config.run.max_actions_per_step = 3
+    config.run.planner_interval_steps = 1
+    script = Script(
+        [browse(), done()],
+        [{"calls": [
+            ("browser_tabs", {"command": {"operation": "create", "url": "https://a.test/"}}),
+            ("browser_tabs", {"command": {"operation": "create", "url": "https://b.test/"}}),
+            ("browser_tabs", {"command": {"operation": "create", "url": "https://c.test/"}}),
+        ], "outcome": {"status": "goal_reached"}}],
+    )
+    orchestrator, bridge, _ = make(script, config=config)
+    created = iter([71, 72, 73])
+    bridge.responses["tabs.create"] = lambda: {
+        "tab": {"id": next(created), "url": "https://x.test/", "title": "X"}
+    }
+    await orchestrator.run("Open three tabs.")
+    # all three reached the bridge inside one navigator step
+    assert bridge.methods.count("tabs.create") == 3
+    assert script.navigator_calls == 1
+
+
+async def test_closing_a_tab_still_interrupts_the_step():
+    """Closing can destroy the very tab the remaining actions target, so it
+    keeps interrupting even though create/activate no longer do."""
+    config = AxisConfig.load()
+    config.run.planner_interval_steps = 1
+    script = Script(
+        [browse(), done()],
+        [{"calls": [
+            ("browser_tabs", {"command": {"operation": "close", "tab": "tab_1"}}),
+            CLICK,
+        ], "outcome": {"status": "continue"}}],
+    )
+    orchestrator, bridge, _ = make(script, config=config)
+    await orchestrator.run("Close it then click.")
+    assert "tabs.close" in bridge.methods
+    assert "locator.clickRef" not in bridge.methods
+
+
 async def test_the_orchestrator_follows_a_tab_the_navigator_switched_to():
     """Regression: after the navigator created/activated a tab, self.tab still
     pointed at the old one, so the next observation came back for the page it
@@ -319,6 +365,22 @@ async def test_capture_tool_is_added_when_the_task_asks_for_a_screenshot():
     await orchestrator.run("Do the thing and then take a screenshot of it.")
     assert built and built[0]["capture"] is True
     assert built[0]["diagnose"] is False
+    assert built[0]["downloads"] is False
+
+
+async def test_download_tool_is_added_only_for_download_tasks():
+    from axis.orchestrator import downloads_requested
+
+    assert downloads_requested("download the generated CSV") is True
+    assert downloads_requested("read the current page") is False
+    config = AxisConfig.load()
+    built = []
+    script = Script([done("Fine.")])
+    orchestrator, _, _ = make(script, config=config)
+    orchestrator.navigator_factory = lambda **kwargs: built.append(kwargs) or orchestrator.navigator
+    await orchestrator.run("Generate and download the report as CSV.")
+    assert built and built[0]["downloads"] is True
+    assert built[0]["capture"] is False
 
 
 async def test_at_most_three_browser_actions_execute_per_navigator_step():
@@ -423,10 +485,13 @@ async def test_capture_and_diagnose_are_opt_in():
     config = AxisConfig.load()
     assert config.tools.capture_evidence is False
     assert config.tools.diagnose is False
+    assert config.tools.downloads is False
     config.tools.capture_evidence = True
     assert [t.name for t in navigator_tools(config)][-1] == "browser_capture_evidence"
     config.tools.diagnose = True
     assert [t.name for t in navigator_tools(config)][-1] == "browser_diagnose"
+    config.tools.downloads = True
+    assert [t.name for t in navigator_tools(config)][-1] == "browser_downloads"
 
     script = Script([browse(), done()], [{"calls": [], "outcome": {"status": "goal_reached"}}])
     orchestrator, _, _ = make(script, config=config)
@@ -649,7 +714,10 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
 
     assert result.status == "completed"
     assert result.answer == "The top result is the Pydantic AI docs."
+    assert "<unverified_page_changes>2</unverified_page_changes>" in script.navigator_prompts[1]
     assert bridge.methods == [
+        "extension.info",          # one-time capability negotiation
+        "native.sitePatterns",     # site-pattern preflight
         "tabs.list",              # bind to the focused tab, once
         "page.accessibilityTree",  # programmatic observation before step 1
         "locator.fillRef",

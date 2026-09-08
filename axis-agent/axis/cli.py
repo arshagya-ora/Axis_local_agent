@@ -65,12 +65,13 @@ def build_orchestrator(
     """Wire config -> one shared model -> planner + navigator -> orchestrator."""
     model = build_model(config, client=openai_client, model_name=model_name)
 
-    def navigator_factory(*, capture: bool, diagnose: bool):
+    def navigator_factory(*, capture: bool, diagnose: bool, downloads: bool):
         """Rebuild the navigator when an opt-in tool becomes necessary. Cheap:
         the model instance is shared, only the tool list changes."""
         variant = config.model_copy(deep=True)
         variant.tools.capture_evidence = capture
         variant.tools.diagnose = diagnose
+        variant.tools.downloads = downloads
         return build_navigator(variant, model)
 
     return AxisOrchestrator(

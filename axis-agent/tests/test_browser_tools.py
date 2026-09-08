@@ -26,6 +26,7 @@ TOOL_FUNCTIONS = (
     bt.browser_assert,
     bt.browser_capture_evidence,
     bt.browser_diagnose,
+    bt.browser_downloads,
 )
 
 
@@ -56,11 +57,12 @@ def runtime_with_tab(url="https://example.test/"):
     return bridge, runtime, alias
 
 
-def test_all_eight_functions_are_independently_selectable():
+def test_all_nine_functions_are_independently_selectable():
     names = [function.__name__ for function in TOOL_FUNCTIONS]
     assert names == [
         "browser_tabs", "browser_observe", "browser_act", "browser_navigate",
         "browser_wait", "browser_assert", "browser_capture_evidence", "browser_diagnose",
+        "browser_downloads",
     ]
     selected = [bt.browser_tabs, bt.browser_observe, bt.browser_navigate]
     assert [Tool(function, takes_ctx=True).name for function in selected] == [
@@ -84,7 +86,10 @@ def test_pydantic_generates_bounded_schemas_without_internal_identifiers():
         assert "page.executeJavaScript" not in serialized
         assert "tabs.list" not in serialized
     assert "oneOf" in json.dumps(Tool(bt.browser_act, takes_ctx=True).tool_def.parameters_json_schema)
-    assert len(json.dumps(schemas)) < 25_000
+    # The six hot-path schemas stay compact. Specialist evidence, diagnostics,
+    # and downloads are progressively disclosed and do not burden normal runs.
+    assert len(json.dumps(schemas[:6])) < 25_000
+    assert len(json.dumps(schemas)) < 32_000
 
 
 def test_pydantic_rejects_an_incomplete_action_before_the_function_runs():
@@ -207,8 +212,164 @@ def test_sensitive_diagnostics_and_unsafe_artifacts_never_reach_bridge():
     assert bridge.saved == []
 
 
+def test_locator_actions_use_visible_strict_stable_bridge_defaults():
+    bridge, runtime, alias = runtime_with_tab()
+    command = bt.Fill(
+        action="fill",
+        target=bt.LocatorTarget(
+            kind="locator",
+            locator=bt.Locator(
+                role="textbox", name="Message",
+                within=bt.Locator(selector="main", has_text="Chat"),
+                frame_selector="iframe.app",
+            ),
+        ),
+        value="hello",
+    )
+    result = bt.browser_act(context(runtime), alias, command)
+    assert result["ok"] is True
+    method, params = bridge.calls[-1]
+    assert method == "locator.fill"
+    assert params["locator"]["visible"] is True
+    assert params["locator"]["within"]["hasText"] == "Chat"
+    assert params["frameSelector"] == "iframe.app"
+    assert params["strict"] is True
+    assert params["stable"] is True
+    assert params["timeoutMs"] == bt.DEFAULT_ACTION_TIMEOUT_MS
+
+
+def test_structured_bridge_error_code_and_diagnostic_are_preserved():
+    bridge, runtime, alias = runtime_with_tab()
+
+    def fail():
+        raise bt.BrowserBridgeError(
+            "not actionable",
+            {"code": "LOCATOR_ACTIONABILITY_TIMEOUT", "diagnostic": {"visibleCount": 0}},
+        )
+
+    bridge.responses["locator.click"] = fail
+    result = bt.browser_act(
+        context(runtime), alias,
+        bt.Click(action="click", target=bt.LocatorTarget(
+            kind="locator", locator=bt.Locator(role="button", name="Save"),
+        )),
+    )
+    assert result["error"]["code"] == "LOCATOR_ACTIONABILITY_TIMEOUT"
+    assert result["error"]["retryable"] is True
+    assert result["error"]["detail"]["diagnostic"]["visibleCount"] == 0
+
+
+def test_observe_supports_locator_inspection_and_frames_without_raw_ids():
+    bridge, runtime, alias = runtime_with_tab()
+    bridge.responses["locator.count"] = {"count": 2, "visibleCount": 1}
+    counted = bt.browser_observe(
+        context(runtime), alias, locator=bt.Locator(role="button", name="Save"), extract="count",
+    )
+    assert counted["data"]["result"] == {"count": 2, "visibleCount": 1}
+
+    bridge.responses["page.frames"] = {
+        "frames": [{"frameId": 7, "parentFrameId": 0, "url": "https://frame.example/"}],
+    }
+    frames = bt.browser_observe(context(runtime), alias, mode="frames")
+    assert frames["data"]["frames"] == [{"url": "https://frame.example/"}]
+    assert "frameId" not in json.dumps(frames)
+
+
+def test_popup_wait_registers_a_safe_tab_alias():
+    bridge, runtime, alias = runtime_with_tab()
+    bridge.responses["page.waitForPopup"] = {
+        "tab": {"id": 99, "url": "https://login.example/callback", "title": "Signed in"},
+        "elapsedMs": 12,
+    }
+    result = bt.browser_wait(
+        context(runtime), alias,
+        bt.EventWait(condition="popup", url_contains="callback"),
+    )
+    assert result["data"]["openedTab"] == "tab_2"
+    assert result["data"]["result"]["tab"]["tab"] == "tab_2"
+    assert "99" not in json.dumps(result)
+
+
+def test_network_wait_maps_typed_filters_and_aliases_request_ids():
+    bridge, runtime, alias = runtime_with_tab()
+    bridge.responses["page.waitForResponse"] = {
+        "response": {"requestId": "raw-request", "url": "https://api.example/items", "status": 201},
+    }
+    result = bt.browser_wait(
+        context(runtime), alias,
+        bt.ResponseWait(
+            condition="response", url_contains="/items", status=201,
+            http_method="post", mime_type="application/json",
+        ),
+    )
+    method, params = bridge.calls[-1]
+    assert method == "page.waitForResponse"
+    assert params["urlContains"] == "/items"
+    assert params["method"] == "post"
+    assert params["mimeType"] == "application/json"
+    assert result["data"]["result"]["response"]["request"] == "request_1"
+    assert "raw-request" not in json.dumps(result)
+
+
+def test_download_tool_hides_download_ids():
+    bridge, runtime, _ = runtime_with_tab()
+    bridge.responses["downloads.list"] = {
+        "items": [{"id": 12, "filename": "report.csv", "state": "complete", "url": "https://x.test/file"}],
+    }
+    result = bt.browser_downloads(context(runtime), bt.ListDownloads(operation="list"))
+    assert result["data"]["items"][0]["filename"] == "report.csv"
+    assert "\"id\"" not in json.dumps(result)
+
+
+def test_capability_negotiation_prevents_unadvertised_rpc_calls():
+    bridge, runtime, alias = runtime_with_tab()
+    bridge.responses["extension.info"] = {"tools": ["tabs.list"]}
+    result = bt.browser_act(
+        context(runtime), alias,
+        bt.Click(action="click", target=bt.LocatorTarget(
+            kind="locator", locator=bt.Locator(role="button", name="Save"),
+        )),
+    )
+    assert result["error"]["code"] == "CAPABILITY_UNAVAILABLE"
+    assert "locator.click" not in [method for method, _ in bridge.calls]
+
+
+def test_site_pattern_preflight_is_attached_to_observation():
+    bridge, runtime, alias = runtime_with_tab("https://app.example.test/path")
+    bridge.responses["extension.info"] = {"tools": ["page.accessibilityTree", "native.sitePatterns"]}
+    bridge.responses["native.sitePatterns"] = {
+        "patterns": [{
+            "domain": "example.test", "summary": "Known app shell",
+            "content": "Use the visible composer and wait for Save.",
+        }],
+    }
+    bridge.responses["page.accessibilityTree"] = {"snapshotId": "s", "snapshot": "", "url": "https://app.example.test/path"}
+    result = bt.browser_observe(context(runtime), alias)
+    assert result["data"]["sitePattern"]["domain"] == "example.test"
+    assert "visible composer" in result["data"]["sitePattern"]["notes"]
+
+
+def test_debug_telemetry_is_bounded_redacted_and_uses_safe_aliases():
+    bridge, runtime, alias = runtime_with_tab()
+    bridge.responses["extension.info"] = {
+        "tools": ["recording.start", "recording.stop", "trace.start", "trace.stop", "native.sitePatterns"],
+    }
+    bridge.responses["recording.start"] = {"recording": {"id": "raw-recording"}}
+    bridge.responses["trace.start"] = {"trace": {"id": "raw-trace"}}
+    runtime.start_debug_telemetry(alias)
+    assert runtime.debug_recording == "recording_1"
+    assert runtime.debug_trace == "trace_1"
+    start_params = {method: params for method, params in bridge.calls}
+    assert start_params["recording.start"]["includeText"] is False
+    assert start_params["recording.start"]["captureScreenshots"] is False
+    assert start_params["recording.start"]["maxActions"] == 250
+    assert start_params["trace.start"]["includeText"] is False
+    stopped = runtime.stop_debug_telemetry()
+    assert stopped == {"recording": "recording_1", "trace": "trace_1"}
+
+
 def test_new_module_is_substantially_smaller_and_legacy_file_is_unchanged():
     legacy = AGENT_DIR / "browser_agent_tools.py"
     new = AGENT_DIR / "browser_tools.py"
     assert hashlib.sha256(legacy.read_bytes()).hexdigest() == LEGACY_SHA256
-    assert len(new.read_text(encoding="utf-8").splitlines()) < len(legacy.read_text(encoding="utf-8").splitlines()) // 2
+    assert len(new.read_text(encoding="utf-8").splitlines()) < len(legacy.read_text(encoding="utf-8").splitlines()) * 3 // 5

@@ -18,10 +18,33 @@ instructions: |
   an error, do not repeat it — report what happened and let a fresh
   observation arrive.
 
+  Treat BrowserState as control state, not background prose:
+  - refs_fresh=false means use a semantic locator or wait for a new snapshot;
+  - unverified_page_changes>0 means check the stated success condition before
+    claiming goal_reached;
+  - site_pattern contains local prior experience: use it as a hint, then verify
+    against the current page;
+  - openedTab/openedTabs results are registered tab aliases; the orchestrator
+    follows the new context automatically, so stop the current step.
+
+  Choose by current state. Use browser_observe for page reading, locator inspection,
+  or frame discovery; browser_act for one interaction (including dialog
+  handling); browser_wait only for a concrete asynchronous page, popup,
+  dialog, request, or response; and browser_assert for exact success checks.
+  Prefer a visible semantic locator scoped with within/has_text over a broad
+  CSS match. The runtime enforces strict single-element action matching and
+  stable-element readiness, so refine ambiguity instead of bypassing it.
+
   Do not spend actions re-reading or re-selecting what you already have. A
-  fresh observation of the active tab arrives automatically before every
-  step, so never call browser_observe as your first action, and never
-  activate a tab you just created or switched to — you are already there.
+  fresh observation arrives automatically before every step, so do not
+  re-observe that tab, and never activate a tab you just created or switched
+  to — you are already there.
+
+  That automatic observation covers one tab. To read a different tab, call
+  browser_observe with that tab's alias — do NOT activate it first.
+  Every tool takes a tab alias, so you can create several tabs and then read
+  each of them by alias within a single step. Activating a tab is only for
+  when the user needs to see it.
 
   Never resubmit a form, prompt, or message that a previous step already
   submitted successfully; that duplicates it. If the result has not appeared
@@ -29,8 +52,8 @@ instructions: |
 
   Waiting is expensive: a wait that times out costs its full timeout for
   nothing. Prefer ending the step and reading the next observation over
-  waiting, and when you must wait, pass an explicit short timeout_ms
-  (about 5000-8000) rather than the default.
+  waiting. Defaults are deliberately short; increase timeout_ms only for a
+  known slow operation.
 
   After a navigation, a tab change, a substantial rerender, a failed call,
   or a denied approval, your remaining calls for this step are cancelled.

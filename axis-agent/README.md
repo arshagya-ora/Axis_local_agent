@@ -1,9 +1,21 @@
 # Axis Agent — Browser Tool Layer
 
-A minimal Python tool layer that lets an LLM-based agent drive Chrome tabs
-through [Browser Agent Bridge](../browser-agent-bridge-main), using eight bounded
-natural-language tools instead of the bridge's ~150-method raw JSON-RPC
-surface.
+Python browser-control layers that let an LLM-based agent drive Chrome tabs
+through [Browser Agent Bridge](../browser-agent-bridge-main) without exposing
+the bridge's ~150-method raw JSON-RPC surface.
+
+## Active AXIS runtime versus frozen compatibility layer
+
+The AXIS planner/navigator runtime imports `browser_tools.py`. It keeps six
+semantic tools eager (`tabs`, `observe`, `act`, `navigate`, `wait`, `assert`),
+progressively adds evidence, diagnostics, and downloads only when relevant,
+and keeps capability negotiation, site-pattern lookup, popup registration, and
+debug recording/tracing inside `BrowserRuntime`. Its P0-P3 behavior and state
+machine are documented in [P0_P3_IMPLEMENTATION.md](P0_P3_IMPLEMENTATION.md).
+
+The remainder of this README documents `browser_agent_tools.py`, the older
+eight-tool compatibility layer and its legacy tests. The active AXIS runtime
+does not load or require browser-contract snapshot files.
 
 ```
 axis-agent/

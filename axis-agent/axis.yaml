@@ -82,9 +82,13 @@ run:
 
 tools:
   # The ordinary navigator set is browser_tabs / observe / act / navigate /
-  # wait / assert. These two are opt-in.
+  # wait / assert. Specialist tools stay out of the hot-path schema.
   capture_evidence: false
   diagnose: false
+  downloads: false
+  # Internal bridge recording + RPC trace. Text and screenshots are excluded;
+  # enable only for bounded failure investigation.
+  debug_recording: false
   # Pydantic AI's ToolSearch capability. With six visible tools discovery
   # earns nothing, so it is off; turning it on hides the opt-in tools above
   # behind defer_loading=True so the navigator has to search for them.

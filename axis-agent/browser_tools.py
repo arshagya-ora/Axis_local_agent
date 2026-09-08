@@ -42,7 +42,7 @@ _SENSITIVE = re.compile(
     re.IGNORECASE,
 )
 _INTERNAL_KEYS = {
-    "tabId", "windowId", "groupId", "sessionId", "snapshotId", "frameId",
+    "tabId", "windowId", "groupId", "sessionId", "snapshotId", "frameId", "parentFrameId", "processId",
     "targetId", "loaderId", "executionContextId", "traceId", "requestId",
 }
 _REF_LINE = re.compile(r"^\[f(\d+):([^\]]+)\](.*)$")
@@ -117,6 +117,13 @@ def _locator_params(locator: Locator) -> dict[str, Any]:
     frame_selector = value.pop("frameSelector", None)
     if frame_selector:
         params["frameSelector"] = frame_selector
+    return params
+
+
+def _action_locator_params(locator: Locator) -> dict[str, Any]:
+    """Actions should never select an earlier hidden duplicate by accident."""
+    params = _locator_params(locator)
+    params["locator"].setdefault("visible", True)
     return params
 
 
@@ -546,7 +553,7 @@ def _error(tab: str | None, fault: ToolFault) -> dict[str, Any]:
             "code": fault.code,
             "message": str(fault),
             "retryable": fault.retryable,
-            "detail": fault.detail,
+            "detail": _without_bridge_element_refs(fault.detail),
         }),
     }
 
@@ -679,6 +686,9 @@ class BrowserRuntime:
     def _rpc(self, method: str, params: dict[str, Any], *, tab: str | None = None, url: str | None = None) -> Any:
         if not self._method_allowed(method):
             raise ToolFault("FIREWALL_DENIED", "This browser operation is not allowed.")
+        current_url = self.tabs[tab].url if tab in self.tabs else None
+        if not self._url_allowed(url or current_url):
+            raise ToolFault("FIREWALL_DENIED", "This URL is blocked by browser policy.")
         if not self._capabilities_checked and method != "extension.info":
             self._negotiate_capabilities()
         if self.advertised_methods is not None and method not in self.advertised_methods and not method.startswith("native."):
@@ -686,9 +696,6 @@ class BrowserRuntime:
                 "CAPABILITY_UNAVAILABLE",
                 f"The connected bridge does not advertise {method}; reload or upgrade the extension.",
             )
-        current_url = self.tabs[tab].url if tab in self.tabs else None
-        if not self._url_allowed(url or current_url):
-            raise ToolFault("FIREWALL_DENIED", "This URL is blocked by browser policy.")
         try:
             return self.client.rpc(method, params)
         except BrowserBridgeError as exc:
@@ -705,10 +712,6 @@ class BrowserRuntime:
                 if tab:
                     self.invalidate(tab)
                 raise ToolFault("STALE_REFERENCE", "The page changed; observe it again.", True) from exc
-            if re.search(r"timed?\s*out|timeout", text, re.IGNORECASE):
-                raise ToolFault("TIMEOUT", text, True, data) from exc
-            if re.search(r"connection|refused|unreachable|temporarily unavailable|HTTP 5\d\d", text, re.IGNORECASE):
-                raise ToolFault("BRIDGE_UNAVAILABLE", text, True, data) from exc
             if isinstance(bridge_code, str) and bridge_code:
                 retryable = bridge_code.endswith("_TIMEOUT") or bridge_code in {
                     "LOCATOR_ACTIONABILITY_TIMEOUT", "PAGE_WAIT_FOR_POPUP_TIMEOUT",
@@ -716,6 +719,10 @@ class BrowserRuntime:
                     "PAGE_WAIT_FOR_RESPONSE_TIMEOUT",
                 }
                 raise ToolFault(bridge_code, text, retryable, data) from exc
+            if re.search(r"timed?\s*out|timeout", text, re.IGNORECASE):
+                raise ToolFault("TIMEOUT", text, True, data) from exc
+            if re.search(r"connection|refused|unreachable|temporarily unavailable|HTTP 5\d\d", text, re.IGNORECASE):
+                raise ToolFault("BRIDGE_UNAVAILABLE", text, True, data) from exc
             raise ToolFault("BRIDGE_ERROR", text, False, data) from exc
 
     def _negotiate_capabilities(self) -> None:
@@ -735,6 +742,10 @@ class BrowserRuntime:
 
     def site_pattern_for(self, url: str | None) -> dict[str, Any] | None:
         host = (urlsplit(url).hostname or "").lower() if url else ""
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
         while host:
             if host in self.site_patterns:
                 return self.site_patterns[host]
@@ -1115,7 +1126,7 @@ def _act_target(rt: BrowserRuntime, tab: str, target: Target, command: Any) -> t
         params = rt.ref_params(tab, target.ref, timeout)
         params["stable"] = True
         return ref_methods[action], params
-    locator_params = _locator_params(target.locator)
+    locator_params = _action_locator_params(target.locator)
     if action == "hover":
         selector = locator_params["locator"].get("selector")
         if not selector:
@@ -1148,28 +1159,28 @@ def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: ActComm
         elif isinstance(command, Check):
             method = f"locator.{command.action}"
             params = {
-                "tabId": state.raw_id, **_locator_params(command.locator), "timeoutMs": command.timeout_ms,
+                "tabId": state.raw_id, **_action_locator_params(command.locator), "timeoutMs": command.timeout_ms,
                 "index": 0, "strict": True, "stable": True,
             }
         elif isinstance(command, TypeSequentially):
             method = "locator.pressSequentially"
             params = {
-                "tabId": state.raw_id, **_locator_params(command.locator), "text": command.value,
+                "tabId": state.raw_id, **_action_locator_params(command.locator), "text": command.value,
                 "delayMs": command.delay_ms, "index": 0, "strict": True,
                 "timeoutMs": command.timeout_ms,
             }
         elif isinstance(command, Upload):
             method = "locator.setInputFiles"
             params = {
-                "tabId": state.raw_id, **_locator_params(command.locator),
+                "tabId": state.raw_id, **_action_locator_params(command.locator),
                 "files": rt.validated_files(command.files), "timeoutMs": command.timeout_ms,
                 "index": 0, "strict": True,
             }
         elif isinstance(command, Drag):
             method = "locator.dragTo"
             params = {
-                "tabId": state.raw_id, **_locator_params(command.source),
-                "targetLocator": command.destination.bridge_value(), "timeoutMs": command.timeout_ms,
+                "tabId": state.raw_id, **_action_locator_params(command.source),
+                "targetLocator": _action_locator_params(command.destination)["locator"], "timeoutMs": command.timeout_ms,
                 "index": 0, "targetIndex": 0, "strict": True,
             }
         elif isinstance(command, Scroll):
@@ -1179,7 +1190,7 @@ def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: ActComm
                 params["selector"] = command.selector
         elif isinstance(command, Focus):
             method = "locator.focus"
-            params = {"tabId": state.raw_id, **_locator_params(command.locator), "index": command.index}
+            params = {"tabId": state.raw_id, **_action_locator_params(command.locator), "index": command.index}
         else:
             method = "page.acceptDialog" if command.action == "accept_dialog" else "page.dismissDialog"
             params = {"tabId": state.raw_id}
@@ -1286,6 +1297,10 @@ def browser_wait(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: WaitCo
                     params[bridge_key] = value
         result = rt._rpc(methods[command.condition], params, tab=tab) or {}
         invalidated = command.condition in {"url", "navigation"}
+        if isinstance(command, (RequestWait, ResponseWait)) and isinstance(result, dict):
+            event_key = command.condition
+            if isinstance(result.get(event_key), dict):
+                result = {**result, event_key: rt.public_requests([result[event_key]])[0]}
         popup_tab = None
         if command.condition == "popup" and isinstance(result, dict) and isinstance(result.get("tab"), dict):
             popup_tab = rt._register(result["tab"])

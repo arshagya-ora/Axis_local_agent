@@ -63,10 +63,19 @@ _EVIDENCE_REQUEST = re.compile(
     r"\bpdf\b|\bartifact\b|save .*(image|picture|file)",
     re.IGNORECASE,
 )
+_DOWNLOAD_REQUEST = re.compile(
+    r"\bdownload(?:ed|ing|s)?\b|\bexport\b.*\b(file|csv|xlsx|pdf|zip)\b|"
+    r"\bsave\b.*\b(file|report|attachment)\b",
+    re.IGNORECASE,
+)
 
 
 def evidence_requested(*texts: str | None) -> bool:
     return any(_EVIDENCE_REQUEST.search(text) for text in texts if text)
+
+
+def downloads_requested(*texts: str | None) -> bool:
+    return any(_DOWNLOAD_REQUEST.search(text) for text in texts if text)
 
 
 class _Stop(Exception):
@@ -114,6 +123,8 @@ class AxisOrchestrator:
         self._repair_attempted = False
         self._capture_enabled = config.tools.capture_evidence
         self._diagnose_enabled = config.tools.diagnose
+        self._downloads_enabled = config.tools.downloads
+        self._debug_telemetry_started = False
         self._started = time.monotonic()
         self._model_ms = 0
         self._browser_ms = 0
@@ -143,7 +154,9 @@ class AxisOrchestrator:
         self._completion_rejected = False
         self._started = time.monotonic()
         self._model_ms = self._browser_ms = 0
-        self._sync_navigator_tools(capture=evidence_requested(task))
+        self._sync_navigator_tools(
+            capture=evidence_requested(task), downloads=downloads_requested(task),
+        )
         return await self._loop()
 
     async def continue_task(self, follow_up: str) -> AxisResult:
@@ -165,10 +178,14 @@ class AxisOrchestrator:
         self._completion_rejected = False
         self._started = time.monotonic()
         self._model_ms = self._browser_ms = 0
-        self._sync_navigator_tools(capture=evidence_requested(follow_up))
+        self._sync_navigator_tools(
+            capture=evidence_requested(follow_up), downloads=downloads_requested(follow_up),
+        )
         return await self._loop()
 
-    def _sync_navigator_tools(self, *, capture: bool = False, diagnose: bool = False) -> None:
+    def _sync_navigator_tools(
+        self, *, capture: bool = False, diagnose: bool = False, downloads: bool = False,
+    ) -> None:
         """Turn on an opt-in tool when the run actually needs it.
 
         ``browser_capture_evidence`` is added when the user asked for a
@@ -179,13 +196,23 @@ class AxisOrchestrator:
         """
         want_capture = self._capture_enabled or capture or self.config.tools.capture_evidence
         want_diagnose = self._diagnose_enabled or diagnose or self.config.tools.diagnose
-        if (want_capture, want_diagnose) == (self._capture_enabled, self._diagnose_enabled):
+        want_downloads = self._downloads_enabled or downloads or self.config.tools.downloads
+        if (want_capture, want_diagnose, want_downloads) == (
+            self._capture_enabled, self._diagnose_enabled, self._downloads_enabled,
+        ):
             return
-        self._capture_enabled, self._diagnose_enabled = want_capture, want_diagnose
+        self._capture_enabled, self._diagnose_enabled, self._downloads_enabled = (
+            want_capture, want_diagnose, want_downloads,
+        )
         if self.navigator_factory is None:
             return
-        self.navigator = self.navigator_factory(capture=want_capture, diagnose=want_diagnose)
-        self._emit("status", phase="tools_changed", capture=want_capture, diagnose=want_diagnose)
+        self.navigator = self.navigator_factory(
+            capture=want_capture, diagnose=want_diagnose, downloads=want_downloads,
+        )
+        self._emit(
+            "status", phase="tools_changed", capture=want_capture,
+            diagnose=want_diagnose, downloads=want_downloads,
+        )
 
     # -- events ----------------------------------------------------------
 
@@ -221,6 +248,8 @@ class AxisOrchestrator:
     def _result(self, status: str, *, answer: str | None = None, evidence: list[str] | None = None,
                 reason: str = "") -> AxisResult:
         memory = self.memory
+        debug_artifacts = self.browser.stop_debug_telemetry() if self._debug_telemetry_started else {}
+        self._debug_telemetry_started = False
         result = AxisResult(
             status=status,  # type: ignore[arg-type]
             answer=answer,
@@ -237,6 +266,7 @@ class AxisOrchestrator:
         self._emit(
             "final", status=result.status, reason=result.reason,
             duration_ms=result.duration_ms, model_ms=result.model_ms, browser_ms=result.browser_ms,
+            debug_artifacts=debug_artifacts or None,
         )
         return result
 
@@ -305,9 +335,11 @@ class AxisOrchestrator:
             memory.latest_navigator_outcome = outcome
             memory.record_actions(gate.records)
             self.browser_actions += gate.actions_used
+            mutated_this_step = False
             for record, (mutated, verified) in zip(gate.records, gate.effects):
                 if mutated:
                     memory.mutation_count += 1
+                    mutated_this_step = True
                 if verified:
                     memory.verified_mutation_count = memory.mutation_count
             # Follow a tab the navigator switched to, so the next observation
@@ -316,6 +348,12 @@ class AxisOrchestrator:
             if gate.active_tab_changed_to and gate.active_tab_changed_to in self.browser.tabs:
                 self.tab = gate.active_tab_changed_to
             failures = [record for record in gate.records if not record.success]
+            # A goal_reached decision with no new mutation is a semantic
+            # assessment of the fresh pre-step BrowserState. Do not grant the
+            # same status to a step that just changed the page: that change
+            # still needs a later observation or passing assertion.
+            if outcome.status == "goal_reached" and not failures and not mutated_this_step:
+                memory.verified_mutation_count = memory.mutation_count
             memory.last_error = failures[-1].error if failures else None
             self._emit(
                 "navigator_step",
@@ -546,6 +584,9 @@ class AxisOrchestrator:
         assert memory is not None
         run = self.config.run
         tab = self._ensure_tab()
+        if self.config.tools.debug_recording and not self._debug_telemetry_started:
+            self.browser.start_debug_telemetry(tab)
+            self._debug_telemetry_started = bool(self.browser.debug_recording or self.browser.debug_trace)
 
         observation: dict[str, Any] | None = None
         last: ToolFault | None = None
@@ -567,8 +608,6 @@ class AxisOrchestrator:
         if observation is None:
             reason = clip(str(last)) if last else "The browser could not be observed."
             raise _Stop(self._result("failed", reason=reason or "The browser could not be observed."))
-        memory.verified_mutation_count = memory.mutation_count
-
         screenshot = self._screenshot(tab) if run.include_screenshot else None
         state = BrowserState(
             tab=tab,
@@ -579,6 +618,10 @@ class AxisOrchestrator:
             snapshot=observation.get("snapshot", ""),
             truncated=bool(observation.get("truncated")),
             screenshot=screenshot,
+            refs_fresh=tab in self.browser.observations,
+            unverified_page_changes=memory.unverified_mutations,
+            site_pattern=observation.get("sitePattern"),
+            runtime_warning=observation.get("runtimeWarning"),
             recent_actions=memory.recent_action_results[-4:],
             goal=memory.current_goal,
             success_condition=memory.current_success_condition,
