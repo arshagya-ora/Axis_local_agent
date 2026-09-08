@@ -259,6 +259,26 @@ def test_structured_bridge_error_code_and_diagnostic_are_preserved():
     assert result["error"]["detail"]["diagnostic"]["visibleCount"] == 0
 
 
+def test_bridge_exception_messages_do_not_expose_raw_identifiers():
+    bridge, runtime, alias = runtime_with_tab()
+
+    def fail():
+        raise bt.BrowserBridgeError(
+            "FrameId 88 failed in tabId 41", {"code": "TERMINAL_BRIDGE_ERROR"},
+        )
+
+    bridge.responses["locator.click"] = fail
+    result = bt.browser_act(
+        context(runtime), alias,
+        bt.Click(action="click", target=bt.LocatorTarget(
+            kind="locator", locator=bt.Locator(role="button", name="Save"),
+        )),
+    )
+    assert "88" not in result["error"]["message"]
+    assert "41" not in result["error"]["message"]
+    assert "frame identifier" in result["error"]["message"].lower()
+
+
 def test_observe_supports_locator_inspection_and_frames_without_raw_ids():
     bridge, runtime, alias = runtime_with_tab()
     bridge.responses["locator.count"] = {"count": 2, "visibleCount": 1}
@@ -273,6 +293,19 @@ def test_observe_supports_locator_inspection_and_frames_without_raw_ids():
     frames = bt.browser_observe(context(runtime), alias, mode="frames")
     assert frames["data"]["frames"] == [{"url": "https://frame.example/"}]
     assert "frameId" not in json.dumps(frames)
+
+
+def test_locator_observe_without_extract_defaults_to_all_inner_text():
+    bridge, runtime, alias = runtime_with_tab()
+    bridge.responses["locator.allInnerTexts"] = {"texts": ["First", "Second"]}
+    result = bt.browser_observe(
+        context(runtime), alias, locator=bt.Locator(role="list", name="Results"),
+    )
+    method, params = bridge.calls[-1]
+    assert result["ok"] is True
+    assert result["data"]["extract"] == "all_inner_text"
+    assert method == "locator.allInnerTexts"
+    assert params["locator"]["role"] == "list"
 
 
 def test_popup_wait_registers_a_safe_tab_alias():

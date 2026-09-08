@@ -8,10 +8,13 @@ to a browser, a provider, or Pydantic AI's runtime.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Literal
+from uuid import uuid4
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic_ai import CancellationToken, RunUsage
 
 # Bounds. Model output is never rejected for exceeding these — validators clip
 # instead, so a chatty model costs a truncation rather than a retry.
@@ -103,13 +106,37 @@ class ActionRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool: str
+    tab: str | None = None
     operation: str | None = None
     args: str | None = None
-    success: bool = False
+    executed: bool = True
+    execution_success: bool = False
+    semantic_success: bool | None = None
+    code: str | None = None
+    message: str | None = None
     extracted_data: str | None = None
-    error: str | None = None
     refs_invalidated: bool = False
     retain_in_memory: bool = False
+    meaningful_change: bool | None = None
+    result_data: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @computed_field
+    @property
+    def success(self) -> bool:
+        """Compatibility view used by events and callers.
+
+        Transport/execution success and semantic success intentionally remain
+        separate in storage: an assertion can execute correctly and still fail.
+        """
+        return self.executed and self.execution_success and self.semantic_success is not False
+
+    @computed_field
+    @property
+    def error(self) -> str | None:
+        if self.success:
+            return None
+        detail = ": ".join(part for part in (self.code, self.message) if part)
+        return clip(detail) if detail else "The browser action did not succeed."
 
     @field_validator("args")
     @classmethod
@@ -121,10 +148,72 @@ class ActionRecord(BaseModel):
     def _extract(cls, value: str | None) -> str | None:
         return clip(value, MAX_EXTRACT)
 
-    @field_validator("error")
+    @field_validator("message")
     @classmethod
     def _error(cls, value: str | None) -> str | None:
         return clip(value)
+
+
+class AssertionRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assertion: str
+    passed: bool
+    expected: Any = None
+    tab: str | None = None
+    message: str | None = None
+
+
+class Evidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["observation", "navigator", "assertion", "screenshot", "download", "console", "network"]
+    detail: str
+    tab: str | None = None
+    verified: bool = True
+
+    @field_validator("detail")
+    @classmethod
+    def _detail(cls, value: str) -> str:
+        return clip(value, MAX_EXTRACT) or ""
+
+
+class TaskRequirements(BaseModel):
+    """Only the literal facts needed for deterministic completion checks."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    literal_urls: list[str] = Field(default_factory=list)
+    required_text: list[str] = Field(default_factory=list)
+    final_url_pattern: str | None = None
+    require_screenshot: bool = False
+    require_download: bool = False
+    require_console_check: bool = False
+    require_network_check: bool = False
+    mutation_allowed: bool = True
+    forbidden_actions: set[str] = Field(default_factory=set)
+
+
+class RunCounters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    navigator_steps_since_plan: int = 0
+    total_steps: int = 0
+    planner_passes: int = 0
+    browser_actions: int = 0
+    consecutive_failures: int = 0
+    mutation_count: int = 0
+    verified_mutation_count: int = 0
+    repeated_observations: int = 0
+    repeated_actions: int = 0
+    no_progress_steps: int = 0
+
+
+class CompletionVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    valid: bool
+    reasons: list[str] = Field(default_factory=list)
 
 
 class TabSummary(BaseModel):
@@ -163,6 +252,7 @@ class BrowserState(BaseModel):
     remaining_steps: int = 0
     remaining_actions: int = 0
     note: str | None = None
+    requirements: TaskRequirements | None = None
 
     @field_validator("snapshot")
     @classmethod
@@ -174,30 +264,51 @@ class BrowserState(BaseModel):
 # Bounded task memory
 # ---------------------------------------------------------------------------
 
-class TaskMemory(BaseModel):
-    """One bounded record of the whole task. Deliberately holds semantic
-    summaries and extracted content only: no raw model messages, no repeated
-    observations, no screenshots, no provider responses, no tool histories,
-    and no internal browser identifiers (those never leave ``BrowserRuntime``).
-    """
+class TaskRunState(BaseModel):
+    """The single, bounded source of truth for one task and its follow-ups."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
-    original_task: str = ""
-    user_followups: list[str] = Field(default_factory=list)
+    task_id: str = Field(default_factory=lambda: uuid4().hex)
+    original_request: str = ""
+    follow_ups: list[str] = Field(default_factory=list)
+    requirements: TaskRequirements = Field(default_factory=TaskRequirements)
+    bound_tab: str | None = None
+    task_tabs: list[str] = Field(default_factory=list)
+    diagnostics_armed_tabs: set[str] = Field(default_factory=set)
+    evidence: list[Evidence] = Field(default_factory=list)
+    actions: list[ActionRecord] = Field(default_factory=list)
+    assertions: list[AssertionRecord] = Field(default_factory=list)
+    downloads: list[Evidence] = Field(default_factory=list)
+    diagnostic_evidence: list[Evidence] = Field(default_factory=list)
+    last_browser_state: BrowserState | None = Field(default=None, exclude=True)
+    usage: RunUsage = Field(default_factory=RunUsage, exclude=True)
+    cancellation_token: CancellationToken = Field(default_factory=CancellationToken, exclude=True)
+    counters: RunCounters = Field(default_factory=RunCounters)
+    status: Literal[
+        "active", "completed", "failed", "cancelled", "needs_user", "paused", "limit_reached"
+    ] = "active"
+
+    # Current planning state is part of the same task object, not a second
+    # memory subsystem.
     current_plan_summary: str | None = None
     current_goal: str | None = None
     current_success_condition: str | None = None
     completed_goal_summaries: list[str] = Field(default_factory=list)
     latest_navigator_outcome: NavigatorOutcome | None = None
-    recent_action_results: list[ActionRecord] = Field(default_factory=list)
     relevant_extracted_data: list[str] = Field(default_factory=list)
     last_error: str | None = None
-    navigator_steps_since_plan: int = 0
-    total_steps: int = 0
-    consecutive_failures: int = 0
-    mutation_count: int = 0
-    verified_mutation_count: int = 0
+    last_page_fingerprint: str | None = None
+    last_action_fingerprint: str | None = None
+    direct_navigation_done: bool = False
+    completion_rejected: bool = False
+    repair_attempted: bool = False
+    debug_telemetry_started: bool = False
+    started_monotonic: float = Field(default_factory=time.monotonic, exclude=True)
+    model_ms: int = 0
+    browser_ms: int = 0
+    plan_ms: int = 0
+    step_ms: int = 0
 
     # bounds, injected from MemoryConfig
     max_recent_actions: int = 8
@@ -206,7 +317,7 @@ class TaskMemory(BaseModel):
     max_extracted_data: int = 8
 
     def add_followup(self, follow_up: str) -> None:
-        self.user_followups = (self.user_followups + [clip(follow_up) or ""])[-self.max_followups:]
+        self.follow_ups = (self.follow_ups + [clip(follow_up, MAX_ANSWER) or ""])[-self.max_followups:]
 
     def complete_goal(self, summary: str) -> None:
         self.completed_goal_summaries = (
@@ -214,7 +325,7 @@ class TaskMemory(BaseModel):
         )[-self.max_completed_goals:]
 
     def record_actions(self, records: list[ActionRecord]) -> None:
-        self.recent_action_results = (self.recent_action_results + records)[-self.max_recent_actions:]
+        self.actions = (self.actions + records)[-self.max_recent_actions:]
         extracted = [
             f"{record.tool}: {record.extracted_data}"
             for record in records
@@ -225,9 +336,48 @@ class TaskMemory(BaseModel):
                 self.relevant_extracted_data + extracted
             )[-self.max_extracted_data:]
 
+    def evidence_by_kind(self, kind: str) -> list[Evidence]:
+        return [item for item in self.evidence if item.kind == kind]
+
     @property
     def unverified_mutations(self) -> int:
-        return max(0, self.mutation_count - self.verified_mutation_count)
+        return max(0, self.counters.mutation_count - self.counters.verified_mutation_count)
+
+    @property
+    def original_task(self) -> str:
+        return self.original_request
+
+    @property
+    def user_followups(self) -> list[str]:
+        return self.follow_ups
+
+    @property
+    def recent_action_results(self) -> list[ActionRecord]:
+        return self.actions
+
+    @property
+    def navigator_steps_since_plan(self) -> int:
+        return self.counters.navigator_steps_since_plan
+
+    @property
+    def total_steps(self) -> int:
+        return self.counters.total_steps
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self.counters.consecutive_failures
+
+    @property
+    def mutation_count(self) -> int:
+        return self.counters.mutation_count
+
+    @property
+    def verified_mutation_count(self) -> int:
+        return self.counters.verified_mutation_count
+
+
+# Backwards-compatible import name; there is only one state implementation.
+TaskMemory = TaskRunState
 
 
 # ---------------------------------------------------------------------------
@@ -372,5 +522,9 @@ class AxisConfig(BaseModel):
             setattr(config, field, str(resolved))
         return config
 
-    def new_memory(self, task: str) -> TaskMemory:
-        return TaskMemory(original_task=clip(task, MAX_ANSWER) or "", **self.memory.model_dump())
+    def new_memory(self, task: str, requirements: TaskRequirements | None = None) -> TaskRunState:
+        return TaskRunState(
+            original_request=clip(task, MAX_ANSWER) or "",
+            requirements=requirements or TaskRequirements(),
+            **self.memory.model_dump(),
+        )

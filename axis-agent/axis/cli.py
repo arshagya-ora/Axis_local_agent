@@ -201,7 +201,12 @@ def print_result(result: AxisResult) -> None:
 
 
 def confirm(tool: str, operation: str | None, detail: dict[str, Any]) -> bool:
-    answer = input(f"Approve {tool}.{operation} on {detail.get('tab')}? [y/N] ").strip().lower()
+    target = f" target={detail.get('target')!r}" if detail.get("target") else ""
+    origin = f" at {detail.get('origin')}" if detail.get("origin") else ""
+    reason = f" ({detail.get('reason')})" if detail.get("reason") else ""
+    answer = input(
+        f"Approve {tool}.{operation}{origin}{target}{reason}? [y/N] "
+    ).strip().lower()
     return answer in {"y", "yes"}
 
 
@@ -241,7 +246,14 @@ async def run(args: argparse.Namespace) -> int:
             break
         if not follow_up:
             break
-        result = await orchestrator.continue_task(follow_up)
+        explicit_continue = follow_up.lower().startswith("/continue ")
+        explicit_new = follow_up.lower().startswith("/new ")
+        if explicit_continue or explicit_new:
+            follow_up = follow_up.split(maxsplit=1)[1].strip()
+        if explicit_continue or (not explicit_new and result.status in {"needs_user", "paused"}):
+            result = await orchestrator.continue_task(follow_up)
+        else:
+            result = await orchestrator.start_task(follow_up)
         print_result(result)
     return 0 if result.status in {"completed", "needs_user"} else 1
 
@@ -262,7 +274,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--capture", action="store_true", help="Add browser_capture_evidence for this run.")
     parser.add_argument("--diagnose", action="store_true", help="Add browser_diagnose for this run.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override run.max_total_steps.")
-    return asyncio.run(run(parser.parse_args(argv)))
+    try:
+        return asyncio.run(run(parser.parse_args(argv)))
+    except KeyboardInterrupt:
+        print("\n[cancelled] Interrupted by user.")
+        return 130
 
 
 if __name__ == "__main__":

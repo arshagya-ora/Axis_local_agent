@@ -50,6 +50,10 @@ _ASSERTION_MISMATCH = {
     "LOCATOR_EXPECT_TIMEOUT", "PAGE_EXPECT_TITLE_TIMEOUT",
     "PAGE_EXPECT_ARIA_SNAPSHOT_TIMEOUT",
 }
+_RAW_ID_IN_MESSAGE = re.compile(
+    r"\b(tab|window|group|frame|snapshot|request|trace)(?:\s*id|\s+with\s+id)\s*[:=#]?\s*[-\w]+",
+    re.IGNORECASE,
+)
 
 _ALLOWED_METHODS = frozenset({
     "extension.info", "native.status", "native.sitePatterns",
@@ -102,6 +106,12 @@ class Locator(Command):
     has_not_text: str | None = Field(None, serialization_alias="hasNotText")
     within: Locator | None = None
     frame_selector: str | None = Field(None, serialization_alias="frameSelector")
+
+    @model_validator(mode="after")
+    def has_strategy(self) -> Locator:
+        if not any((self.selector, self.text, self.role, self.name, self.label, self.placeholder)):
+            raise ValueError("A locator needs selector, text, role/name, label, or placeholder.")
+        return self
 
     def bridge_value(self) -> dict[str, Any]:
         value = self.model_dump(by_alias=True, exclude_none=True, exclude_defaults=True)
@@ -578,6 +588,11 @@ def _without_bridge_element_refs(value: Any) -> Any:
     return value
 
 
+def _safe_bridge_message(message: str) -> str:
+    """Remove bridge identity values while retaining a useful error reason."""
+    return _RAW_ID_IN_MESSAGE.sub(lambda match: f"{match.group(1).lower()} identifier", message)
+
+
 def _public_action_change(rt: BrowserRuntime, changed: Any) -> tuple[Any, list[str]]:
     if not isinstance(changed, dict):
         return changed, []
@@ -640,6 +655,7 @@ class BrowserRuntime:
         self.tabs: dict[str, TabState] = {}
         self.observations: dict[str, Observation] = {}
         self.issued_refs: dict[str, str] = {}
+        self.ref_descriptions: dict[str, str] = {}
         self.traces: dict[str, str] = {}
         self.requests: dict[str, str] = {}
         self.recordings: dict[str, str] = {}
@@ -701,7 +717,18 @@ class BrowserRuntime:
         except BrowserBridgeError as exc:
             data = exc.data if isinstance(exc.data, dict) else {}
             bridge_code = data.get("code")
-            text = str(exc)
+            raw_text = str(exc)
+            if tab and re.search(r"no tab with id|tab (?:was )?not found|invalid tab id", raw_text, re.IGNORECASE):
+                state = self.tabs.get(tab)
+                if state is not None:
+                    state.closed = True
+                self.invalidate(tab)
+                raise ToolFault(
+                    "TAB_NOT_FOUND",
+                    f"{tab} is no longer open; refresh the tab list and choose a live tab.",
+                    True,
+                ) from exc
+            text = _safe_bridge_message(raw_text)
             if bridge_code in _ASSERTION_MISMATCH or re.search(
                 r"timed out waiting for locator .* to be (attached|visible|hidden|detached)", text, re.IGNORECASE,
             ):
@@ -800,6 +827,7 @@ class BrowserRuntime:
             alias = f"ref_{self._ref_number}"
             refs[alias] = (int(match.group(1)), match.group(2))
             self.issued_refs[alias] = tab
+            self.ref_descriptions[alias] = match.group(3).strip()[:500]
             lines.append(f"[{alias}]{match.group(3)}")
         if refs and not snapshot_id:
             raise ToolFault("BRIDGE_ERROR", "The bridge returned refs without a usable snapshot.")
@@ -864,6 +892,21 @@ class BrowserRuntime:
         if ref in self.issued_refs:
             raise ToolFault("STALE_REFERENCE", "That ref is stale; observe the tab again.", True)
         raise ToolFault("REF_NOT_FOUND", f"Unknown ref {ref!r}; use a ref from browser_observe.")
+
+    def describe_ref(self, ref: str) -> str | None:
+        return self.ref_descriptions.get(ref)
+
+    def reconcile_tabs(self) -> list[str]:
+        """Refresh cached aliases from the bridge and return live aliases."""
+        result = browser_tabs(type("Context", (), {"deps": self})(), ListTabs(operation="list"))
+        if not result["ok"]:
+            error = result.get("error") or {}
+            raise ToolFault(
+                error.get("code") or "BRIDGE_ERROR",
+                error.get("message") or "The bridge failed to list tabs.",
+                bool(error.get("retryable")),
+            )
+        return [item["tab"] for item in result["data"]["tabs"]]
 
     def ref_params(self, tab: str, ref: str, timeout: int) -> dict[str, Any]:
         state = self.tab(tab)
@@ -1091,7 +1134,10 @@ def browser_observe(
                 raise ToolFault("INVALID_ARGUMENT", "A locator extraction requires locator.")
             return _ok(tab, rt.observe(tab, mode, max_nodes))
         if extract is None:
-            raise ToolFault("INVALID_ARGUMENT", "Set extract when providing locator.")
+            # A locator with no requested scalar naturally means "read this
+            # element".  Defaulting avoids an otherwise Pydantic-valid but
+            # semantically incomplete call and matches the common agent intent.
+            extract = "all_inner_text"
         methods = {
             "count": "locator.count", "text": "locator.textContent",
             "all_text": "locator.allTextContents", "all_inner_text": "locator.allInnerTexts",

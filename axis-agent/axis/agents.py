@@ -12,20 +12,27 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-from pydantic_ai import Agent, Tool
+from pydantic_ai import Agent, InstrumentationSettings, ModelRetry, Tool, ToolFailed
 from pydantic_ai.capabilities import ToolSearch
+from pydantic_ai.capabilities.hooks import Hooks
 from pydantic_ai.models import Model
 
 import browser_tools as bt
 from browser_tools import BrowserRuntime
 
 from .models import ActionRecord, AxisConfig, NavigatorOutcome, PlanDecision, clip
+
+# Pydantic AI emits model, tool, retry, and run spans through OpenTelemetry.
+# Browser/page content and Oracle prompts are deliberately excluded; operators
+# still get timings and error attributes without copying sensitive payloads.
+Agent.instrument_all(InstrumentationSettings(include_content=False, include_binary_content=False))
 
 # Ordinary navigator tool set. capture/diagnose are deliberately absent.
 DEFAULT_TOOL_FUNCTIONS = (
@@ -52,9 +59,29 @@ MUTATING_TOOLS = frozenset({"browser_act", "browser_navigate"})
 UNKNOWN_OUTCOME_CODES = frozenset({"TIMEOUT", "BRIDGE_UNAVAILABLE", "BRIDGE_ERROR"})
 NON_RETRYABLE_CODES = frozenset({
     "FIREWALL_DENIED", "SENSITIVE_OPERATION_BLOCKED", "UPLOAD_DENIED",
-    "APPROVAL_DENIED", "TAB_LIMIT", "INVALID_ARGUMENT",
+    "APPROVAL_DENIED", "TAB_LIMIT",
 })
 STOP_CODES = frozenset({"RUN_PAUSED", "RUN_CANCELLED"})
+
+# One small, explicit recovery table.  The orchestrator consumes the same
+# codes; there is intentionally no workflow or exception framework here.
+RECOVERY_POLICY = {
+    "STALE_REFERENCE": "observe_and_retry",
+    "REF_NOT_FOUND": "observe_and_retry",
+    "TAB_NOT_FOUND": "reconcile_tab",
+    "TAB_CLOSED": "reconcile_tab",
+    "INVALID_ARGUMENT": "model_retry",
+    "ASSERTION_FAILED": "replan",
+    "APPROVAL_DENIED": "replan",
+    "POLICY_DENIED": "stop_retry",
+    "FIREWALL_DENIED": "stop_retry",
+    "BRIDGE_UNAVAILABLE": "transport_retry",
+}
+MODEL_RETRY_CODES = frozenset({"INVALID_ARGUMENT", "STALE_REFERENCE", "REF_NOT_FOUND"})
+TOOL_FAILED_CODES = frozenset({
+    "POLICY_DENIED", "FIREWALL_DENIED", "SENSITIVE_OPERATION_BLOCKED",
+    "CAPABILITY_UNAVAILABLE", "TAB_LIMIT", "UPLOAD_DENIED", "BRIDGE_ERROR",
+})
 
 
 def browser_context(runtime: BrowserRuntime) -> Any:
@@ -151,6 +178,8 @@ class StepGate:
     remaining_total_actions: int
     approval_actions: frozenset[str] = frozenset()
     approval: Callable[[str, str | None, dict[str, Any]], bool] | None = None
+    forbidden_actions: frozenset[str] = frozenset()
+    mutation_allowed: bool = True
     is_paused: Callable[[], bool] = lambda: False
     is_cancelled: Callable[[], bool] = lambda: False
     on_action: Callable[[ActionRecord, int], None] | None = None
@@ -174,19 +203,31 @@ class StepGate:
     # (mutated, verified) per record, in execution order, so the orchestrator
     # can tell whether a mutation was followed by evidence.
     effects: list[tuple[bool, bool]] = field(default_factory=list)
+    refusals: int = 0
+    committed: bool = False
 
     def _interrupt(self, reason: str) -> None:
         if not self.interrupted:
             self.interrupted = True
             self.interrupt_reason = reason
 
-    def check(self, tool: str, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    def check(
+        self, tool: str, kwargs: dict[str, Any], approval_detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """Return a refusal envelope if this call must not reach the bridge."""
         tab = kwargs.get("tab")
         operation = _command_operation(kwargs)
         args = _describe_args(kwargs)
 
         def refuse(code: str, message: str) -> dict[str, Any]:
+            record = ActionRecord(
+                tool=tool, tab=tab if isinstance(tab, str) else None, operation=operation, args=args, executed=False,
+                execution_success=False, semantic_success=False, code=code, message=message,
+                retain_in_memory=True,
+            )
+            self.records.append(record)
+            self.effects.append((False, False))
+            self.refusals += 1
             if self.on_refusal is not None:
                 self.on_refusal(tool, operation, code, message, args)
             return _refusal(tab, code, message)
@@ -214,10 +255,24 @@ class StepGate:
         if self.actions_used >= self.remaining_total_actions:
             self._interrupt("the total browser action budget was reached")
             return refuse("ACTION_BUDGET_EXHAUSTED", "The run's browser action budget is exhausted.")
+        mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
+        target_text = str((approval_detail or {}).get("target") or "").lower()
+        forbidden = next(
+            (item for item in self.forbidden_actions if item.lower() in target_text or item == operation),
+            None,
+        )
+        if forbidden:
+            self.non_retryable = True
+            self._interrupt(f"the task forbids {forbidden!r}")
+            return refuse("POLICY_DENIED", f"The current task explicitly forbids {forbidden!r}.")
+        if mutating and not self.mutation_allowed:
+            self.non_retryable = True
+            self._interrupt("the task is read-only")
+            return refuse("POLICY_DENIED", "The current task does not allow page mutations.")
         if operation in self.approval_actions:
             approved = True
             if self.approval is not None:
-                approved = bool(self.approval(tool, operation, {"tab": tab}))
+                approved = bool(self.approval(tool, operation, approval_detail or {"tab": tab}))
             if not approved:
                 self._interrupt("approval was denied")
                 self.non_retryable = True
@@ -232,13 +287,20 @@ class StepGate:
         operation = _command_operation(kwargs)
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         error = result.get("error") if isinstance(result.get("error"), dict) else {}
-        success = bool(result.get("ok"))
+        execution_success = bool(result.get("ok"))
+        semantic_success = None
+        if tool == "browser_assert" and execution_success:
+            semantic_success = bool(data.get("passed"))
+        success = execution_success and semantic_success is not False
         code = error.get("code")
         changed = data.get("whatChanged") if isinstance(data.get("whatChanged"), dict) else {}
         refs_invalidated = bool(data.get("refsInvalidated")) or bool(changed.get("urlChanged"))
         rerendered = bool(changed.get("domChanged")) or bool(changed.get("navigated"))
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
-
+        meaningful_change = refs_invalidated or any(
+            bool(changed.get(key))
+            for key in ("urlChanged", "domChanged", "navigated", "focusChanged", "newPopups", "a11yDiff")
+        ) if mutating and isinstance(changed, dict) else None
         mutated = success and mutating
         verified = success and (
             tool == "browser_observe" or (tool == "browser_assert" and bool(data.get("passed")))
@@ -247,7 +309,11 @@ class StepGate:
         if not success:
             if code in STOP_CODES:
                 self.stopped = "cancelled" if code == "RUN_CANCELLED" else "paused"
-            if mutating and code in UNKNOWN_OUTCOME_CODES:
+            if code in MODEL_RETRY_CODES:
+                # Pydantic AI may issue a corrected call in this same model
+                # turn; do not make the gate reject that correction.
+                pass
+            elif mutating and code in UNKNOWN_OUTCOME_CODES:
                 self.unknown_outcome = True
                 self._interrupt(f"a {operation!r} action failed with an unknown outcome ({code})")
             elif code in NON_RETRYABLE_CODES:
@@ -288,12 +354,20 @@ class StepGate:
 
         record = ActionRecord(
             tool=tool,
+            tab=kwargs.get("tab") if isinstance(kwargs.get("tab"), str) else None,
             operation=operation,
             args=_describe_args(kwargs),
-            success=success,
+            executed=True,
+            execution_success=execution_success,
+            semantic_success=semantic_success,
+            code=None if success else (code or ("ASSERTION_FAILED" if semantic_success is False else None)),
+            message=None if success else (
+                error.get("message") or ("The assertion did not match the current page." if semantic_success is False else None)
+            ),
             extracted_data=_extracted(tool, data) if success else None,
-            error=None if success else clip(f"{code}: {error.get('message')}"),
             refs_invalidated=refs_invalidated,
+            meaningful_change=meaningful_change,
+            result_data=data,
             retain_in_memory=(
                 (not success) or mutating or tool in {"browser_assert", "browser_capture_evidence"}
                 # A tabs.list result is the answer to "what tabs are open" — if it
@@ -329,17 +403,123 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
         # `tab` is the only positional the tools take after ctx.
         if rest:
             named.setdefault("tab", rest[0])
-        refusal = deps.gate.check(function.__name__, named)
+        tab = named.get("tab")
+        command = named.get("command")
+        target = getattr(command, "target", None)
+        target_type = getattr(target, "kind", None)
+        target_text = None
+        if target_type == "ref":
+            target_text = deps.browser.describe_ref(getattr(target, "ref", ""))
+        elif target_type == "locator":
+            locator = getattr(target, "locator", None)
+            if locator is not None:
+                target_text = next(
+                    (value for value in (
+                        locator.name, locator.label, locator.text, locator.placeholder, locator.selector,
+                    ) if value),
+                    None,
+                )
+        elif getattr(command, "locator", None) is not None:
+            locator = command.locator
+            target_type = "locator"
+            target_text = next(
+                (value for value in (locator.name, locator.label, locator.text, locator.placeholder, locator.selector) if value),
+                None,
+            )
+        current_url = deps.browser.tabs[tab].url if tab in deps.browser.tabs else None
+        detail = {
+            "tab": tab,
+            "operation": _command_operation(named),
+            "current_url": deps.browser.safe_url(current_url),
+            "origin": current_url.split("/", 3)[:3] if isinstance(current_url, str) else None,
+            "target": target_text,
+            "target_type": target_type,
+            "upload_filenames": getattr(command, "files", None),
+            "expected_effect": _command_operation(named),
+            "reason": "This action is configured to require user approval.",
+        }
+        if isinstance(detail["origin"], list):
+            detail["origin"] = "/".join(detail["origin"])
+        refusal = deps.gate.check(function.__name__, named, detail)
         if refusal is not None:
+            error = refusal.get("error") if isinstance(refusal.get("error"), dict) else {}
+            if error.get("code") in TOOL_FAILED_CODES:
+                raise ToolFailed(error.get("message") or "This browser operation is not retryable.")
             return refusal
         browser_ctx = dataclasses.replace(ctx, deps=deps.browser)
         started = time.perf_counter()
         result = function(browser_ctx, *rest, **kwargs)
         duration_ms = int((time.perf_counter() - started) * 1000)
-        deps.gate.record(function.__name__, named, result, duration_ms)
+        record = deps.gate.record(function.__name__, named, result, duration_ms)
+        if not record.success and record.code in MODEL_RETRY_CODES:
+            raise ModelRetry(record.error or "Correct the browser tool arguments and try once more.")
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        detail = error.get("detail") if isinstance(error.get("detail"), dict) else {}
+        if not record.success and detail.get("consecutiveUiFailures", 0) >= 2:
+            raise ToolFailed(record.error or "The element is still unavailable after recovery.")
+        if not record.success and record.code in TOOL_FAILED_CODES:
+            raise ToolFailed(record.error or "This browser operation cannot be retried.")
         return result
 
     return wrapper
+
+
+def validate_browser_args(function: Callable[..., Any]) -> Callable[..., None]:
+    """Validate cross-field browser arguments before execution.
+
+    Discriminated Pydantic command models already make missing upload files,
+    assertion expectations, and tab-operation parameters impossible.  This
+    validator covers the remaining observe combinations that are individually
+    well typed but incompatible together.  Policy and live browser checks stay
+    in ``StepGate``/``BrowserRuntime`` where they belong.
+    """
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def validator(*args: Any, **kwargs: Any) -> None:
+        bound = signature.bind(*args, **kwargs)
+        values = bound.arguments
+        if function is bt.browser_observe:
+            mode = values.get("mode", "compact")
+            locator = values.get("locator")
+            extract = values.get("extract")
+            attribute = values.get("attribute")
+            if mode == "frames" and (locator is not None or extract is not None):
+                raise ModelRetry("Frame inspection cannot be combined with locator extraction.")
+            if extract is not None and locator is None:
+                raise ModelRetry("Choose a locator when requesting an extraction mode.")
+            if extract == "attribute" and not attribute:
+                raise ModelRetry("Attribute extraction requires the attribute name.")
+
+    return validator
+
+
+def browser_validation_hooks() -> Hooks:
+    """Record schema/args-validator failures that occur before tool execution."""
+    hooks = Hooks()
+    tool_names = [f.__name__ for f in DEFAULT_TOOL_FUNCTIONS] + list(OPTIONAL_TOOL_FUNCTIONS)
+
+    @hooks.on.tool_validate_error(tools=tool_names)
+    def record_validation_failure(ctx: Any, *, call: Any, tool_def: Any, args: Any, error: Exception) -> Any:
+        deps: AxisDeps = ctx.deps
+        message = clip(str(error)) or "The browser tool arguments are invalid."
+        record = ActionRecord(
+            tool=call.tool_name,
+            args=clip(repr(args)),
+            executed=False,
+            execution_success=False,
+            semantic_success=False,
+            code="INVALID_ARGUMENT",
+            message=message,
+            retain_in_memory=True,
+        )
+        deps.gate.records.append(record)
+        deps.gate.effects.append((False, False))
+        if deps.gate.on_refusal is not None:
+            deps.gate.on_refusal(call.tool_name, None, "INVALID_ARGUMENT", message, record.args)
+        raise ModelRetry(f"Invalid arguments for {tool_def.name}: {message}")
+
+    return hooks
 
 
 def navigator_tools(config: AxisConfig) -> list[Tool[AxisDeps]]:
@@ -358,6 +538,7 @@ def navigator_tools(config: AxisConfig) -> list[Tool[AxisDeps]]:
         return Tool(
             guarded(function),
             takes_ctx=True,
+            args_validator=validate_browser_args(function),
             sequential=True,
             timeout=config.run.tool_timeout_seconds,
             defer_loading=defer,
@@ -408,7 +589,9 @@ def build_planner(config: AxisConfig, model: Model) -> Agent[None, PlanDecision]
 
 def build_navigator(config: AxisConfig, model: Model) -> Agent[AxisDeps, NavigatorOutcome]:
     tools = navigator_tools(config)
-    capabilities = [ToolSearch()] if config.tools.tool_search else None
+    capabilities: list[Any] = [browser_validation_hooks()]
+    if config.tools.tool_search:
+        capabilities.append(ToolSearch())
     return Agent.from_file(
         config.navigator_spec_path,
         model=model,

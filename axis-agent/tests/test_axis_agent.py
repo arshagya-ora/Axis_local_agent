@@ -43,14 +43,17 @@ class FakeBridge:
         self.calls = []
         self.responses = {}
         self.saved = []
+        self.extra_tabs = []
         self.observations = 0
+        self.base_id = 41
         self.url = "https://www.google.com/"
         self.title = "Google"
 
     def rpc(self, method, params=None, **_):
         self.calls.append((method, params or {}))
         if method == "tabs.list":
-            return {"tabs": [{"id": 41, "url": self.url, "title": self.title, "active": True}]}
+            base = {"id": self.base_id, "url": self.url, "title": self.title, "active": not self.extra_tabs}
+            return {"tabs": [base, *self.extra_tabs]}
         if method == "page.accessibilityTree":
             self.observations += 1
             return {
@@ -60,7 +63,15 @@ class FakeBridge:
                 "title": self.title,
             }
         response = self.responses.get(method, {})
-        return response() if callable(response) else response
+        result = response() if callable(response) else response
+        if method == "tabs.create" and isinstance(result, dict):
+            raw = result.get("tab") if isinstance(result.get("tab"), dict) else result
+            if isinstance(raw.get("id"), int):
+                for item in self.extra_tabs:
+                    item["active"] = False
+                if not any(item.get("id") == raw["id"] for item in self.extra_tabs):
+                    self.extra_tabs.append({**raw, "active": True})
+        return result
 
     def save_data_url(self, data_url, filename=None, directory=None):
         self.saved.append((data_url, filename, directory))
@@ -151,6 +162,9 @@ FILL = ("browser_act", {"tab": "tab_1", "command": {
 ENTER = ("browser_act", {"tab": "tab_1", "command": {"action": "press", "key": "Enter"}})
 CLICK = ("browser_act", {"tab": "tab_1", "command": {
     "action": "click", "target": {"kind": "ref", "ref": "ref_1"}}})
+LOCATOR_CLICK = ("browser_act", {"tab": "tab_1", "command": {
+    "action": "click", "target": {"kind": "locator", "locator": {
+        "role": "button", "name": "Continue"}}}})
 OBSERVE = ("browser_observe", {"tab": "tab_1"})
 
 
@@ -244,6 +258,8 @@ async def test_navigator_tools_are_pydantic_validated_and_sequential():
     # Pydantic rejected the call; nothing reached the bridge except observation.
     assert "locator.fillRef" not in bridge.methods
     assert "locator.fill" not in bridge.methods
+    invalid = [record for record in orchestrator.memory.actions if record.code == "INVALID_ARGUMENT"]
+    assert invalid and invalid[0].executed is False
 
 
 async def test_a_tabs_list_result_survives_into_planner_context_across_steps():
@@ -437,10 +453,14 @@ async def test_refused_and_interrupted_calls_are_traceable_even_though_never_exe
     assert [a.detail["skipped"] for a in actions] == [False, True]
     assert actions[1].detail["tool"] == "browser_act"
     assert "STEP_INTERRUPTED" in actions[1].detail["error"]
-    # never reached the bridge, and never entered bounded task memory either
+    # It never reached the bridge, but every attempted call is an ActionRecord.
     assert "locator.clickRef" not in bridge.methods
-    assert all(record.error is None or "STEP_INTERRUPTED" not in record.error
-               for record in orchestrator.memory.recent_action_results)
+    refused = [
+        record for record in orchestrator.memory.recent_action_results
+        if record.code == "STEP_INTERRUPTED"
+    ]
+    assert refused and refused[0].executed is False
+    assert refused[0].execution_success is False
 
 
 async def test_internal_browser_identifiers_never_reach_either_model():
@@ -600,6 +620,28 @@ async def test_cancellation_prevents_any_further_tool_execution():
     assert bridge.methods.count("locator.clickRef") == 1
 
 
+async def test_cancellation_always_closes_debug_telemetry_in_finally():
+    config = AxisConfig.load()
+    config.tools.debug_recording = True
+    script = Script([browse()], [{"calls": [CLICK], "outcome": {"status": "continue"}}])
+    orchestrator, bridge, _ = make(script, config=config)
+    bridge.responses["recording.start"] = {"recording": {"id": "raw-recording"}}
+    bridge.responses["trace.start"] = {"trace": {"id": "raw-trace"}}
+
+    def cancel_after_send():
+        orchestrator.cancel()
+        return {"whatChanged": {}}
+
+    bridge.responses["locator.clickRef"] = cancel_after_send
+    result = await orchestrator.start_task("Click once, with debug telemetry enabled.")
+    assert result.status == "cancelled"
+    assert "recording.stop" in bridge.methods
+    assert "trace.stop" in bridge.methods
+    assert orchestrator.browser.debug_recording is None
+    assert orchestrator.browser.debug_trace is None
+    assert any(record.tool == "browser_act" for record in orchestrator.memory.actions)
+
+
 async def test_pause_returns_a_typed_paused_result_and_preserves_state():
     script = Script([browse(), done()], [{"calls": [], "outcome": {"status": "continue"}}])
     orchestrator, bridge, _ = make(script)
@@ -636,6 +678,174 @@ async def test_follow_up_preserves_context_and_the_live_browser():
     assert memory.completed_goal_summaries  # earlier goal retained
     assert script.planner_calls == 3  # a follow-up forces an immediate planner pass
     assert "And now summarise it." in script.planner_prompts[-1]
+
+
+async def test_start_task_resets_state_but_reuses_the_browser_runtime():
+    script = Script([done("First."), done("Second.")])
+    orchestrator, _, _ = make(script)
+
+    await orchestrator.start_task("First independent task.")
+    first_state = orchestrator.memory
+    first_task_id = first_state.task_id
+    first_token = first_state.cancellation_token
+
+    second = await orchestrator.start_task("Second independent task.")
+    second_state = orchestrator.memory
+    assert second.answer == "Second."
+    assert second_state.task_id != first_task_id
+    assert second_state.original_request == "Second independent task."
+    assert second_state.follow_ups == []
+    assert second_state.actions == [] and second_state.evidence == []
+    assert second_state.counters.planner_passes == 1
+    assert int(second_state.usage.requests) == 1
+    assert second_state.cancellation_token is not first_token
+
+
+async def test_follow_up_rebinds_a_replaced_tab_by_public_identity():
+    script = Script(
+        [browse(), done("Read."), done("Continued.")],
+        [{"calls": [], "outcome": {"status": "goal_reached"}}],
+    )
+    orchestrator, bridge, _ = make(script)
+    await orchestrator.start_task("Read the current page.")
+    original_task_id = orchestrator.memory.task_id
+    assert orchestrator.browser.tabs[orchestrator.tab].raw_id == 41
+
+    bridge.base_id = 43  # Chrome replaced the underlying tab between turns.
+    result = await orchestrator.continue_task("Now summarise that page.")
+    assert result.answer == "Continued."
+    assert orchestrator.memory.task_id == original_task_id
+    assert orchestrator.browser.tabs[orchestrator.tab].raw_id == 43
+    assert orchestrator.tab != "tab_1"
+
+
+async def test_failed_assertion_is_execution_success_but_semantic_failure():
+    script = Script(
+        [browse(), {"decision": "fail", "reason": "The assertion failed."}],
+        [{"calls": [("browser_assert", {"tab": "tab_1", "command": {
+            "assertion": "title", "expected": "Expected title"}})],
+          "outcome": {"status": "goal_reached"}}],
+    )
+    orchestrator, bridge, _ = make(script)
+
+    def mismatch():
+        raise bt.BrowserBridgeError(
+            "title did not match", {"code": "PAGE_EXPECT_TITLE_TIMEOUT"},
+        )
+
+    bridge.responses["expect.page.toHaveTitle"] = mismatch
+    result = await orchestrator.start_task("Verify the title.")
+    assertion_action = next(record for record in orchestrator.memory.actions if record.tool == "browser_assert")
+    assert result.status == "failed"
+    assert assertion_action.executed is True
+    assert assertion_action.execution_success is True
+    assert assertion_action.semantic_success is False
+    assert assertion_action.success is False
+    assert orchestrator.memory.assertions[-1].passed is False
+
+
+async def test_tab_not_found_is_sanitized_and_reconciled_by_the_controller():
+    script = Script(
+        [browse(), {"decision": "fail", "reason": "Could not click."}],
+        [{"calls": [CLICK], "outcome": {"status": "continue"}}],
+    )
+    orchestrator, bridge, _ = make(script)
+
+    def missing():
+        raise bt.BrowserBridgeError("No tab with id: 41")
+
+    bridge.responses["locator.clickRef"] = missing
+    result = await orchestrator.start_task("Click the visible control.")
+    assert result.status == "failed"
+    assert orchestrator.tab != "tab_1"
+    assert any(record.code == "TAB_NOT_FOUND" for record in orchestrator.memory.actions)
+    assert "No tab with id" not in "\n".join(script.prompts)
+
+
+async def test_three_successful_no_change_actions_terminate_as_no_progress():
+    config = AxisConfig.load()
+    config.run.max_total_steps = 10
+    config.run.max_model_requests = 20
+    script = Script(
+        [browse()],
+        [{"calls": [LOCATOR_CLICK], "outcome": {"status": "continue"}} for _ in range(4)],
+    )
+    orchestrator, bridge, _ = make(script, config=config)
+    bridge.responses["locator.click"] = {"whatChanged": {}}
+    result = await orchestrator.start_task("Keep clicking Continue until the page changes.")
+    assert result.status == "failed"
+    assert "NO_PROGRESS" in result.reason
+    assert bridge.methods.count("locator.click") == 3
+
+
+async def test_literal_url_is_navigated_directly_before_first_observation():
+    target = "https://example.test/exact?a=1&b=two"
+    script = Script(
+        [browse("Inspect the target"), done("Target inspected.")],
+        [{"calls": [], "outcome": {"status": "goal_reached"}}],
+    )
+    orchestrator, bridge, _ = make(script)
+
+    def navigate():
+        bridge.url = target
+        bridge.title = "Exact target"
+        return {"tab": {"url": target, "title": bridge.title}, "whatChanged": {"urlChanged": True}}
+
+    bridge.responses["page.navigate"] = navigate
+    result = await orchestrator.start_task(f"Open {target} and report its title.")
+    assert result.status == "completed"
+    navigate_index = bridge.methods.index("page.navigate")
+    observe_index = bridge.methods.index("page.accessibilityTree")
+    assert navigate_index < observe_index
+    params = next(params for method, params in bridge.calls if method == "page.navigate")
+    assert params["url"] == target
+    assert "https://example.test/exact?a=1&amp;b=two" in script.planner_prompts[0]
+
+
+async def test_approval_callback_receives_target_origin_file_and_reason():
+    config = AxisConfig.load()
+    config.run.planner_interval_steps = 1
+    approvals = []
+    script = Script(
+        [browse(), {"decision": "fail", "reason": "Upload was denied."}],
+        [{"calls": [("browser_act", {"tab": "tab_1", "command": {
+            "action": "upload", "locator": {"label": "Attach file"},
+            "files": ["C:/temp/report.csv"]}})],
+          "outcome": {"status": "continue"}}],
+    )
+
+    def deny(tool, operation, detail):
+        approvals.append((tool, operation, detail))
+        return False
+
+    orchestrator, bridge, _ = make(script, config=config, approval=deny)
+    result = await orchestrator.start_task("Upload the report after asking for approval.")
+    assert result.status == "failed"
+    assert "locator.setInputFiles" not in bridge.methods
+    tool, operation, detail = approvals[0]
+    assert (tool, operation) == ("browser_act", "upload")
+    assert detail["current_url"] == bridge.url
+    assert detail["origin"] == "https://www.google.com"
+    assert detail["target"] == "Attach file"
+    assert detail["target_type"] == "locator"
+    assert detail["upload_filenames"] == ["C:/temp/report.csv"]
+    assert detail["expected_effect"] == "upload"
+    assert detail["reason"]
+
+
+async def test_requested_diagnostics_are_armed_before_direct_navigation():
+    target = "https://diagnostic.test/"
+    script = Script(
+        [browse(), {"decision": "fail", "reason": "Stop after setup."}],
+        [{"calls": [], "outcome": {"status": "goal_reached"}}],
+    )
+    orchestrator, bridge, _ = make(script)
+    bridge.responses["page.navigate"] = {"tab": {"url": target, "title": "Diagnostics"}}
+    await orchestrator.start_task(
+        f"Open {target}, then check the browser console and network requests."
+    )
+    assert bridge.methods.index("console.read") < bridge.methods.index("page.navigate")
+    assert bridge.methods.index("network.read") < bridge.methods.index("page.navigate")
 
 
 async def test_unknown_mutation_outcome_is_never_repeated_automatically():
@@ -675,16 +885,19 @@ async def test_state_changing_completion_is_rejected_until_it_is_verified():
     assert orchestrator.memory.verified_mutation_count == orchestrator.memory.mutation_count
 
 
-async def test_a_rejected_completion_is_only_rejected_once():
+async def test_a_rejected_completion_is_rejected_on_every_attempt():
+    config = AxisConfig.load()
+    config.run.max_model_requests = 5
     script = Script(
         [browse(), done("Submitted."), done("Still submitted.")],
         [{"calls": [FILL], "outcome": {"status": "goal_reached"}}],
     )
-    orchestrator, bridge, _ = make(script)
+    orchestrator, bridge, _ = make(script, config=config)
     bridge.responses["locator.fillRef"] = {"whatChanged": {}}
     result = await orchestrator.run("Fill it.")
-    assert result.status == "completed"
-    assert result.answer == "Still submitted."
+    assert result.status == "limit_reached"
+    assert orchestrator.memory.completion_rejected is True
+    assert script.planner_calls > 2
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +935,7 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
         "page.accessibilityTree",  # programmatic observation before step 1
         "locator.fillRef",
         "keyboard.press",
+        "tabs.list",              # revalidate the bound tab before reuse
         "page.accessibilityTree",  # fresh observation before step 2
     ]
     assert script.planner_calls == 2 and script.navigator_calls == 2

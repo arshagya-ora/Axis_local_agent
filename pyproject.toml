@@ -11,9 +11,11 @@ dependencies = [
     "openai==3.8.0",
     "pydantic==2.13.5",
     "pydantic-ai-slim[openai]==2.40.0",
+    "pyyaml==6.0.3",
 ]
 
 [dependency-groups]
 dev = [
+    "pydantic-evals==2.40.0",
     "pytest==8.4.2",
 ]

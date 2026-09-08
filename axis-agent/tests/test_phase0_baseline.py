@@ -1,11 +1,10 @@
-"""Phase 0 baseline tests: browser-tool contract freeze + provider probe safety.
+"""Phase 0 baseline tests: executable browser schemas + provider probe safety.
 
 Does not duplicate tests/test_browser_agent_tools.py's 114 tests — see that
-file for full tool-behavior coverage. This file proves only the Phase 0
-deliverables: the seven-tool contract is frozen and verifiable, it is never
-silently rewritten, model-facing schemas leak no raw bridge identifiers, and
-the compatibility-probe/report/manifest machinery is safe to run without
-live provider credentials.
+file for full tool-behavior coverage. Historical JSON snapshots are retired;
+the executable schemas are the active baseline. This file also verifies that
+model-facing schemas hide raw bridge identifiers and that provider probes are
+safe to run without live credentials.
 """
 from __future__ import annotations
 
@@ -108,12 +107,6 @@ class TestSevenToolContract(unittest.TestCase):
         names = tuple(tool["function"]["name"] for tool in bat.get_tool_definitions())
         self.assertEqual(names, EXPECTED_TOOL_NAMES)
 
-    def test_frozen_v1_contract_still_has_exactly_seven_tools(self):
-        v1 = browser_contract.load_committed_snapshot("v1")
-        self.assertIsNotNone(v1, "Frozen v1 contract snapshot must still exist")
-        self.assertEqual(v1["toolCount"], 7)
-        self.assertNotIn("browser_tabs", v1["toolNames"])
-
     def test_no_raw_bridge_method_selection_in_schemas(self):
         for tool in bat.get_tool_definitions():
             props = set(_iter_schema_property_names(tool["function"]["parameters"]))
@@ -128,20 +121,10 @@ class TestSevenToolContract(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 2. The frozen contract snapshot
+# 2. Deterministic executable-contract helpers (no snapshot files)
 # ---------------------------------------------------------------------------
 
-class TestContractSnapshot(unittest.TestCase):
-    def test_generated_contract_matches_committed_snapshot(self):
-        generated = browser_contract.generate_snapshot()
-        committed = browser_contract.load_committed_snapshot()
-        self.assertIsNotNone(
-            committed,
-            "No committed snapshot found; run "
-            "'python scripts/browser_contract.py --update' once and commit the result.",
-        )
-        self.assertEqual(generated, committed)
-
+class TestContractHelpers(unittest.TestCase):
     def test_contract_drift_produces_a_readable_message(self):
         generated = browser_contract.generate_snapshot()
         drifted = copy.deepcopy(generated)
@@ -158,14 +141,6 @@ class TestContractSnapshot(unittest.TestCase):
         generated = browser_contract.generate_snapshot()
         message = browser_contract.format_drift_report(None, generated)
         self.assertIn("--update", message)
-
-    def test_verify_does_not_rewrite_the_committed_file(self):
-        path = browser_contract.CONTRACT_PATH
-        before_bytes = path.read_bytes()
-        before_mtime = path.stat().st_mtime_ns
-        self.assertTrue(browser_contract.verify())
-        self.assertEqual(path.read_bytes(), before_bytes)
-        self.assertEqual(path.stat().st_mtime_ns, before_mtime)
 
     def test_contract_hash_is_deterministic(self):
         first = browser_contract.generate_snapshot()

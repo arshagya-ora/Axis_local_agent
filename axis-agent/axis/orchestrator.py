@@ -8,27 +8,34 @@ the process.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic_ai import Agent, ModelHTTPError, RunUsage, UsageLimitExceeded, UsageLimits, format_as_xml
+from pydantic_ai import Agent, ModelHTTPError, RunCancelled, UsageLimitExceeded, UsageLimits, format_as_xml
 
 import browser_tools as bt
 from browser_tools import BrowserRuntime, ToolFault
 
-from .agents import AxisDeps, StepGate, browser_context
+from .agents import AxisDeps, RECOVERY_POLICY, StepGate, browser_context
 from .models import (
     ActionRecord,
+    AssertionRecord,
     AxisConfig,
     AxisEvent,
     AxisResult,
     BrowserState,
+    CompletionVerdict,
+    Evidence,
     NavigatorOutcome,
     PlanDecision,
     TabSummary,
-    TaskMemory,
+    TaskRequirements,
+    TaskRunState,
     clip,
 )
 
@@ -59,13 +66,29 @@ FATAL_BRIDGE_CODES = frozenset({"BRIDGE_UNAVAILABLE", "FIREWALL_DENIED"})
 # is recognised in the task text, so a user who asks for a screenshot actually
 # gets the tool that can take one.
 _EVIDENCE_REQUEST = re.compile(
-    r"screen\s?shot|screengrab|screen capture|\bcapture\b|\bevidence\b|\bproof\b|"
-    r"\bpdf\b|\bartifact\b|save .*(image|picture|file)",
+    r"screen\s?shot|screengrab|screen capture|\bproof\b|\bpdf\b|\bartifact\b|"
+    r"save .*(image|picture)",
     re.IGNORECASE,
 )
+_SCREENSHOT_REQUEST = re.compile(
+    r"screen\s?shot|screengrab|screen capture|save .*(image|picture)", re.IGNORECASE,
+)
+_CONSOLE_REQUEST = re.compile(r"\bbrowser console\b|\bconsole (?:log|message|error|warning|output)s?\b", re.IGNORECASE)
+_NETWORK_REQUEST = re.compile(
+    r"\bnetwork (?:activity|request|response|error|status|detail)s?\b|\bhttp status\b|"
+    r"\brequest(?:'s)? (?:status|details?)\b",
+    re.IGNORECASE,
+)
+_URL = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+_CURRENT_PAGE_DEPENDENCY = re.compile(r"\bcurrent page\b|\bthis page\b|\bfrom here\b|\bcompare\b", re.IGNORECASE)
+_REQUIRED_TEXT = re.compile(
+    r"(?:assert|verify|contains?|subject(?: is|:)?|exact text(?: is|:)?)\s+(?:that\s+)?[\"“`]([^\"”`]{1,300})[\"”`]",
+    re.IGNORECASE,
+)
+_FORBIDDEN = re.compile(r"\bdo not\s+(send|submit|delete|purchase|buy|post|transfer|upload)\b", re.IGNORECASE)
 _DOWNLOAD_REQUEST = re.compile(
     r"\bdownload(?:ed|ing|s)?\b|\bexport\b.*\b(file|csv|xlsx|pdf|zip)\b|"
-    r"\bsave\b.*\b(file|report|attachment)\b",
+    r"\bsave\b.*\b(file|report|attachment|csv|xlsx|pdf|zip)\b",
     re.IGNORECASE,
 )
 
@@ -76,6 +99,92 @@ def evidence_requested(*texts: str | None) -> bool:
 
 def downloads_requested(*texts: str | None) -> bool:
     return any(_DOWNLOAD_REQUEST.search(text) for text in texts if text)
+
+
+def extract_requirements(*texts: str | None) -> TaskRequirements:
+    combined = "\n".join(text for text in texts if text)
+    urls = list(dict.fromkeys(match.rstrip(".,);]") for match in _URL.findall(combined)))
+    required = list(dict.fromkeys(_REQUIRED_TEXT.findall(combined)))
+    forbidden = {match.lower() for match in _FORBIDDEN.findall(combined)}
+    return TaskRequirements(
+        literal_urls=urls,
+        required_text=required,
+        require_screenshot=bool(_SCREENSHOT_REQUEST.search(combined)),
+        require_download=downloads_requested(combined),
+        require_console_check=bool(_CONSOLE_REQUEST.search(combined)),
+        require_network_check=bool(_NETWORK_REQUEST.search(combined)),
+        mutation_allowed=not bool(re.search(r"\bread[- ]only\b|\bdo not (?:change|modify)\b", combined, re.IGNORECASE)),
+        forbidden_actions=forbidden,
+    )
+
+
+def diagnostics_requested(requirements: TaskRequirements) -> bool:
+    return requirements.require_console_check or requirements.require_network_check
+
+
+def _merge_requirements(current: TaskRequirements, added: TaskRequirements) -> TaskRequirements:
+    return TaskRequirements(
+        literal_urls=list(dict.fromkeys(current.literal_urls + added.literal_urls)),
+        required_text=list(dict.fromkeys(current.required_text + added.required_text)),
+        final_url_pattern=added.final_url_pattern or current.final_url_pattern,
+        require_screenshot=current.require_screenshot or added.require_screenshot,
+        require_download=current.require_download or added.require_download,
+        require_console_check=current.require_console_check or added.require_console_check,
+        require_network_check=current.require_network_check or added.require_network_check,
+        mutation_allowed=current.mutation_allowed and added.mutation_allowed,
+        forbidden_actions=current.forbidden_actions | added.forbidden_actions,
+    )
+
+
+def verify_completion(state: TaskRunState, browser_state: BrowserState | None) -> CompletionVerdict:
+    """Deterministically decide whether a model completion claim is admissible."""
+    reasons: list[str] = []
+    latest_assertions: dict[tuple[str, str, str], AssertionRecord] = {}
+    for assertion in state.assertions:
+        key = (assertion.tab or "", assertion.assertion, repr(assertion.expected))
+        latest_assertions[key] = assertion
+    if any(not item.passed for item in latest_assertions.values()):
+        reasons.append("A required assertion is still failing.")
+    if state.unverified_mutations:
+        reasons.append(f"{state.unverified_mutations} page mutation(s) remain unverified.")
+    requirements = state.requirements
+    if requirements.require_screenshot and not state.evidence_by_kind("screenshot"):
+        reasons.append("The requested screenshot is missing.")
+    if requirements.require_download and not state.downloads:
+        reasons.append("The requested download is missing.")
+    if requirements.require_console_check and not any(e.kind == "console" for e in state.diagnostic_evidence):
+        reasons.append("Console diagnostics were requested but not collected.")
+    if requirements.require_network_check and not any(e.kind == "network" for e in state.diagnostic_evidence):
+        reasons.append("Network diagnostics were requested but not collected.")
+    searchable = "\n".join(
+        [browser_state.snapshot if browser_state else ""]
+        + [item.detail for item in state.evidence]
+        + [record.extracted_data or "" for record in state.actions]
+    ).casefold()
+    for required in requirements.required_text:
+        if required.casefold() not in searchable:
+            reasons.append(f"Required text has not been verified: {required!r}.")
+    current_url = browser_state.url if browser_state else None
+    visited = "\n".join(
+        [current_url or ""]
+        + [item.detail for item in state.evidence]
+        + [record.extracted_data or "" for record in state.actions]
+    )
+    for literal_url in requirements.literal_urls:
+        if literal_url not in visited:
+            reasons.append(f"Required URL has not been visited or verified: {literal_url!r}.")
+    if requirements.final_url_pattern and not re.search(requirements.final_url_pattern, current_url or ""):
+        reasons.append("The final URL condition is not met.")
+    unresolved_refusals: dict[tuple[str, str | None], ActionRecord] = {}
+    for record in state.actions:
+        key = (record.tool, record.operation)
+        if not record.executed:
+            unresolved_refusals[key] = record
+        elif record.success:
+            unresolved_refusals.pop(key, None)
+    if unresolved_refusals:
+        reasons.append("A refused browser action remains unresolved.")
+    return CompletionVerdict(valid=not reasons, reasons=reasons)
 
 
 class _Stop(Exception):
@@ -110,54 +219,83 @@ class AxisOrchestrator:
         # tool set is fixed for the whole run (the default the tests use).
         self.navigator_factory = navigator_factory
 
-        self.memory: TaskMemory | None = None
-        self.usage = RunUsage()
+        self.state: TaskRunState | None = None
         self.usage_limits = UsageLimits(request_limit=config.run.max_model_requests)
-        self.browser_actions = 0
-        self.planner_passes = 0
-        self.tab: str | None = None
 
-        self._paused = False
-        self._cancelled = False
-        self._completion_rejected = False
-        self._repair_attempted = False
+        self._prestart_paused = False
         self._capture_enabled = config.tools.capture_evidence
         self._diagnose_enabled = config.tools.diagnose
         self._downloads_enabled = config.tools.downloads
-        self._debug_telemetry_started = False
-        self._started = time.monotonic()
-        self._model_ms = 0
-        self._browser_ms = 0
-        self._plan_ms = 0
-        self._step_ms = 0
+        self._base_navigator = navigator
+
+    @property
+    def memory(self) -> TaskRunState | None:
+        return self.state
+
+    @property
+    def usage(self):
+        return self.state.usage if self.state else None
+
+    @property
+    def browser_actions(self) -> int:
+        return self.state.counters.browser_actions if self.state else 0
+
+    @property
+    def planner_passes(self) -> int:
+        return self.state.counters.planner_passes if self.state else 0
+
+    @property
+    def tab(self) -> str | None:
+        return self.state.bound_tab if self.state else None
+
+    @tab.setter
+    def tab(self, value: str | None) -> None:
+        if self.state is not None:
+            self.state.bound_tab = value
+            if value and value not in self.state.task_tabs:
+                self.state.task_tabs = (self.state.task_tabs + [value])[-8:]
 
     # -- timing ----------------------------------------------------------
 
     def _elapsed_ms(self) -> int:
-        return int((time.monotonic() - self._started) * 1000)
+        started = self.state.started_monotonic if self.state else time.monotonic()
+        return int((time.monotonic() - started) * 1000)
 
     # -- control ---------------------------------------------------------
 
     def pause(self) -> None:
-        self._paused = True
+        if self.state:
+            self.state.status = "paused"
+        else:
+            self._prestart_paused = True
 
     def resume(self) -> None:
-        self._paused = False
+        self._prestart_paused = False
+        if self.state and self.state.status == "paused":
+            self.state.status = "active"
 
     def cancel(self) -> None:
-        self._cancelled = True
+        if self.state:
+            self.state.status = "cancelled"
+            self.state.cancellation_token.cancel()
 
     # -- entry points ----------------------------------------------------
 
+    async def start_task(self, task: str) -> AxisResult:
+        """Start an independent task while reusing the connected browser."""
+        self.state = self.config.new_memory(task, extract_requirements(task))
+        self.state.status = "paused" if self._prestart_paused else "active"
+        self._set_navigator_tools()
+        try:
+            return await self._loop()
+        except RunCancelled:
+            return self._result("cancelled", reason="The user cancelled the run.")
+        finally:
+            self._close_telemetry()
+
     async def run(self, task: str) -> AxisResult:
-        self.memory = self.config.new_memory(task)
-        self._completion_rejected = False
-        self._started = time.monotonic()
-        self._model_ms = self._browser_ms = 0
-        self._sync_navigator_tools(
-            capture=evidence_requested(task), downloads=downloads_requested(task),
-        )
-        return await self._loop()
+        """Compatibility alias for start_task()."""
+        return await self.start_task(task)
 
     async def continue_task(self, follow_up: str) -> AxisResult:
         """Append a follow-up and force an immediate planner pass.
@@ -166,25 +304,45 @@ class AxisOrchestrator:
         live browser runtime with its open tabs. The browser is only re-bound
         if the previous run lost its tab.
         """
-        if self.memory is None:
-            return await self.run(follow_up)
-        self.memory.add_followup(follow_up)
-        self.memory.last_error = None
-        self.memory.consecutive_failures = 0
-        self.memory.navigator_steps_since_plan = self.config.run.planner_interval_steps
-        self.memory.current_goal = None
-        self._paused = False
-        self._cancelled = False
-        self._completion_rejected = False
-        self._started = time.monotonic()
-        self._model_ms = self._browser_ms = 0
+        if self.state is None:
+            return await self.start_task(follow_up)
+        state = self.state
+        state.add_followup(follow_up)
+        state.requirements = _merge_requirements(state.requirements, extract_requirements(follow_up))
+        state.last_error = None
+        state.counters.consecutive_failures = 0
+        state.counters.navigator_steps_since_plan = self.config.run.planner_interval_steps
+        state.current_goal = None
+        state.latest_navigator_outcome = None
+        state.status = "active"
+        state.completion_rejected = False
+        state.repair_attempted = False
+        state.direct_navigation_done = False
+        state.started_monotonic = time.monotonic()
+        state.model_ms = state.browser_ms = state.plan_ms = state.step_ms = 0
+        state.cancellation_token = type(state.cancellation_token)()
+        try:
+            self._set_navigator_tools()
+            self._reconcile_bound_tab()
+            return await self._loop()
+        except RunCancelled:
+            return self._result("cancelled", reason="The user cancelled the run.")
+        finally:
+            self._close_telemetry()
+
+    def _set_navigator_tools(self) -> None:
+        state = self.state
+        assert state is not None
         self._sync_navigator_tools(
-            capture=evidence_requested(follow_up), downloads=downloads_requested(follow_up),
+            capture=evidence_requested(state.original_request, *state.follow_ups),
+            diagnose=diagnostics_requested(state.requirements),
+            downloads=state.requirements.require_download,
+            exact=True,
         )
-        return await self._loop()
 
     def _sync_navigator_tools(
         self, *, capture: bool = False, diagnose: bool = False, downloads: bool = False,
+        exact: bool = False,
     ) -> None:
         """Turn on an opt-in tool when the run actually needs it.
 
@@ -194,9 +352,15 @@ class AxisOrchestrator:
         rule while making sure a task that asks for a screenshot is not left
         without the one tool that can take it.
         """
-        want_capture = self._capture_enabled or capture or self.config.tools.capture_evidence
-        want_diagnose = self._diagnose_enabled or diagnose or self.config.tools.diagnose
-        want_downloads = self._downloads_enabled or downloads or self.config.tools.downloads
+        want_capture = (capture or self.config.tools.capture_evidence) if exact else (
+            self._capture_enabled or capture or self.config.tools.capture_evidence
+        )
+        want_diagnose = (diagnose or self.config.tools.diagnose) if exact else (
+            self._diagnose_enabled or diagnose or self.config.tools.diagnose
+        )
+        want_downloads = (downloads or self.config.tools.downloads) if exact else (
+            self._downloads_enabled or downloads or self.config.tools.downloads
+        )
         if (want_capture, want_diagnose, want_downloads) == (
             self._capture_enabled, self._diagnose_enabled, self._downloads_enabled,
         ):
@@ -228,53 +392,65 @@ class AxisOrchestrator:
     # -- budgets and stopping --------------------------------------------
 
     def _stop_reason(self) -> AxisResult | None:
-        memory = self.memory
-        assert memory is not None
+        state = self.state
+        assert state is not None
         run = self.config.run
-        if self._cancelled:
+        if state.status == "cancelled":
             return self._result("cancelled", reason="The user cancelled the run.")
-        if self._paused:
+        if state.status == "paused":
             return self._result("paused", reason="The run is paused; task and browser state are preserved.")
-        if memory.total_steps >= run.max_total_steps:
+        if state.counters.total_steps >= run.max_total_steps:
             return self._result("limit_reached", reason=f"Reached the maximum of {run.max_total_steps} steps.")
-        if int(self.usage.requests) >= run.max_model_requests:
+        if int(state.usage.requests) >= run.max_model_requests:
             return self._result("limit_reached", reason="Reached the maximum number of model requests.")
-        if self.browser_actions >= run.max_browser_actions:
+        if state.counters.browser_actions >= run.max_browser_actions:
             return self._result("limit_reached", reason="Reached the maximum number of browser actions.")
-        if memory.consecutive_failures >= run.max_consecutive_failures:
-            return self._result("failed", reason=f"{memory.consecutive_failures} consecutive failures.")
+        if state.counters.consecutive_failures >= run.max_consecutive_failures:
+            return self._result("failed", reason=f"{state.counters.consecutive_failures} consecutive failures.")
+        if state.counters.no_progress_steps >= 3:
+            return self._result("failed", reason="NO_PROGRESS: Three equivalent attempts produced no useful change.")
         return None
 
     def _result(self, status: str, *, answer: str | None = None, evidence: list[str] | None = None,
                 reason: str = "") -> AxisResult:
-        memory = self.memory
-        debug_artifacts = self.browser.stop_debug_telemetry() if self._debug_telemetry_started else {}
-        self._debug_telemetry_started = False
+        state = self.state
+        if state:
+            state.status = status  # type: ignore[assignment]
         result = AxisResult(
             status=status,  # type: ignore[arg-type]
             answer=answer,
             evidence=evidence or [],
             reason=reason,
-            total_steps=memory.total_steps if memory else 0,
-            planner_passes=self.planner_passes,
-            browser_actions=self.browser_actions,
-            model_requests=int(self.usage.requests),
+            total_steps=state.counters.total_steps if state else 0,
+            planner_passes=state.counters.planner_passes if state else 0,
+            browser_actions=state.counters.browser_actions if state else 0,
+            model_requests=int(state.usage.requests) if state else 0,
             duration_ms=self._elapsed_ms(),
-            model_ms=self._model_ms,
-            browser_ms=self._browser_ms,
+            # Agent.run includes time spent executing tools. Subtract the
+            # measured bridge portion to avoid double-counting it as model time.
+            model_ms=max(0, state.model_ms - state.browser_ms) if state else 0,
+            browser_ms=state.browser_ms if state else 0,
         )
         self._emit(
             "final", status=result.status, reason=result.reason,
             duration_ms=result.duration_ms, model_ms=result.model_ms, browser_ms=result.browser_ms,
-            debug_artifacts=debug_artifacts or None,
+            debug_artifacts=None,
         )
         return result
+
+    def _close_telemetry(self) -> None:
+        state = self.state
+        if state and state.debug_telemetry_started:
+            artifacts = self.browser.stop_debug_telemetry()
+            state.debug_telemetry_started = False
+            if artifacts:
+                state.evidence.append(Evidence(kind="observation", detail=f"Debug telemetry: {artifacts}"))
 
     # -- main loop -------------------------------------------------------
 
     async def _loop(self) -> AxisResult:
-        memory = self.memory
-        assert memory is not None
+        state = self.state
+        assert state is not None
         while True:
             stop = self._stop_reason()
             if stop is not None:
@@ -284,18 +460,16 @@ class AxisOrchestrator:
             except _Stop as stopped:
                 return stopped.result
 
-            self.planner_passes += 1
-            memory.navigator_steps_since_plan = 0
-            self._emit("planner_decision", **plan.model_dump(), duration_ms=self._plan_ms)
+            state.counters.planner_passes += 1
+            state.counters.navigator_steps_since_plan = 0
+            self._emit("planner_decision", **plan.model_dump(), duration_ms=state.plan_ms)
 
             if plan.decision == "complete":
-                if memory.unverified_mutations and not self._completion_rejected:
-                    self._completion_rejected = True
-                    memory.last_error = (
-                        "Completion rejected once: the page was changed and no observation or "
-                        "passing assertion has been made since. Verify the result, then decide again."
-                    )
-                    memory.current_goal = memory.current_goal or "Verify the result of the last change."
+                verdict = verify_completion(state, state.last_browser_state)
+                if not verdict.valid:
+                    state.completion_rejected = True
+                    state.last_error = "Completion rejected: " + " ".join(verdict.reasons)
+                    state.current_goal = state.current_goal or "Verify every unresolved completion requirement."
                     continue
                 return self._result(
                     "completed", answer=plan.final_answer, evidence=plan.evidence, reason=plan.reason,
@@ -306,12 +480,12 @@ class AxisOrchestrator:
             if plan.decision == "fail":
                 return self._result("failed", evidence=plan.evidence, reason=plan.reason)
 
-            if memory.current_goal and plan.next_goal and plan.next_goal != memory.current_goal:
-                memory.complete_goal(memory.current_goal)
-            memory.current_plan_summary = plan.plan_summary
-            memory.current_goal = plan.next_goal
-            memory.current_success_condition = plan.success_condition
-            self._repair_attempted = False
+            if state.current_goal and plan.next_goal and plan.next_goal != state.current_goal:
+                state.complete_goal(state.current_goal)
+            state.current_plan_summary = plan.plan_summary
+            state.current_goal = self._preserve_literal_urls(plan.next_goal)
+            state.current_success_condition = plan.success_condition
+            state.repair_attempted = False
 
             try:
                 await self._navigator_burst()
@@ -320,47 +494,48 @@ class AxisOrchestrator:
 
     async def _navigator_burst(self) -> None:
         """Run navigator steps until the planner is due again."""
-        memory = self.memory
-        assert memory is not None
+        state = self.state
+        assert state is not None
         while True:
             stop = self._stop_reason()
             if stop is not None:
                 raise _Stop(stop)
 
-            state = await self._browser_state()
-            outcome, gate = await self._navigate(state)
+            browser_state = await self._browser_state()
+            outcome, gate = await self._navigate(browser_state)
 
-            memory.total_steps += 1
-            memory.navigator_steps_since_plan += 1
-            memory.latest_navigator_outcome = outcome
-            memory.record_actions(gate.records)
-            self.browser_actions += gate.actions_used
-            mutated_this_step = False
-            for record, (mutated, verified) in zip(gate.records, gate.effects):
-                if mutated:
-                    memory.mutation_count += 1
-                    mutated_this_step = True
-                if verified:
-                    memory.verified_mutation_count = memory.mutation_count
+            state.counters.total_steps += 1
+            state.counters.navigator_steps_since_plan += 1
+            state.latest_navigator_outcome = outcome
+            self._commit_gate(gate)
+            mutated_this_step = any(mutated for mutated, _ in gate.effects)
             # Follow a tab the navigator switched to, so the next observation
             # targets the page it actually moved to rather than the one it
             # left — otherwise it must burn a whole step re-activating.
-            if gate.active_tab_changed_to and gate.active_tab_changed_to in self.browser.tabs:
-                self.tab = gate.active_tab_changed_to
             failures = [record for record in gate.records if not record.success]
             # A goal_reached decision with no new mutation is a semantic
             # assessment of the fresh pre-step BrowserState. Do not grant the
             # same status to a step that just changed the page: that change
             # still needs a later observation or passing assertion.
             if outcome.status == "goal_reached" and not failures and not mutated_this_step:
-                memory.verified_mutation_count = memory.mutation_count
-            memory.last_error = failures[-1].error if failures else None
+                state.counters.verified_mutation_count = state.counters.mutation_count
+            if outcome.status == "goal_reached" and failures:
+                outcome.status = "continue"
+                outcome.reason = failures[-1].error or "A required browser call did not succeed."
+            state.last_error = failures[-1].error if failures else None
+            if any(RECOVERY_POLICY.get(record.code or "") == "reconcile_tab" for record in failures):
+                # Tab liveness is controller state. Reconcile it once instead
+                # of asking the model to guess or repeat an internal tab id.
+                self._reconcile_bound_tab()
+            for item in outcome.evidence:
+                state.evidence.append(Evidence(kind="navigator", detail=item, tab=self.tab, verified=False))
+            self._update_progress(browser_state, gate.records)
             self._emit(
                 "navigator_step",
                 **outcome.model_dump(),
                 actions=gate.actions_used,
                 interrupted=gate.interrupt_reason,
-                duration_ms=getattr(self, "_step_ms", 0),
+                duration_ms=state.step_ms,
                 browser_ms=gate.browser_ms,
             )
 
@@ -370,87 +545,111 @@ class AxisOrchestrator:
                 raise _Stop(self._result("paused", reason="The run is paused; state is preserved."))
 
             if failures:
-                memory.consecutive_failures += 1
-                # A genuine failure worth investigating — the one condition the
-                # spec allows browser_diagnose to be added under.
-                if gate.unknown_outcome or gate.non_retryable or memory.consecutive_failures > 1:
-                    self._sync_navigator_tools(diagnose=True)
+                state.counters.consecutive_failures += 1
             else:
-                memory.consecutive_failures = 0
-                self._repair_attempted = False
+                state.counters.consecutive_failures = 0
+                state.repair_attempted = False
 
             # Back to the planner immediately.
             if outcome.status != "continue":
-                if outcome.status == "goal_reached" and memory.current_goal:
-                    memory.complete_goal(f"{memory.current_goal} -> {outcome.summary}")
-                    memory.current_goal = None
+                if outcome.status == "goal_reached" and state.current_goal:
+                    state.complete_goal(f"{state.current_goal} -> {outcome.summary}")
+                    state.current_goal = None
                 return
             if gate.unknown_outcome:
-                memory.last_error = (
-                    f"{memory.last_error or 'An action had an unknown outcome.'} "
+                state.last_error = (
+                    f"{state.last_error or 'An action had an unknown outcome.'} "
                     "It was not repeated; verify the page before acting again."
                 )
                 return
             if gate.non_retryable:
                 return
             if failures:
-                if self._repair_attempted:
+                if state.repair_attempted:
                     return  # one repair attempt only
-                self._repair_attempted = True
-            if memory.navigator_steps_since_plan >= self.config.run.planner_interval_steps:
+                state.repair_attempted = True
+            if state.counters.no_progress_steps >= 2:
+                state.last_error = "NO_PROGRESS: Two equivalent attempts made no useful change; choose a different strategy."
+                return
+            if state.counters.navigator_steps_since_plan >= self.config.run.planner_interval_steps:
                 return
 
     # -- planner ---------------------------------------------------------
 
     async def _plan(self) -> PlanDecision:
-        memory = self.memory
-        assert memory is not None
+        state = self.state
+        assert state is not None
         run = self.config.run
         context: dict[str, Any] = {
-            "original_task": memory.original_task,
-            "user_followups": memory.user_followups,
-            "current_plan_summary": memory.current_plan_summary,
-            "current_goal": memory.current_goal,
-            "success_condition": memory.current_success_condition,
-            "completed_goals": memory.completed_goal_summaries,
+            "task_id": state.task_id,
+            "original_request": state.original_request,
+            "follow_ups": state.follow_ups,
+            "current_request": state.follow_ups[-1] if state.follow_ups else state.original_request,
+            "requirements": state.requirements.model_dump(mode="json"),
+            "current_plan_summary": state.current_plan_summary,
+            "current_goal": state.current_goal,
+            "success_condition": state.current_success_condition,
+            "completed_goals": state.completed_goal_summaries,
             "latest_navigator_outcome": (
-                memory.latest_navigator_outcome.model_dump() if memory.latest_navigator_outcome else None
+                state.latest_navigator_outcome.model_dump() if state.latest_navigator_outcome else None
             ),
-            "recent_action_results": [record.model_dump() for record in memory.recent_action_results],
-            "relevant_extracted_data": memory.relevant_extracted_data,
-            "last_error": memory.last_error,
-            "unverified_page_changes": memory.unverified_mutations,
-            "remaining_steps": max(0, run.max_total_steps - memory.total_steps),
-            "remaining_browser_actions": max(0, run.max_browser_actions - self.browser_actions),
-            "remaining_model_requests": max(0, run.max_model_requests - int(self.usage.requests)),
+            "recent_action_results": [record.model_dump() for record in state.actions[-state.max_recent_actions:]],
+            "relevant_extracted_data": state.relevant_extracted_data,
+            "last_error": state.last_error,
+            "unverified_page_changes": state.unverified_mutations,
+            "remaining_steps": max(0, run.max_total_steps - state.counters.total_steps),
+            "remaining_browser_actions": max(0, run.max_browser_actions - state.counters.browser_actions),
+            "remaining_model_requests": max(0, run.max_model_requests - int(state.usage.requests)),
         }
-        if self.tab is not None:
+        if self.tab is not None and self.tab in self.browser.tabs:
             context["browser"] = {
                 "tab": self.tab,
                 "url": self.browser.safe_url(self.browser.tabs[self.tab].url),
                 "title": self.browser.tabs[self.tab].title,
             }
-        self._emit("status", phase="planner_started", steps_since_plan=memory.navigator_steps_since_plan)
+        self._emit("status", phase="planner_started", steps_since_plan=state.counters.navigator_steps_since_plan)
         started = time.monotonic()
         decision = await self._run_agent(
             self.planner,
             format_as_xml(context, root_tag="task_context"),
             deps=None,
         )
-        self._plan_ms = int((time.monotonic() - started) * 1000)
+        state.plan_ms = int((time.monotonic() - started) * 1000)
         return decision
 
     # -- navigator -------------------------------------------------------
 
+    def _commit_gate(self, gate: StepGate) -> None:
+        """Persist a step gate exactly once, including cancelled runs."""
+        if gate.committed:
+            return
+        state = self.state
+        assert state is not None
+        state.record_actions(gate.records)
+        state.counters.browser_actions += gate.actions_used
+        for record, (mutated, verified) in zip(gate.records, gate.effects):
+            if mutated:
+                state.counters.mutation_count += 1
+            if verified:
+                state.counters.verified_mutation_count = state.counters.mutation_count
+            self._collect_record_evidence(record)
+        if gate.active_tab_changed_to and gate.active_tab_changed_to in self.browser.tabs:
+            self.tab = gate.active_tab_changed_to
+        gate.committed = True
+
     async def _navigate(self, state: BrowserState) -> tuple[NavigatorOutcome, StepGate]:
+        task = self.state
+        assert task is not None
         run = self.config.run
         gate = StepGate(
             max_actions=run.max_actions_per_step,
-            remaining_total_actions=max(0, run.max_browser_actions - self.browser_actions),
+            remaining_total_actions=max(0, run.max_browser_actions - task.counters.browser_actions),
             approval_actions=frozenset(self.config.tools.approval_required_actions),
             approval=self.approval,
-            is_paused=lambda: self._paused,
-            is_cancelled=lambda: self._cancelled,
+            forbidden_actions=frozenset(task.requirements.forbidden_actions),
+            mutation_allowed=task.requirements.mutation_allowed,
+            is_paused=lambda: bool(self.state and self.state.status == "paused"),
+            is_cancelled=lambda: bool(self.state and self.state.status == "cancelled"),
             on_action=lambda record, duration_ms: self._emit(
                 "browser_action", tool=record.tool, operation=record.operation, args=record.args,
                 success=record.success, error=record.error, refs_invalidated=record.refs_invalidated,
@@ -465,9 +664,15 @@ class AxisOrchestrator:
         self._emit("status", phase="navigator_step_started", goal=state.goal)
         prompt = format_as_xml(state.model_dump(exclude_none=True), root_tag="browser_state")
         started = time.monotonic()
-        outcome = await self._run_agent(self.navigator, prompt, deps=deps)
-        self._browser_ms += gate.browser_ms
-        self._step_ms = int((time.monotonic() - started) * 1000)
+        try:
+            outcome = await self._run_agent(self.navigator, prompt, deps=deps)
+        except BaseException:
+            task.browser_ms += gate.browser_ms
+            task.step_ms = int((time.monotonic() - started) * 1000)
+            self._commit_gate(gate)
+            raise
+        task.browser_ms += gate.browser_ms
+        task.step_ms = int((time.monotonic() - started) * 1000)
         return outcome, gate
 
     async def _run_agent(self, agent: Agent[Any, Any], prompt: str, *, deps: Any) -> Any:
@@ -475,14 +680,17 @@ class AxisOrchestrator:
 
         Pause/cancel are checked here, immediately before the request.
         """
-        if self._cancelled:
+        state = self.state
+        assert state is not None
+        if state.status == "cancelled":
             raise _Stop(self._result("cancelled", reason="The user cancelled the run."))
-        if self._paused:
+        if state.status == "paused":
             raise _Stop(self._result("paused", reason="The run is paused; state is preserved."))
         started = time.monotonic()
         try:
             result = await agent.run(
-                prompt, deps=deps, usage=self.usage, usage_limits=self.usage_limits,
+                prompt, deps=deps, usage=state.usage, usage_limits=self.usage_limits,
+                cancellation_token=state.cancellation_token,
             )
         except UsageLimitExceeded as exc:
             raise _Stop(self._result("limit_reached", reason=clip(str(exc)) or "Usage limit exceeded.")) from exc
@@ -494,11 +702,51 @@ class AxisOrchestrator:
                 else f"The model provider returned an error ({status})."
             )
             raise _Stop(self._result("failed", reason=reason)) from exc
+        except RunCancelled:
+            state.status = "cancelled"
+            raise
         finally:
-            self._model_ms += int((time.monotonic() - started) * 1000)
+            state.model_ms += int((time.monotonic() - started) * 1000)
         return result.output
 
     # -- browser ---------------------------------------------------------
+
+    def _reconcile_bound_tab(self) -> list[dict[str, Any]]:
+        """Refresh tab liveness while retaining a valid task-scoped alias."""
+        state = self.state
+        assert state is not None
+        previous_alias = state.bound_tab
+        previous = self.browser.tabs.get(previous_alias) if previous_alias else None
+        previous_identity = (
+            self.browser.safe_url(previous.url), previous.title
+        ) if previous is not None else (None, None)
+        ctx = browser_context(self.browser)
+        listed = bt.browser_tabs(ctx, bt.ListTabs(operation="list"))
+        self._emit(
+            "status", phase="tab_list", success=listed["ok"],
+            tabs=len(listed["data"]["tabs"]) if listed["ok"] else None,
+            error=self._envelope_error(listed),
+        )
+        if not listed["ok"]:
+            raise _Stop(self._result(
+                "failed", reason=self._envelope_error(listed) or "The browser bridge failed to list tabs.",
+            ))
+        tabs = listed["data"]["tabs"]
+        live = {item["tab"] for item in tabs}
+        if state.bound_tab not in live:
+            state.bound_tab = None
+            previous_url, previous_title = previous_identity
+            matches = [
+                item for item in tabs
+                if previous_url and item.get("url") == previous_url
+                and (not previous_title or item.get("title") == previous_title)
+            ]
+            if len(matches) == 1:
+                # Chrome may replace a tab underneath us while retaining its
+                # public identity. Rebind to the unique alias; raw ids never
+                # leave BrowserRuntime.
+                self.tab = matches[0]["tab"]
+        return tabs
 
     def _ensure_tab(self) -> str:
         """Bind (once) to a live, observable tab. Never restarts a browser
@@ -512,21 +760,14 @@ class AxisOrchestrator:
         so any unobservable candidate is skipped in favor of an ordinary tab,
         falling back to a freshly created one already pointed at a real page.
         """
-        if self.tab is not None and not self.browser.tabs[self.tab].closed:
-            return self.tab
+        state = self.state
+        assert state is not None
         ctx = browser_context(self.browser)
-
-        listed = bt.browser_tabs(ctx, bt.ListTabs(operation="list"))
-        self._emit(
-            "status", phase="tab_list", success=listed["ok"],
-            tabs=len(listed["data"]["tabs"]) if listed["ok"] else None,
-            error=self._envelope_error(listed),
-        )
-        if not listed["ok"]:
-            raise _Stop(self._result(
-                "failed", reason=self._envelope_error(listed) or "The browser bridge failed to list tabs.",
-            ))
-        tabs = listed["data"]["tabs"]
+        tabs = self._reconcile_bound_tab()
+        if self.tab is not None:
+            cached = self.browser.tabs.get(self.tab)
+            if cached is not None and not cached.closed and not _unobservable(cached.url):
+                return self.tab
 
         def observable(candidates: list[dict[str, Any]]) -> str | None:
             return next((t["tab"] for t in candidates if not _unobservable(t.get("url"))), None)
@@ -568,11 +809,91 @@ class AxisOrchestrator:
         return clip(f"{error.get('code')}: {error.get('message')}")
 
     def _tab_summaries(self) -> list[TabSummary]:
+        state = self.state
+        assert state is not None
+        candidates = list(dict.fromkeys(([self.tab] if self.tab else []) + state.task_tabs[-7:]))
         return [
             TabSummary(**self.browser.public_tab(alias))
-            for alias, state in self.browser.tabs.items()
-            if not state.closed
+            for alias in candidates
+            if alias in self.browser.tabs and not self.browser.tabs[alias].closed
         ]
+
+    def _current_request(self) -> str:
+        state = self.state
+        assert state is not None
+        return state.follow_ups[-1] if state.follow_ups else state.original_request
+
+    def _preserve_literal_urls(self, goal: str | None) -> str | None:
+        state = self.state
+        assert state is not None
+        if not goal or not state.requirements.literal_urls:
+            return goal
+        missing = [url for url in state.requirements.literal_urls if url not in goal]
+        if len(state.requirements.literal_urls) == 1 and missing:
+            return clip(f"{goal} Target URL: {missing[0]}")
+        return goal
+
+    def _direct_url(self) -> str | None:
+        state = self.state
+        assert state is not None
+        current_urls = extract_requirements(self._current_request()).literal_urls
+        urls = current_urls or state.requirements.literal_urls
+        if state.direct_navigation_done or len(urls) != 1:
+            return None
+        if _CURRENT_PAGE_DEPENDENCY.search(self._current_request()):
+            return None
+        return urls[0]
+
+    def _maybe_direct_navigate(self, tab: str) -> None:
+        state = self.state
+        assert state is not None
+        url = self._direct_url()
+        if not url:
+            return
+        current = self.browser.tabs.get(tab)
+        if current and current.url and current.url.rstrip("/") == url.rstrip("/"):
+            state.direct_navigation_done = True
+            return
+        result = bt.browser_navigate(
+            browser_context(self.browser), tab, bt.Open(operation="open", url=url),
+        )
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        record = ActionRecord(
+            tool="browser_navigate", tab=tab, operation="open", args=f"tab={tab!r}, url={url!r}",
+            executed=True, execution_success=bool(result.get("ok")), semantic_success=None,
+            code=error.get("code"), message=error.get("message"), refs_invalidated=bool(result.get("ok")),
+            meaningful_change=bool(result.get("ok")), retain_in_memory=True,
+            extracted_data=f"navigated to {url!r}" if result.get("ok") else None,
+        )
+        state.record_actions([record])
+        state.counters.browser_actions += 1
+        if not record.success:
+            state.last_error = record.error
+            return
+        state.counters.mutation_count += 1
+        state.direct_navigation_done = True
+
+    def _arm_diagnostics(self, tab: str) -> None:
+        state = self.state
+        assert state is not None
+        if not diagnostics_requested(state.requirements) or tab in state.diagnostics_armed_tabs:
+            return
+        raw = self.browser.tabs.get(tab)
+        if raw is None:
+            return
+        armed = True
+        for required, method in (
+            (state.requirements.require_console_check, "console.read"),
+            (state.requirements.require_network_check, "network.read"),
+        ):
+            if required:
+                try:
+                    self.browser._rpc(method, {"tabId": raw.raw_id, "limit": 1}, tab=tab)
+                except ToolFault as fault:
+                    state.last_error = f"Could not arm {method}: {fault.code}."
+                    armed = False
+        if armed:
+            state.diagnostics_armed_tabs.add(tab)
 
     async def _browser_state(self) -> BrowserState:
         """A fresh, bounded observation before every navigator step.
@@ -580,27 +901,34 @@ class AxisOrchestrator:
         Calls ``BrowserRuntime.observe`` directly — the same method the
         ``browser_observe`` tool calls — so observation logic exists once.
         """
-        memory = self.memory
-        assert memory is not None
+        state = self.state
+        assert state is not None
         run = self.config.run
         tab = self._ensure_tab()
-        if self.config.tools.debug_recording and not self._debug_telemetry_started:
+        self._arm_diagnostics(tab)
+        self._maybe_direct_navigate(tab)
+        if self.config.tools.debug_recording and not state.debug_telemetry_started:
             self.browser.start_debug_telemetry(tab)
-            self._debug_telemetry_started = bool(self.browser.debug_recording or self.browser.debug_trace)
+            state.debug_telemetry_started = bool(self.browser.debug_recording or self.browser.debug_trace)
 
         observation: dict[str, Any] | None = None
         last: ToolFault | None = None
         observe_started = time.monotonic()
-        for attempt in range(2):  # one repair attempt, then stop
+        for attempt in range(2):  # one tab reconciliation/observation repair, then stop
             try:
                 observation = self.browser.observe(tab, run.observation_mode, run.observation_max_nodes)
                 break
             except ToolFault as fault:
                 last = fault
+                if RECOVERY_POLICY.get(fault.code) == "reconcile_tab" and attempt == 0:
+                    self.tab = None
+                    tab = self._ensure_tab()
+                    self._arm_diagnostics(tab)
+                    continue
                 if fault.code in FATAL_BRIDGE_CODES or not fault.retryable or attempt == 1:
                     break
         observe_ms = int((time.monotonic() - observe_started) * 1000)
-        self._browser_ms += observe_ms
+        state.browser_ms += observe_ms
         self._emit(
             "status", phase="observed", tab=tab, success=observation is not None,
             duration_ms=observe_ms,
@@ -609,7 +937,7 @@ class AxisOrchestrator:
             reason = clip(str(last)) if last else "The browser could not be observed."
             raise _Stop(self._result("failed", reason=reason or "The browser could not be observed."))
         screenshot = self._screenshot(tab) if run.include_screenshot else None
-        state = BrowserState(
+        browser_state = BrowserState(
             tab=tab,
             url=observation.get("url"),
             title=observation.get("title"),
@@ -619,19 +947,123 @@ class AxisOrchestrator:
             truncated=bool(observation.get("truncated")),
             screenshot=screenshot,
             refs_fresh=tab in self.browser.observations,
-            unverified_page_changes=memory.unverified_mutations,
+            unverified_page_changes=state.unverified_mutations,
             site_pattern=observation.get("sitePattern"),
             runtime_warning=observation.get("runtimeWarning"),
-            recent_actions=memory.recent_action_results[-4:],
-            goal=memory.current_goal,
-            success_condition=memory.current_success_condition,
-            remaining_steps=max(0, run.max_total_steps - memory.total_steps),
+            recent_actions=state.actions[-4:],
+            goal=state.current_goal,
+            success_condition=state.current_success_condition,
+            remaining_steps=max(0, run.max_total_steps - state.counters.total_steps),
             remaining_actions=min(
-                run.max_actions_per_step, max(0, run.max_browser_actions - self.browser_actions)
+                run.max_actions_per_step, max(0, run.max_browser_actions - state.counters.browser_actions)
             ),
-            note=memory.last_error,
+            note=state.last_error,
+            requirements=state.requirements,
         )
-        return state
+        state.last_browser_state = browser_state
+        state.evidence.append(Evidence(
+            kind="observation", tab=tab,
+            detail=f"Observed {browser_state.url or 'unknown URL'} titled {browser_state.title or 'untitled'}.",
+        ))
+        # The automatic post-action observation is deterministic verification
+        # that the resulting page state was actually read.
+        if state.unverified_mutations:
+            state.counters.verified_mutation_count = state.counters.mutation_count
+        return browser_state
+
+    def _collect_record_evidence(self, record: ActionRecord) -> None:
+        state = self.state
+        assert state is not None
+        data = record.result_data
+        if record.tool == "browser_assert":
+            assertion = AssertionRecord(
+                assertion=record.operation or "unknown",
+                passed=record.semantic_success is True,
+                expected=data.get("expected"),
+                tab=record.tab,
+                message=record.message,
+            )
+            state.assertions.append(assertion)
+            state.evidence.append(Evidence(
+                kind="assertion", tab=record.tab, verified=assertion.passed,
+                detail=f"{assertion.assertion} passed={assertion.passed} expected={assertion.expected!r}",
+            ))
+        elif record.tool == "browser_capture_evidence" and record.success:
+            capture = data.get("capture")
+            if capture in {"page_screenshot", "element_screenshot"}:
+                state.evidence.append(Evidence(
+                    kind="screenshot", tab=record.tab,
+                    detail=f"Screenshot {data.get('evidence')} saved={data.get('saved')}: {data.get('path') or ''}",
+                ))
+        elif record.tool == "browser_downloads" and record.success:
+            item = Evidence(kind="download", tab=record.tab, detail=record.extracted_data or "Download verified.")
+            state.downloads.append(item)
+            state.evidence.append(item)
+        elif record.tool == "browser_diagnose" and record.success and record.operation in {"console", "network"}:
+            detail = str(data.get("events", []))[:4_000]
+            item = Evidence(kind=record.operation, tab=record.tab, detail=detail or "No events were returned.")
+            state.diagnostic_evidence.append(item)
+            state.evidence.append(item)
+
+    @staticmethod
+    def _normalized_url(url: str | None) -> str:
+        if not url:
+            return ""
+        parts = urlsplit(url)
+        query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", query, ""))
+
+    @classmethod
+    def _page_fingerprint(cls, browser_state: BrowserState, records: list[ActionRecord]) -> str:
+        extracted = [record.extracted_data for record in records if record.extracted_data]
+        changes: list[dict[str, Any]] = []
+        for record in records:
+            changed = record.result_data.get("whatChanged")
+            if isinstance(changed, dict):
+                changes.append({
+                    key: changed.get(key)
+                    for key in ("urlChanged", "toUrl", "focusChanged", "newPopups", "a11yDiff")
+                    if key in changed
+                })
+        payload = {
+            "url": cls._normalized_url(browser_state.url),
+            "snapshot": hashlib.sha256(browser_state.snapshot.encode("utf-8", errors="replace")).hexdigest(),
+            "extracted": hashlib.sha256(
+                "\n".join(extracted).encode("utf-8", errors="replace")
+            ).hexdigest(),
+            "changes": changes,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8", errors="replace")
+        ).hexdigest()
+
+    def _update_progress(self, browser_state: BrowserState, records: list[ActionRecord]) -> None:
+        state = self.state
+        assert state is not None
+        page_fingerprint = self._page_fingerprint(browser_state, records)
+        if page_fingerprint == state.last_page_fingerprint:
+            state.counters.repeated_observations += 1
+        else:
+            state.counters.repeated_observations = 0
+        state.last_page_fingerprint = page_fingerprint
+
+        mutating = [record for record in records if record.executed and record.tool in {"browser_act", "browser_navigate"}]
+        if not mutating:
+            return
+        record = mutating[-1]
+        normalized_args = re.sub(r"ref_\d+", "ref", record.args or "")
+        fingerprint = hashlib.sha256(
+            f"{record.tool}|{record.operation}|{normalized_args}".encode("utf-8", errors="replace")
+        ).hexdigest()
+        repeated = fingerprint == state.last_action_fingerprint
+        no_change = record.success and record.meaningful_change is False
+        if no_change:
+            state.counters.no_progress_steps += 1
+            state.counters.repeated_actions = state.counters.repeated_actions + 1 if repeated else 1
+        elif record.success:
+            state.counters.no_progress_steps = 0
+            state.counters.repeated_actions = 0
+        state.last_action_fingerprint = fingerprint
 
     def _screenshot(self, tab: str) -> str | None:
         """Capture a screenshot and hand the model only its safe alias — image

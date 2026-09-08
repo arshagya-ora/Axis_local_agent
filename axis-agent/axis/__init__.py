@@ -25,19 +25,25 @@ from .agents import (  # noqa: E402
 )
 from .models import (  # noqa: E402
     ActionRecord,
+    AssertionRecord,
     AxisConfig,
     AxisEvent,
     AxisResult,
     BrowserState,
+    CompletionVerdict,
+    Evidence,
     NavigatorOutcome,
     PlanDecision,
     TabSummary,
     TaskMemory,
+    TaskRequirements,
+    TaskRunState,
 )
-from .orchestrator import AxisOrchestrator  # noqa: E402
+from .orchestrator import AxisOrchestrator, diagnostics_requested, verify_completion  # noqa: E402
 
 __all__ = [
-    "ActionRecord", "AxisConfig", "AxisDeps", "AxisEvent", "AxisOrchestrator", "AxisResult",
-    "BrowserState", "NavigatorOutcome", "PlanDecision", "StepGate", "TabSummary", "TaskMemory",
-    "build_model", "build_navigator", "build_planner", "navigator_tools",
+    "ActionRecord", "AssertionRecord", "AxisConfig", "AxisDeps", "AxisEvent", "AxisOrchestrator",
+    "AxisResult", "BrowserState", "CompletionVerdict", "Evidence", "NavigatorOutcome", "PlanDecision",
+    "StepGate", "TabSummary", "TaskMemory", "TaskRequirements", "TaskRunState", "build_model",
+    "build_navigator", "build_planner", "diagnostics_requested", "navigator_tools", "verify_completion",
 ]
