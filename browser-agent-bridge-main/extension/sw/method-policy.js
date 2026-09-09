@@ -102,7 +102,9 @@ export function getMethodCategory(method, params = {}) {
     method === 'page.acceptDialog' ||
     method === 'page.dismissDialog' ||
     method === 'computer.click' ||
-    method === 'computer.drag'
+    method === 'computer.drag' ||
+    method === 'computer.hover' ||
+    method === 'computer.scroll'
   ) {
     return 'page_action';
   }

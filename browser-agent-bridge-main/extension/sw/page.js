@@ -11,6 +11,8 @@ export function createPageHandlers({
   sleep,
   ensureContentScripts,
   captureTabScreenshot,
+  captureVisualScreenshot,
+  readVisualState,
   attachDebugger,
   cdp,
   resolveFrameTarget,
@@ -937,11 +939,18 @@ export function createPageHandlers({
           function visit(node) {
             if (!node) return;
             if (node.nodeType === Node.TEXT_NODE) {
+              const visibility = node.parentElement && getComputedStyle(node.parentElement).visibility;
+              if (visibility === 'hidden' || visibility === 'collapse') return;
               const value = node.textContent.trim();
               if (value) parts.push(value);
               return;
             }
             if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return;
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              if (['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT'].includes(node.tagName)) return;
+              const style = getComputedStyle(node);
+              if (style.display === 'none' || style.contentVisibility === 'hidden') return;
+            }
             if (node.nodeType === Node.ELEMENT_NODE && node.shadowRoot) visit(node.shadowRoot);
             for (const child of node.childNodes || []) visit(child);
           }
@@ -1077,8 +1086,15 @@ export function createPageHandlers({
     const tabId = assertTabId(params.tabId);
     const tab = await chromeApi.tabs.get(tabId);
     await assertUrlAllowed(tab.url || '', 'page.screenshot');
+    if (params.modelFacing === true) return captureVisualScreenshot(tabId, params);
     const dataUrl = await captureTabScreenshot(tabId, params);
     return { dataUrl };
+  }
+
+  async function pageVisualState(params) {
+    const tabId = assertTabId(params.tabId);
+    await assertTabAllowed(tabId, 'page.visualState');
+    return readVisualState(tabId);
   }
 
   async function pagePdf(params) {
@@ -1463,6 +1479,7 @@ export function createPageHandlers({
     pageAriaSnapshot,
     pageExpectAriaSnapshot,
     pageScreenshot,
+    pageVisualState,
     pagePdf,
     pageExecuteJavaScript,
     pageDomSnapshot,

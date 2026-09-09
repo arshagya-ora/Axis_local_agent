@@ -1,6 +1,7 @@
 import { createLocatorHandlers } from './sw/locator.js';
 import { createDomHandlers } from './sw/dom.js';
 import { createComputerHandlers } from './sw/computer.js';
+import { createVisualHandlers } from './sw/visual.js';
 import { createPageHandlers } from './sw/page.js';
 import { createDevtoolsHandlers } from './sw/devtools.js';
 import { createDownloadsHandlers } from './sw/downloads.js';
@@ -186,6 +187,8 @@ const domHandlers = createDomHandlers({
   defaultTimeoutMs: DEFAULT_TIMEOUT_MS
 });
 
+const visualHandlers = createVisualHandlers({ assertTabAllowed, attachDebugger, cdp });
+
 const computerHandlers = createComputerHandlers({
   assertTabId,
   assertTabAllowed,
@@ -195,7 +198,8 @@ const computerHandlers = createComputerHandlers({
   cdp,
   indicatorSet,
   recordAction: recordingHandlers.recordAction,
-  keyboardDispatcher
+  keyboardDispatcher,
+  validateVisualAction: visualHandlers.validateVisualAction
 });
 
 const keyboardHandlers = createKeyboardHandlers({
@@ -220,6 +224,8 @@ const pageHandlers = createPageHandlers({
   sleep,
   ensureContentScripts,
   captureTabScreenshot,
+  captureVisualScreenshot: visualHandlers.captureVisualScreenshot,
+  readVisualState: visualHandlers.readVisualState,
   attachDebugger,
   cdp,
   resolveFrameTarget: frameTargetResolver.resolveFrameTarget,
@@ -303,6 +309,7 @@ const rpcRouter = {
   'page.ariaSnapshot': (params) => pageHandlers.pageAriaSnapshot(params),
   'expect.page.toMatchAriaSnapshot': (params) => pageHandlers.pageExpectAriaSnapshot(params),
   'page.screenshot': (params) => pageHandlers.pageScreenshot(params),
+  'page.visualState': (params) => pageHandlers.pageVisualState(params),
   'page.pdf': (params) => pageHandlers.pagePdf(params),
   'page.executeJavaScript': (params) => pageHandlers.pageExecuteJavaScript(params),
   'page.domSnapshot': (params) => pageHandlers.pageDomSnapshot(params),
@@ -585,8 +592,10 @@ async function connectNative() {
     return;
   }
 
-  setNativeStatus('connected');
+  setNativeStatus('connecting');
+  const connectedPort = nativePort;
   nativePort.onMessage.addListener(message => {
+    if (nativePort !== connectedPort) return;
     if (message && message.type === 'pong') {
       markNativePong();
       return;
@@ -612,6 +621,7 @@ async function connectNative() {
   });
 
   nativePort.onDisconnect.addListener(() => {
+    if (nativePort !== connectedPort) return;
     const error = chrome.runtime.lastError?.message;
     nativePort = null;
     rejectPendingNativeRequests(error || 'Native host disconnected');
@@ -628,19 +638,27 @@ async function connectNative() {
     });
   });
 
-  const portResult = await chrome.storage.local.get('bridgePort');
-  const port = Number.isInteger(portResult.bridgePort) ? portResult.bridgePort : 8765;
-  lastNativePongAt = Date.now();
-  await ensureNativeHeartbeatAlarm();
-
-  sendNativeNotification('extension.ready', {
-    version: chrome.runtime.getManifest().version,
-    extensionId: chrome.runtime.id,
-    port: port
-  });
-
-  await pushSettingsToNative();
-  sendNativePing();
+  try {
+    const portResult = await chrome.storage.local.get('bridgePort');
+    if (nativePort !== connectedPort) return;
+    const port = Number.isInteger(portResult.bridgePort) ? portResult.bridgePort : 8765;
+    lastNativePongAt = Date.now();
+    sendNativeNotification('extension.ready', {
+      version: chrome.runtime.getManifest().version,
+      extensionId: chrome.runtime.id,
+      port: port
+    });
+    await pushSettingsToNative();
+    await ensureNativeHeartbeatAlarm();
+    sendNativePing();
+  } catch (error) {
+    if (nativePort !== connectedPort) return;
+    const failedPort = nativePort;
+    nativePort = null;
+    try { failedPort?.disconnect(); } catch {}
+    setNativeStatus('disconnected', errorMessage(error));
+    scheduleReconnect();
+  }
 }
 
 async function pushSettingsToNative() {
@@ -663,7 +681,7 @@ function scheduleReconnect() {
 }
 
 async function ensureNativeHeartbeatAlarm() {
-  await chrome.alarms.create(NATIVE_HEARTBEAT_ALARM, { periodInMinutes: NATIVE_HEARTBEAT_PERIOD_MINUTES }).catch(() => {});
+  await Promise.resolve(chrome.alarms.create(NATIVE_HEARTBEAT_ALARM, { periodInMinutes: NATIVE_HEARTBEAT_PERIOD_MINUTES })).catch(() => {});
 }
 
 async function clearNativeHeartbeatAlarm() {

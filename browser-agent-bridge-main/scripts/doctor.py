@@ -388,7 +388,8 @@ def check_save_data_url(checks, client):
 
 def check_websocket(checks, args):
     script = ROOT / "scripts" / "ws-rpc.js"
-    if not shutil.which("node"):
+    node = shutil.which("node")
+    if not node:
         add(checks, "live.websocket", "warn", "node is not available")
         return
     env = os.environ.copy()
@@ -401,7 +402,7 @@ def check_websocket(checks, args):
     request = '{"jsonrpc":"2.0","id":"doctor-ws","method":"native.status","params":{}}'
     try:
         result = subprocess.run(
-            [str(script), request],
+            [node, str(script), request],
             cwd=ROOT,
             env=env,
             text=True,

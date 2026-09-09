@@ -13,7 +13,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 from pydantic_ai import CancellationToken, RunUsage
 
 # Bounds. Model output is never rejected for exceeding these — validators clip
@@ -43,6 +43,35 @@ def clip_all(items: list[str] | None, count: int = MAX_EVIDENCE, limit: int = MA
 # Agent output types
 # ---------------------------------------------------------------------------
 
+class GoalCheck(BaseModel):
+    """The expected business result, declared before it is used as proof."""
+
+    model_config = ConfigDict(extra="forbid")
+    assertion: Literal["text", "value", "checked", "title", "url", "visible", "hidden", "enabled", "disabled", "count", "download"]
+    expected: str | bool | int | None = None
+    target: str | None = None
+
+    @model_validator(mode="after")
+    def _concrete_check(self) -> GoalCheck:
+        if self.assertion in {"text", "value", "title", "url", "download"}:
+            if not isinstance(self.expected, str):
+                raise ValueError(f"{self.assertion} verification requires an expected string.")
+            if self.assertion in {"title", "url", "download"} and not self.expected:
+                raise ValueError(f"{self.assertion} verification requires a nonempty expectation.")
+        elif self.assertion == "count":
+            if type(self.expected) is not int or self.expected < 0:
+                raise ValueError("Count verification requires a non-negative integer.")
+        elif self.expected is None:
+            self.expected = True
+        elif type(self.expected) is not bool:
+            raise ValueError("State verification requires a boolean expectation.")
+        elif self.assertion != "checked" and self.expected is False:
+            raise ValueError("Use the opposite state (hidden/visible or disabled/enabled) for a negative check.")
+        if self.assertion in {"value", "count", "checked", "visible", "hidden", "enabled", "disabled"} and not self.target:
+            raise ValueError("Element verification requires the target's label or name.")
+        return self
+
+
 class PlanDecision(BaseModel):
     """The planner's typed decision. The planner has no tools; this is its
     only channel, and it is the only place overall completion is decided."""
@@ -53,6 +82,7 @@ class PlanDecision(BaseModel):
     plan_summary: str | None = None
     next_goal: str | None = None
     success_condition: str | None = None
+    verification: GoalCheck | None = None
     final_answer: str | None = None
     evidence: list[str] = Field(default_factory=list)
     reason: str = ""
@@ -83,6 +113,8 @@ class NavigatorOutcome(BaseModel):
     summary: str = ""
     evidence: list[str] = Field(default_factory=list)
     reason: str = ""
+    needs_visual: bool = False
+    evidence_ids: list[str] = Field(default_factory=list, max_length=16)
 
     @field_validator("summary", "reason")
     @classmethod
@@ -119,6 +151,12 @@ class ActionRecord(BaseModel):
     retain_in_memory: bool = False
     meaningful_change: bool | None = None
     result_data: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    sequence: int = 0
+    goal_id: str | None = None
+    source_url: str | None = None
+    target: str | None = None
+    evidence_id: str | None = None
+    expected_value: Any = None
 
     @computed_field
     @property
@@ -162,20 +200,52 @@ class AssertionRecord(BaseModel):
     expected: Any = None
     tab: str | None = None
     message: str | None = None
+    target: str | None = None
+    goal_id: str | None = None
+    sequence: int = 0
+    evidence_id: str | None = None
+    match: str | None = None
+    superseded_by: str | None = None
 
 
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["observation", "navigator", "assertion", "screenshot", "download", "console", "network"]
+    kind: Literal["observation", "extraction", "navigation", "navigator", "assertion", "screenshot", "download", "console", "network"]
     detail: str
     tab: str | None = None
     verified: bool = True
+    id: str | None = None
+    goal_id: str | None = None
+    source_url: str | None = None
+    sequence: int = 0
 
     @field_validator("detail")
     @classmethod
     def _detail(cls, value: str) -> str:
         return clip(value, MAX_EXTRACT) or ""
+
+
+class TaskFact(BaseModel):
+    """A bounded browser result with provenance, never a model-authored claim."""
+
+    source_url: str | None = None
+    tab: str | None = None
+    goal_id: str | None = None
+    target: str = ""
+    evidence_id: str | None = None
+    value: str
+    tool: str = ""
+    priority: int = 1
+
+
+class PendingChange(BaseModel):
+    goal_id: str | None = None
+    tab: str
+    sequence: int
+    count: int = 1
+    expected_url: str | None = None
+    verification: GoalCheck | None = None
 
 
 class TaskRequirements(BaseModel):
@@ -242,6 +312,7 @@ class BrowserState(BaseModel):
     snapshot: str = ""
     truncated: bool = False
     screenshot: str | None = None
+    visual: dict[str, Any] | None = None
     refs_fresh: bool = False
     unverified_page_changes: int = 0
     site_pattern: dict[str, Any] | None = None
@@ -249,10 +320,16 @@ class BrowserState(BaseModel):
     recent_actions: list[ActionRecord] = Field(default_factory=list)
     goal: str | None = None
     success_condition: str | None = None
+    verification: GoalCheck | None = None
     remaining_steps: int = 0
     remaining_actions: int = 0
     note: str | None = None
     requirements: TaskRequirements | None = None
+    goal_id: str | None = None
+    evidence_id: str | None = None
+    facts: list[TaskFact] = Field(default_factory=list)
+    memory_truncated: bool = False
+    pending_changes: list[PendingChange] = Field(default_factory=list)
 
     @field_validator("snapshot")
     @classmethod
@@ -293,10 +370,19 @@ class TaskRunState(BaseModel):
     # memory subsystem.
     current_plan_summary: str | None = None
     current_goal: str | None = None
+    current_goal_id: str | None = None
+    goal_number: int = 0
+    sequence: int = 0
+    evidence_number: int = 0
+    pending_changes: dict[str, PendingChange] = Field(default_factory=dict)
+    visited_urls: list[str] = Field(default_factory=list)
     current_success_condition: str | None = None
+    current_verification: GoalCheck | None = None
     completed_goal_summaries: list[str] = Field(default_factory=list)
     latest_navigator_outcome: NavigatorOutcome | None = None
     relevant_extracted_data: list[str] = Field(default_factory=list)
+    facts: list[TaskFact] = Field(default_factory=list)
+    memory_truncated: bool = False
     last_error: str | None = None
     last_page_fingerprint: str | None = None
     last_action_fingerprint: str | None = None
@@ -305,6 +391,13 @@ class TaskRunState(BaseModel):
     repair_attempted: bool = False
     debug_telemetry_started: bool = False
     started_monotonic: float = Field(default_factory=time.monotonic, exclude=True)
+    started_wallclock: float = Field(default_factory=time.time)
+    tool_model_ms: int = 0
+    visual_tabs: set[str] = Field(default_factory=set)
+    vision_disabled: bool = False
+    visual_failures: dict[str, int] = Field(default_factory=dict)
+    progress_by_tab: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    made_progress: bool = False
     model_ms: int = 0
     browser_ms: int = 0
     plan_ms: int = 0
@@ -314,7 +407,7 @@ class TaskRunState(BaseModel):
     max_recent_actions: int = 8
     max_completed_goals: int = 8
     max_followups: int = 5
-    max_extracted_data: int = 8
+    max_extracted_data: int = 16
 
     def add_followup(self, follow_up: str) -> None:
         self.follow_ups = (self.follow_ups + [clip(follow_up, MAX_ANSWER) or ""])[-self.max_followups:]
@@ -323,6 +416,9 @@ class TaskRunState(BaseModel):
         self.completed_goal_summaries = (
             self.completed_goal_summaries + [clip(summary) or ""]
         )[-self.max_completed_goals:]
+        for fact in self.facts:
+            if fact.goal_id == self.current_goal_id:
+                fact.priority = max(2, fact.priority)
 
     def record_actions(self, records: list[ActionRecord]) -> None:
         self.actions = (self.actions + records)[-self.max_recent_actions:]
@@ -331,13 +427,45 @@ class TaskRunState(BaseModel):
             for record in records
             if record.retain_in_memory and record.extracted_data
         ]
-        if extracted:
+        if extracted and not self.facts:
             self.relevant_extracted_data = (
                 self.relevant_extracted_data + extracted
             )[-self.max_extracted_data:]
 
+    def next_sequence(self) -> int:
+        self.sequence += 1
+        return self.sequence
+
+    def add_evidence(self, kind: str, detail: str, *, tab: str | None = None,
+                     source_url: str | None = None, verified: bool = True,
+                     sequence: int | None = None) -> Evidence:
+        number = self.next_sequence() if sequence is None else sequence
+        self.evidence_number += 1
+        item = Evidence(kind=kind, detail=detail, tab=tab, source_url=source_url,
+                        verified=verified, id=f"evidence_{self.evidence_number}",
+                        goal_id=self.current_goal_id, sequence=number)
+        self.evidence = (self.evidence + [item])[-128:]
+        if verified and source_url and kind in {"observation", "navigation"}:
+            self.visited_urls = list(dict.fromkeys(self.visited_urls + [source_url]))[-128:]
+        return item
+
+    def retain_fact(self, fact: TaskFact) -> None:
+        key = (fact.source_url, fact.tab, fact.target)
+        self.facts = [old for old in self.facts if (old.source_url, old.tab, old.target) != key]
+        if len(fact.value) > MAX_EXTRACT or " chars]" in fact.value or "more items truncated]" in fact.value:
+            self.memory_truncated = True
+        fact.value = clip(fact.value, MAX_EXTRACT) or ""
+        self.facts.append(fact)
+        while len(self.facts) > min(self.max_extracted_data, 16) or sum(len(f.model_dump_json()) for f in self.facts) > 32_000:
+            index = min(range(len(self.facts)), key=lambda i: (self.facts[i].priority, i))
+            self.facts.pop(index)
+            self.memory_truncated = True
+        self.relevant_extracted_data = [
+            f"{f.tool} {f.evidence_id} {f.source_url or f.tab or ''}: {f.value}" for f in self.facts
+        ]
+
     def evidence_by_kind(self, kind: str) -> list[Evidence]:
-        return [item for item in self.evidence if item.kind == kind]
+        return [item for item in self.evidence if item.kind == kind and item.verified and item.id]
 
     @property
     def unverified_mutations(self) -> int:
@@ -391,10 +519,13 @@ class AxisResult(BaseModel):
     answer: str | None = None
     evidence: list[str] = Field(default_factory=list)
     reason: str = ""
+    limitations: list[str] = Field(default_factory=list)
     total_steps: int = 0
     planner_passes: int = 0
     browser_actions: int = 0
     model_requests: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     # Wall-clock breakdown, so a slow run can be attributed rather than guessed
     # at: model time is provider latency, browser time is bridge/page latency,
     # and whatever is left is orchestration.
@@ -437,7 +568,7 @@ class BrowserConfig(BaseModel):
     initial_tab: Literal["focused", "new"] = "focused"
     max_open_tabs: int = 30
     allow_response_body: bool = False
-    allow_coordinate_fallback: bool = False
+    allow_coordinate_fallback: bool = True
     artifact_directory: str | None = None
     upload_roots: list[str] = Field(default_factory=list)
     firewall: FirewallConfig = Field(default_factory=FirewallConfig)
@@ -459,6 +590,7 @@ class RunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     planner_interval_steps: int = Field(default=3, ge=1)
+    planner_max_interval_steps: int = Field(default=6, ge=1)
     max_actions_per_step: int = Field(default=3, ge=1)
     max_total_steps: int = Field(default=30, ge=1)
     max_model_requests: int = Field(default=60, ge=1)
@@ -467,6 +599,7 @@ class RunConfig(BaseModel):
     observation_mode: Literal["compact", "aria", "text"] = "compact"
     observation_max_nodes: int = Field(default=1_000, ge=1, le=2_000)
     include_screenshot: bool = False
+    visual_mode: Literal["auto", "off"] = "auto"
     tool_timeout_seconds: float | None = 120.0
 
 
@@ -476,6 +609,7 @@ class ToolsConfig(BaseModel):
     capture_evidence: bool = False
     diagnose: bool = False
     downloads: bool = False
+    visual: bool = False
     debug_recording: bool = False
     tool_search: bool = False
     approval_required_actions: list[str] = Field(default_factory=lambda: ["upload", "drag"])
@@ -487,7 +621,7 @@ class MemoryConfig(BaseModel):
     max_recent_actions: int = Field(default=8, ge=1)
     max_completed_goals: int = Field(default=8, ge=1)
     max_followups: int = Field(default=5, ge=1)
-    max_extracted_data: int = Field(default=8, ge=1)
+    max_extracted_data: int = Field(default=16, ge=1, le=16)
 
 
 class AxisConfig(BaseModel):

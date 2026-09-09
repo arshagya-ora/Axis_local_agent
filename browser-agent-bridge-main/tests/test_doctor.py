@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import sys
+import json
 import unittest
 import tempfile
+import shutil
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +13,19 @@ sys.path.append(str(Path(__file__).resolve().parent.parent / "scripts"))
 import doctor
 
 class TestDoctor(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node is required for the WebSocket diagnostic")
+    def test_websocket_probe_runs_javascript_through_node(self):
+        checks = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = root / "scripts" / "ws-rpc.js"
+            script.parent.mkdir()
+            script.write_text("console.log(process.argv[2]);\n", encoding="utf-8")
+            with patch("doctor.ROOT", root):
+                doctor.check_websocket(checks, SimpleNamespace(host=None, port=None, token=None))
+        self.assertEqual(checks, [{"name": "live.websocket", "status": "pass",
+                                  "message": "received doctor-ws response"}])
+
     def test_overall_status(self):
         self.assertEqual(doctor.overall_status([{"status": "pass"}]), "pass")
         self.assertEqual(doctor.overall_status([{"status": "pass"}, {"status": "warn"}]), "warn")
@@ -79,14 +95,13 @@ class TestDoctor(unittest.TestCase):
             host_wrapper.chmod(0o755)
             manifest = tmp_root / "manifest.json"
             manifest.write_text(
-                """{
-  "name": "com.local.browser_agent_bridge",
-  "description": "Browser Agent Bridge native messaging host",
-  "path": "%s",
-  "type": "stdio",
-  "allowed_origins": ["chrome-extension://abc/"]
-}
-""" % str(host_wrapper),
+                json.dumps({
+                    "name": "com.local.browser_agent_bridge",
+                    "description": "Browser Agent Bridge native messaging host",
+                    "path": str(host_wrapper),
+                    "type": "stdio",
+                    "allowed_origins": ["chrome-extension://abc/"],
+                }),
                 encoding="utf-8",
             )
 

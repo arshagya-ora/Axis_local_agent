@@ -13,16 +13,18 @@ export function createDownloadsHandlers({ chromeApi = chrome }) {
   }
 
   async function downloadsList(params) {
+    const startedAfter = parseStartedAfter(params.startedAfter);
     const query = {
       limit: Number.isInteger(params.limit) && params.limit > 0 ? params.limit : 50,
       orderBy: ['-startTime'],
+      ...(startedAfter !== null ? { startedAfter: new Date(startedAfter).toISOString() } : {}),
       ...(typeof params.query === 'string' && params.query ? { query: [params.query] } : {}),
       ...(typeof params.filenameRegex === 'string' ? { filenameRegex: params.filenameRegex } : {}),
       ...(typeof params.urlRegex === 'string' ? { urlRegex: params.urlRegex } : {})
     };
     const items = await chromeApi.downloads.search(query);
     return {
-      items: items.map(item => ({
+      items: items.filter(item => startedAfter === null || startedInWindow(item, startedAfter)).map(item => ({
         id: item.id,
         url: item.url,
         finalUrl: item.finalUrl,
@@ -45,19 +47,21 @@ export function createDownloadsHandlers({ chromeApi = chrome }) {
     const intervalMs = Number.isInteger(params.intervalMs) && params.intervalMs > 0 ? params.intervalMs : 250;
     const state = typeof params.state === 'string' && params.state ? params.state : 'complete';
     const started = Date.now();
+    const startedAfter = parseStartedAfter(params.startedAfter) ?? (params.includeExisting === true ? null : started);
 
     while (Date.now() - started <= timeoutMs) {
-      const item = await findMatchingDownload(params, state, started);
+      const item = await findMatchingDownload(params, state, startedAfter);
       if (item) return { ok: true, item: normalizeDownloadItem(item), elapsedMs: Date.now() - started };
       await sleep(intervalMs);
     }
     throw new Error(`Timed out waiting for download${describeDownloadPattern(params)} to be ${state}`);
   }
 
-  async function findMatchingDownload(params, state, started) {
+  async function findMatchingDownload(params, state, startedAfter) {
     const query = {
       limit: 50,
       orderBy: ['-startTime'],
+      ...(startedAfter !== null ? { startedAfter: new Date(startedAfter).toISOString() } : {}),
       ...(typeof params.query === 'string' && params.query ? { query: [params.query] } : {}),
       ...(typeof params.filenameRegex === 'string' && params.filenameRegex ? { filenameRegex: params.filenameRegex } : {}),
       ...(typeof params.urlRegex === 'string' && params.urlRegex ? { urlRegex: params.urlRegex } : {})
@@ -65,9 +69,23 @@ export function createDownloadsHandlers({ chromeApi = chrome }) {
     const items = await chromeApi.downloads.search(query);
     return items.find(item => {
       if (!matchesDownloadItem(item, params)) return false;
-      if (params.includeExisting !== true && Date.parse(item.startTime || '') < started) return false;
+      if (startedAfter !== null && !startedInWindow(item, startedAfter)) return false;
       return state === 'any' || item.state === state;
     }) || null;
+  }
+
+  function parseStartedAfter(value) {
+    if (value === undefined || value === null) return null;
+    const timestamp = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
+    if (!Number.isFinite(timestamp) || timestamp < 0 || !Number.isFinite(new Date(timestamp).getTime())) {
+      throw new Error('startedAfter must be an epoch millisecond timestamp or ISO date');
+    }
+    return timestamp;
+  }
+
+  function startedInWindow(item, startedAfter) {
+    const timestamp = Date.parse(item.startTime || '');
+    return Number.isFinite(timestamp) && timestamp >= startedAfter;
   }
 
   function pushDownloadEvent(event) {

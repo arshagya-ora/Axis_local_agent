@@ -50,6 +50,7 @@ def build_runtime(config: AxisConfig, client: Any | None = None) -> BrowserRunti
         deny_schemes=tuple(firewall.deny_schemes),
         allow_methods=tuple(firewall.allow_methods),
         deny_methods=tuple(firewall.deny_methods),
+        allow_coordinate_fallback=browser.allow_coordinate_fallback,
     )
 
 
@@ -65,13 +66,14 @@ def build_orchestrator(
     """Wire config -> one shared model -> planner + navigator -> orchestrator."""
     model = build_model(config, client=openai_client, model_name=model_name)
 
-    def navigator_factory(*, capture: bool, diagnose: bool, downloads: bool):
+    def navigator_factory(*, capture: bool, diagnose: bool, downloads: bool, visual: bool = False):
         """Rebuild the navigator when an opt-in tool becomes necessary. Cheap:
         the model instance is shared, only the tool list changes."""
         variant = config.model_copy(deep=True)
         variant.tools.capture_evidence = capture
         variant.tools.diagnose = diagnose
         variant.tools.downloads = downloads
+        variant.tools.visual = visual
         return build_navigator(variant, model)
 
     return AxisOrchestrator(
@@ -134,6 +136,8 @@ def print_debug_event(event: AxisEvent) -> None:
             print(f"{at}   [TOOLS] capture={d.get('capture')} diagnose={d.get('diagnose')}")
         elif phase == "observed":
             print(f"{at}   [OBSV] tab={d.get('tab')}{_took(d)}")
+        elif phase == "vision_unavailable":
+            print(f"{at}   [VISION] {d.get('reason')}")
         elif phase in ("tab_list", "tab_create", "tab_selected"):
             icon = "OK  " if d.get("success", True) else "FAIL"
             print(f"{at}   [{icon}] {phase}  {_kv(d, 'tabs', 'tab', 'url')}")
@@ -188,11 +192,14 @@ def print_result(result: AxisResult) -> None:
         print(f"\n{result.answer}")
     for item in result.evidence:
         print(f"  - {item}")
+    for limitation in result.limitations:
+        print(f"Limitation: {limitation}")
     other_ms = max(0, result.duration_ms - result.model_ms - result.browser_ms)
     print(
         f"\nsteps={result.total_steps} planner_passes={result.planner_passes} "
         f"browser_actions={result.browser_actions} model_requests={result.model_requests}"
     )
+    print(f"tokens: input={result.input_tokens} output={result.output_tokens}")
     print(
         f"time: total={result.duration_ms / 1000:.1f}s "
         f"model={result.model_ms / 1000:.1f}s browser={result.browser_ms / 1000:.1f}s "
@@ -222,6 +229,8 @@ async def run(args: argparse.Namespace) -> int:
         config.tools.capture_evidence = True
     if args.diagnose:
         config.tools.diagnose = True
+    if getattr(args, "visual_mode", None) is not None:
+        config.run.visual_mode = args.visual_mode
 
     on_event = print_debug_event if args.debug else (print_event if args.verbose else None)
     orchestrator = build_orchestrator(config, on_event=on_event, approval=confirm if args.approve else None)
@@ -273,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--approve", action="store_true", help="Ask before consequential actions.")
     parser.add_argument("--capture", action="store_true", help="Add browser_capture_evidence for this run.")
     parser.add_argument("--diagnose", action="store_true", help="Add browser_diagnose for this run.")
+    parser.add_argument("--visual-mode", choices=("auto", "off"), help="Automatic visual recovery, or text-only browsing.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override run.max_total_steps.")
     try:
         return asyncio.run(run(parser.parse_args(argv)))

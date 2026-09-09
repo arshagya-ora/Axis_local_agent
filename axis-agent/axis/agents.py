@@ -13,13 +13,14 @@ from __future__ import annotations
 import dataclasses
 import functools
 import inspect
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-from pydantic_ai import Agent, InstrumentationSettings, ModelRetry, Tool, ToolFailed
+from pydantic_ai import Agent, InstrumentationSettings, ModelRetry, Tool, ToolFailed, ToolReturn
 from pydantic_ai.capabilities import ToolSearch
 from pydantic_ai.capabilities.hooks import Hooks
 from pydantic_ai.models import Model
@@ -47,18 +48,19 @@ OPTIONAL_TOOL_FUNCTIONS = {
     "browser_capture_evidence": bt.browser_capture_evidence,
     "browser_diagnose": bt.browser_diagnose,
     "browser_downloads": bt.browser_downloads,
+    "browser_visual": bt.browser_visual,
 }
 
 # Actions that change page state and therefore need later verification.
 MUTATING_ACTIONS = frozenset({
     "click", "fill", "type_sequentially", "press", "select", "check", "uncheck",
-    "upload", "drag", "accept_dialog", "dismiss_dialog",
+    "upload", "drag", "type", "accept_dialog", "dismiss_dialog",
 })
-MUTATING_TOOLS = frozenset({"browser_act", "browser_navigate"})
+MUTATING_TOOLS = frozenset({"browser_act", "browser_navigate", "browser_visual"})
 # Failures whose real effect on the page is unknown: never repeat these.
 UNKNOWN_OUTCOME_CODES = frozenset({"TIMEOUT", "BRIDGE_UNAVAILABLE", "BRIDGE_ERROR"})
 NON_RETRYABLE_CODES = frozenset({
-    "FIREWALL_DENIED", "SENSITIVE_OPERATION_BLOCKED", "UPLOAD_DENIED",
+    "POLICY_DENIED", "FIREWALL_DENIED", "SENSITIVE_OPERATION_BLOCKED", "UPLOAD_DENIED",
     "APPROVAL_DENIED", "TAB_LIMIT",
 })
 STOP_CODES = frozenset({"RUN_PAUSED", "RUN_CANCELLED"})
@@ -67,6 +69,7 @@ STOP_CODES = frozenset({"RUN_PAUSED", "RUN_CANCELLED"})
 # codes; there is intentionally no workflow or exception framework here.
 RECOVERY_POLICY = {
     "STALE_REFERENCE": "observe_and_retry",
+    "STALE_SCREENSHOT": "observe_and_retry",
     "REF_NOT_FOUND": "observe_and_retry",
     "TAB_NOT_FOUND": "reconcile_tab",
     "TAB_CLOSED": "reconcile_tab",
@@ -112,7 +115,9 @@ def _command_operation(kwargs: dict[str, Any]) -> str | None:
 def _extracted(tool: str, data: dict[str, Any]) -> str | None:
     """The part of a tool result worth carrying in bounded task memory."""
     if tool == "browser_observe":
-        return data.get("snapshot") or None
+        if "result" in data:
+            return json.dumps(data["result"], ensure_ascii=False, sort_keys=True, default=str)
+        return data.get("snapshot")
     if tool == "browser_assert":
         return f"assert {data.get('assertion')} passed={data.get('passed')} expected={data.get('expected')!r}"
     if tool == "browser_tabs":
@@ -183,6 +188,7 @@ class StepGate:
     is_paused: Callable[[], bool] = lambda: False
     is_cancelled: Callable[[], bool] = lambda: False
     on_action: Callable[[ActionRecord, int], None] | None = None
+    on_record: Callable[[ActionRecord, bool], None] | None = None
     # Called for a call the gate refused before it ever reached the bridge
     # (budget, interruption, pause/cancel, denied approval) — never stored in
     # bounded TaskMemory, but essential for tracing a step's root cause.
@@ -297,14 +303,12 @@ class StepGate:
         refs_invalidated = bool(data.get("refsInvalidated")) or bool(changed.get("urlChanged"))
         rerendered = bool(changed.get("domChanged")) or bool(changed.get("navigated"))
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
-        meaningful_change = refs_invalidated or any(
+        meaningful_change = True if any(
             bool(changed.get(key))
             for key in ("urlChanged", "domChanged", "navigated", "focusChanged", "newPopups", "a11yDiff")
-        ) if mutating and isinstance(changed, dict) else None
-        mutated = success and mutating
-        verified = success and (
-            tool == "browser_observe" or (tool == "browser_assert" and bool(data.get("passed")))
-        )
+        ) else None
+        mutated = mutating and (success or code in UNKNOWN_OUTCOME_CODES)
+        verified = success and tool == "browser_assert" and bool(data.get("passed"))
 
         if not success:
             if code in STOP_CODES:
@@ -375,15 +379,34 @@ class StepGate:
                 # planner loses it by the next pass and can never accumulate
                 # enough to call the task complete.
                 or (tool == "browser_tabs" and operation == "list")
-                or tool == "browser_downloads"
+                or tool in {"browser_downloads", "browser_observe"}
             ),
         )
+        command = kwargs.get("command")
+        record.expected_value = getattr(command, "value", None)
+        locator = getattr(command, "locator", None) or kwargs.get("locator")
+        if locator is not None:
+            identity = {"locator": locator.model_dump(exclude_none=True),
+                        "index": getattr(command, "index", kwargs.get("index", 0)),
+                        "attribute": getattr(command, "attribute", kwargs.get("attribute"))}
+            if tool == "browser_observe":
+                identity["extract"] = kwargs.get("extract") or "all_inner_text"
+            record.target = json.dumps(identity, sort_keys=True, default=str)
+        else:
+            target = getattr(command, "target", None)
+            record.target = target.model_dump_json(exclude_none=True) if target is not None else operation
+        if self.on_record is not None:
+            self.on_record(record, mutated)
+            if record.evidence_id and isinstance(result.get("data"), dict):
+                result["data"]["evidence_id"] = record.evidence_id
         self.records.append(record)
         self.effects.append((mutated, verified))
         self.actions_used += 1
         self.browser_ms += duration_ms
         if self.on_action is not None:
             self.on_action(record, duration_ms)
+        if tool == "browser_visual" and operation != "capture" and success:
+            self._interrupt("the visual action consumed its screenshot; observe before another interaction")
         return record
 
 
@@ -451,6 +474,8 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
         result = function(browser_ctx, *rest, **kwargs)
         duration_ms = int((time.perf_counter() - started) * 1000)
         record = deps.gate.record(function.__name__, named, result, duration_ms)
+        if function is bt.browser_visual and record.success and record.operation == "capture":
+            return ToolReturn(return_value=result, content=[deps.browser.visual_content(result["data"]["screenshot"])])
         if not record.success and record.code in MODEL_RETRY_CODES:
             raise ModelRetry(record.error or "Correct the browser tool arguments and try once more.")
         error = result.get("error") if isinstance(result.get("error"), dict) else {}
@@ -538,6 +563,8 @@ def navigator_tools(config: AxisConfig) -> list[Tool[AxisDeps]]:
         optional.append(OPTIONAL_TOOL_FUNCTIONS["browser_diagnose"])
     if config.tools.downloads:
         optional.append(OPTIONAL_TOOL_FUNCTIONS["browser_downloads"])
+    if config.tools.visual and config.run.visual_mode == "auto":
+        optional.append(OPTIONAL_TOOL_FUNCTIONS["browser_visual"])
 
     def build(function: Callable[..., Any], *, defer: bool) -> Tool[AxisDeps]:
         return Tool(

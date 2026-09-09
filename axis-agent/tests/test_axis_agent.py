@@ -873,7 +873,9 @@ async def test_state_changing_completion_is_rejected_until_it_is_verified():
         [browse(), done("Submitted."), browse("Verify the result"), done("Submitted and verified.")],
         [
             {"calls": [FILL], "outcome": {"status": "goal_reached", "summary": "filled the box"}},
-            {"calls": [], "outcome": {"status": "goal_reached", "summary": "verified"}},
+            {"calls": [("browser_assert", {"tab": "tab_1", "command": {
+                "assertion": "value", "locator": {"role": "textbox", "name": "Search"},
+                "expected": "pydantic ai"}})], "outcome": {"status": "goal_reached", "summary": "verified"}},
         ],
     )
     orchestrator, bridge, _ = make(script)
@@ -907,10 +909,12 @@ async def test_a_rejected_completion_is_rejected_on_every_attempt():
 async def test_a_simple_search_completes_through_fill_enter_observation_and_the_planner():
     events = []
     script = Script(
-        [browse("Search Google for pydantic ai"), done("The top result is the Pydantic AI docs.")],
+        [browse("Search Google for pydantic ai", verification={"assertion": "title", "expected": "pydantic ai - Google Search"}), done("The top result is the Pydantic AI docs.")],
         [
             {"calls": [FILL, ENTER], "outcome": {"status": "continue", "summary": "submitted the query"}},
-            {"calls": [], "outcome": {"status": "goal_reached", "summary": "results are visible"}},
+            {"calls": [("browser_assert", {"tab": "tab_1", "command": {
+                "assertion": "title", "expected": "pydantic ai - Google Search"}})],
+             "outcome": {"status": "goal_reached", "summary": "results are visible"}},
         ],
     )
     orchestrator, bridge, _ = make(script, on_event=events.append)
@@ -937,6 +941,7 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
         "keyboard.press",
         "tabs.list",              # revalidate the bound tab before reuse
         "page.accessibilityTree",  # fresh observation before step 2
+        "expect.page.toHaveTitle", # goal-specific result verification
     ]
     assert script.planner_calls == 2 and script.navigator_calls == 2
     assert [event.kind for event in events][0] == "status"  # planner_started, before any decision

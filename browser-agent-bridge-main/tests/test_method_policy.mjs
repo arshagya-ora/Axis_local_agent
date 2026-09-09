@@ -39,6 +39,8 @@ const CATEGORY = [
   ['page.setExtraHTTPHeaders', 'page_action'],
   ['page.acceptDialog', 'page_action'],
   ['computer.drag', 'page_action'],
+  ['computer.hover', 'page_action'],
+  ['computer.scroll', 'page_action'],
   ['network.setBlockedUrls', 'page_action'],
   ['network.setInterceptors', 'page_action'],
   ['network.routeFromHAR', 'page_action'],

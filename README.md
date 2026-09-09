@@ -25,6 +25,7 @@ AXIS  →  planner decides a goal
 | [browser-agent-bridge-main/](browser-agent-bridge-main/) | The Chrome extension + native host that gives the agent access to Chrome |
 | [axis-agent/manual_test_prompts.md](axis-agent/manual_test_prompts.md) | 12 ready-made workflow prompts, each with what to watch for in the trace |
 | [axis-agent/evaluation_log.md](axis-agent/evaluation_log.md) | **Where you record your evaluation results** (see "Your task" below) |
+| [axis-agent/evals/](axis-agent/evals/) | Executable local workflow benchmark and generated report instructions |
 | [axis-agent/README.md](axis-agent/README.md) | Deep technical reference for the browser tool layer |
 
 ---
@@ -74,8 +75,9 @@ Check it worked:
 uv run python -m pytest axis-agent/tests -q
 ```
 
-You should see **219 passed**. These tests need no Chrome and no credentials —
-if they pass, your Python side is set up correctly.
+The suite should pass. These tests need no Chrome and no credentials; the
+fixture-server tests use local loopback HTTP. Passing them confirms the Python
+side is set up correctly.
 
 ---
 
@@ -255,8 +257,36 @@ you can type follow-up questions.
 | `--max-steps N` | Stop a run after N navigator steps. Useful for capping runaway tasks |
 | `--capture` | Force the screenshot/evidence tool on |
 | `--diagnose` | Force the console/network diagnostic tool on |
+| `--visual-mode auto\|off` | Enable automatic visual recovery (default `auto`) or use DOM observations only |
 | `--approve` | Ask you for confirmation before consequential actions (upload, drag) |
 | `--config PATH` | Use a different config file instead of `axis.yaml` |
+
+### Verification, memory, and visual recovery
+
+For page-state changes, AXIS requires a passing assertion for the current goal
+on the affected tab before completing that goal. The planner declares the
+expected result; simply reading the page again or writing a confident summary
+does not verify a mutation. Reading tasks use runtime-issued evidence from
+observations and extractions. A download goal is verified by a completed file
+matching its declared filename or URL within the current task's download window.
+
+Useful extracted facts retain their source URL, tab, goal, and evidence ID
+across steps and planner passes. Memory holds at most 16 fact entries and
+32,000 characters of fact values, prioritizing explicit extractions and
+completed goals. Truncation is reported in context.
+
+In an interactive session, `/continue <follow-up>` retains the current task's
+context and facts. `/new <task>` starts independent task memory. An unprefixed
+reply continues a paused task or one waiting for your input; after a finished
+run it starts a new task.
+
+When the DOM view is insufficient, AXIS can request a screenshot automatically
+and send the actual image to a vision-capable model. The optional
+`browser_visual` tool supports screenshot capture and coordinate interactions;
+each interaction requires the latest screenshot and consumes it. These images
+are not saved into ordinary memory, debug events, or evaluation reports. Saving
+a screenshot remains an explicit artifact-capture operation. Use
+`--visual-mode off` to disable automatic images and coordinate recovery.
 
 ### Reading the trace
 
@@ -274,12 +304,12 @@ you can type follow-up questions.
 | `[OK  ]` / `[FAIL]` | The call ran, and its result |
 | `[SKIP]` | The runtime **refused** the call — it never reached Chrome |
 | `[OBSV]` | The automatic page reading before each navigator step |
-| `[TOOLS]` | An opt-in tool (screenshot, diagnostics, downloads) turned on mid-run |
+| `[TOOLS]` | An optional tool (capture, diagnostics, downloads, visual recovery) turned on mid-run |
 | `refs invalidated` | The page changed, so the rest of that step was cancelled |
 
 The last line of every run breaks the wall-clock time into `model=` /
-`browser=` / `other=`. In practice `model=` dominates, so what makes a run
-faster is **fewer round-trips**, not a faster browser.
+`browser=` / `other=` and reports model requests and input/output tokens. Use
+these measurements to compare provider latency and browser work.
 
 ### Tuning behaviour
 
@@ -288,7 +318,10 @@ comment explaining it. The ones you are most likely to touch while evaluating:
 
 - `run.max_total_steps` (default 30) — the hard ceiling on a run
 - `run.max_actions_per_step` (default 3) — browser calls allowed per step
-- `run.planner_interval_steps` (default 3) — how often the planner re-plans
+- `run.planner_interval_steps` (default 3) — baseline planner interval
+- `run.planner_max_interval_steps` (default 6) — extend the interval while fresh evidence shows progress; set it to 3 for fixed cadence
+- `run.visual_mode` (default `auto`) — automatically request image input when needed; `off` disables it
+- `browser.allow_coordinate_fallback` (default `true`) — permit coordinate actions during visual recovery; `false` permits visual reading only
 - `browser.max_open_tabs` (default 60) — raise it if you normally keep many tabs open
 - `browser.firewall` — URL and method allow/deny rules
 
@@ -297,6 +330,35 @@ comment explaining it. The ones you are most likely to touch while evaluating:
 ## Your task: evaluate AXIS on complex workflows
 
 This is what I need from you. Please treat it as the deliverable, not the setup.
+
+### Run the repeatable local benchmark
+
+From `axis-agent`, with the bridge connected and provider configured:
+
+```bash
+uv run python -m evals.run --preflight
+uv run python -m evals.run
+uv run python -m evals.run --case multi_tab_memory --repeat 3
+```
+
+The default runs 12 concrete fixture cases three times, sequentially. Each
+repetition gets a fresh loopback origin and task-owned tabs; navigation stays
+on that origin and the runner closes its tabs afterward. Fixtures cover the
+original eight quality dimensions plus memory across tabs, changing SPA
+content, completed downloads, and canvas interaction.
+
+The runner checks actual fixture state and submission counts, reporting task
+success, false completions, duplicate actions, latency, model requests, browser
+actions, and tokens. Unavailable prerequisites are recorded separately from
+task failures and excluded from performance averages. JSON and Markdown
+reports go under the ignored `axis-agent/evals/results/` directory.
+
+Use `--config PATH` to compare configurations, `--output DIRECTORY` to choose
+the report destination, or `--judge` to add an optional model judge. The
+deterministic checks always run; a judge is constructed only when requested.
+See [the evaluation guide](axis-agent/evals/README.md) for commands and exit
+codes. Live success and latency must be measured on your configured browser
+and provider; the unit tests do not establish those results.
 
 ### What to test
 
@@ -378,7 +440,7 @@ are the ones I want to fix first.
 
 ## What is and is not in this repository
 
-**Committed here:** all source code, all 219 tests, `axis.yaml`, the
+**Committed here:** all source code, the automated tests, `axis.yaml`, the
 `.env.example` template, the vendored Browser Agent Bridge extension, the test
 prompts, and this guide.
 

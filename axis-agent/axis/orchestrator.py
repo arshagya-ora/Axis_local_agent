@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import time
+from datetime import datetime
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -36,6 +37,9 @@ from .models import (
     TabSummary,
     TaskRequirements,
     TaskRunState,
+    TaskFact,
+    PendingChange,
+    GoalCheck,
     clip,
 )
 
@@ -139,9 +143,12 @@ def _merge_requirements(current: TaskRequirements, added: TaskRequirements) -> T
 def verify_completion(state: TaskRunState, browser_state: BrowserState | None) -> CompletionVerdict:
     """Deterministically decide whether a model completion claim is admissible."""
     reasons: list[str] = []
-    latest_assertions: dict[tuple[str, str, str], AssertionRecord] = {}
+    latest_assertions: dict[tuple[str, str, str, str, str], AssertionRecord] = {}
     for assertion in state.assertions:
-        key = (assertion.tab or "", assertion.assertion, repr(assertion.expected))
+        if assertion.superseded_by:
+            continue
+        key = (assertion.goal_id or "", assertion.tab or "", assertion.target or "",
+               assertion.assertion, repr(assertion.expected))
         latest_assertions[key] = assertion
     if any(not item.passed for item in latest_assertions.values()):
         reasons.append("A required assertion is still failing.")
@@ -156,22 +163,17 @@ def verify_completion(state: TaskRunState, browser_state: BrowserState | None) -
         reasons.append("Console diagnostics were requested but not collected.")
     if requirements.require_network_check and not any(e.kind == "network" for e in state.diagnostic_evidence):
         reasons.append("Network diagnostics were requested but not collected.")
+    trusted = [item for item in state.evidence if item.verified and item.id and item.kind != "navigator"]
     searchable = "\n".join(
-        [browser_state.snapshot if browser_state else ""]
-        + [item.detail for item in state.evidence]
-        + [record.extracted_data or "" for record in state.actions]
+        [browser_state.snapshot if browser_state and browser_state.evidence_id else ""]
+        + [item.detail for item in trusted if item.kind in {"observation", "extraction"}]
     ).casefold()
     for required in requirements.required_text:
         if required.casefold() not in searchable:
             reasons.append(f"Required text has not been verified: {required!r}.")
     current_url = browser_state.url if browser_state else None
-    visited = "\n".join(
-        [current_url or ""]
-        + [item.detail for item in state.evidence]
-        + [record.extracted_data or "" for record in state.actions]
-    )
     for literal_url in requirements.literal_urls:
-        if literal_url not in visited:
+        if literal_url not in state.visited_urls:
             reasons.append(f"Required URL has not been visited or verified: {literal_url!r}.")
     if requirements.final_url_pattern and not re.search(requirements.final_url_pattern, current_url or ""):
         reasons.append("The final URL condition is not met.")
@@ -184,6 +186,8 @@ def verify_completion(state: TaskRunState, browser_state: BrowserState | None) -
             unresolved_refusals.pop(key, None)
     if unresolved_refusals:
         reasons.append("A refused browser action remains unresolved.")
+    if state.goal_number and not any(item.kind in {"observation", "extraction", "assertion"} for item in trusted):
+        reasons.append("The browser task has no recorded page evidence.")
     return CompletionVerdict(valid=not reasons, reasons=reasons)
 
 
@@ -193,6 +197,10 @@ class _Stop(Exception):
     def __init__(self, result: AxisResult):
         super().__init__(result.reason)
         self.result = result
+
+
+class _VisionUnavailable(Exception):
+    """The first image request was explicitly rejected before any action."""
 
 
 class AxisOrchestrator:
@@ -226,6 +234,7 @@ class AxisOrchestrator:
         self._capture_enabled = config.tools.capture_evidence
         self._diagnose_enabled = config.tools.diagnose
         self._downloads_enabled = config.tools.downloads
+        self._visual_enabled = False
         self._base_navigator = navigator
 
     @property
@@ -284,6 +293,9 @@ class AxisOrchestrator:
     async def start_task(self, task: str) -> AxisResult:
         """Start an independent task while reusing the connected browser."""
         self.state = self.config.new_memory(task, extract_requirements(task))
+        self.browser.task_started_wallclock = self.state.started_wallclock
+        self.browser.visual_enabled = False
+        self.browser.invalidate_visual()
         self.state.status = "paused" if self._prestart_paused else "active"
         self._set_navigator_tools()
         try:
@@ -308,9 +320,21 @@ class AxisOrchestrator:
             return await self.start_task(follow_up)
         state = self.state
         state.add_followup(follow_up)
-        state.requirements = _merge_requirements(state.requirements, extract_requirements(follow_up))
+        added = extract_requirements(follow_up)
+        state.requirements = _merge_requirements(state.requirements, added)
+        if added.require_download:
+            state.downloads.clear()
+            state.started_wallclock = time.time()
+            self.browser.task_started_wallclock = state.started_wallclock
+        if added.require_screenshot:
+            state.evidence = [item for item in state.evidence if item.kind != "screenshot"]
         state.last_error = None
         state.counters.consecutive_failures = 0
+        state.counters.no_progress_steps = 0
+        state.counters.repeated_actions = 0
+        state.counters.repeated_observations = 0
+        state.progress_by_tab.clear()
+        state.made_progress = False
         state.counters.navigator_steps_since_plan = self.config.run.planner_interval_steps
         state.current_goal = None
         state.latest_navigator_outcome = None
@@ -319,7 +343,7 @@ class AxisOrchestrator:
         state.repair_attempted = False
         state.direct_navigation_done = False
         state.started_monotonic = time.monotonic()
-        state.model_ms = state.browser_ms = state.plan_ms = state.step_ms = 0
+        state.model_ms = state.browser_ms = state.plan_ms = state.step_ms = state.tool_model_ms = 0
         state.cancellation_token = type(state.cancellation_token)()
         try:
             self._set_navigator_tools()
@@ -342,6 +366,7 @@ class AxisOrchestrator:
 
     def _sync_navigator_tools(
         self, *, capture: bool = False, diagnose: bool = False, downloads: bool = False,
+        visual: bool = False,
         exact: bool = False,
     ) -> None:
         """Turn on an opt-in tool when the run actually needs it.
@@ -361,21 +386,26 @@ class AxisOrchestrator:
         want_downloads = (downloads or self.config.tools.downloads) if exact else (
             self._downloads_enabled or downloads or self.config.tools.downloads
         )
-        if (want_capture, want_diagnose, want_downloads) == (
-            self._capture_enabled, self._diagnose_enabled, self._downloads_enabled,
+        want_visual = visual and self.config.run.visual_mode == "auto" and not (self.state and self.state.vision_disabled)
+        previous_visual = self._visual_enabled
+        if (want_capture, want_diagnose, want_downloads, want_visual) == (
+            self._capture_enabled, self._diagnose_enabled, self._downloads_enabled, self._visual_enabled,
         ):
             return
         self._capture_enabled, self._diagnose_enabled, self._downloads_enabled = (
             want_capture, want_diagnose, want_downloads,
         )
+        self._visual_enabled = want_visual
         if self.navigator_factory is None:
             return
-        self.navigator = self.navigator_factory(
-            capture=want_capture, diagnose=want_diagnose, downloads=want_downloads,
-        )
+        options = dict(capture=want_capture, diagnose=want_diagnose, downloads=want_downloads)
+        if want_visual or previous_visual:
+            options["visual"] = want_visual
+        self.navigator = self.navigator_factory(**options)
         self._emit(
             "status", phase="tools_changed", capture=want_capture,
             diagnose=want_diagnose, downloads=want_downloads,
+            visual=want_visual,
         )
 
     # -- events ----------------------------------------------------------
@@ -428,8 +458,12 @@ class AxisOrchestrator:
             duration_ms=self._elapsed_ms(),
             # Agent.run includes time spent executing tools. Subtract the
             # measured bridge portion to avoid double-counting it as model time.
-            model_ms=max(0, state.model_ms - state.browser_ms) if state else 0,
+            model_ms=max(0, state.model_ms - state.tool_model_ms) if state else 0,
             browser_ms=state.browser_ms if state else 0,
+            input_tokens=int(state.usage.input_tokens) if state else 0,
+            output_tokens=int(state.usage.output_tokens) if state else 0,
+            limitations=["The configured provider rejected image input; visual recovery was disabled for this run."]
+            if state and state.vision_disabled else [],
         )
         self._emit(
             "final", status=result.status, reason=result.reason,
@@ -480,8 +514,19 @@ class AxisOrchestrator:
             if plan.decision == "fail":
                 return self._result("failed", evidence=plan.evidence, reason=plan.reason)
 
-            if state.current_goal and plan.next_goal and plan.next_goal != state.current_goal:
-                state.complete_goal(state.current_goal)
+            # A repair stays attached to the unfinished goal; changing its wording
+            # never silently completes it or abandons pending changes.
+            if not state.current_goal_id or (plan.next_goal != state.current_goal and not state.pending_changes):
+                state.goal_number += 1
+                state.current_goal_id = f"goal_{state.goal_number}"
+                state.current_verification = plan.verification
+            elif state.current_verification is None and plan.verification is not None:
+                state.current_verification = plan.verification
+                for pending in state.pending_changes.values():
+                    if pending.goal_id == state.current_goal_id and pending.verification is None:
+                        pending.verification = plan.verification
+            elif plan.verification != state.current_verification:
+                self._refine_verification(plan.verification)
             state.current_plan_summary = plan.plan_summary
             state.current_goal = self._preserve_literal_urls(plan.next_goal)
             state.current_success_condition = plan.success_condition
@@ -502,33 +547,68 @@ class AxisOrchestrator:
                 raise _Stop(stop)
 
             browser_state = await self._browser_state()
+            # The preceding action's effect is only known once the next page
+            # observation arrives, including asynchronously rendered updates.
+            self._update_progress(browser_state, [])
+            stop = self._stop_reason()
+            if stop is not None:
+                raise _Stop(stop)
+            if state.counters.no_progress_steps == 2 and state.counters.navigator_steps_since_plan:
+                state.last_error = "NO_PROGRESS: Two equivalent attempts made no useful change; choose a different strategy."
+                return
             outcome, gate = await self._navigate(browser_state)
 
             state.counters.total_steps += 1
             state.counters.navigator_steps_since_plan += 1
             state.latest_navigator_outcome = outcome
             self._commit_gate(gate)
-            mutated_this_step = any(mutated for mutated, _ in gate.effects)
             # Follow a tab the navigator switched to, so the next observation
             # targets the page it actually moved to rather than the one it
             # left — otherwise it must burn a whole step re-activating.
             failures = [record for record in gate.records if not record.success]
+            recoverable = {"STALE_REFERENCE", "REF_NOT_FOUND", "LOCATOR_ACTIONABILITY_TIMEOUT", "LOCATOR_NOT_FOUND", "LOCATOR_STRICT_MODE_VIOLATION"}
+            tab = browser_state.tab
+            if tab:
+                targeting = [r for r in failures if r.tab == tab and r.code in recoverable]
+                if targeting:
+                    state.visual_failures[tab] = state.visual_failures.get(tab, 0) + len(targeting)
+                elif not failures:
+                    state.visual_failures[tab] = 0
+                if ((outcome.needs_visual or state.visual_failures.get(tab, 0) >= 2)
+                        and not gate.non_retryable and self.config.run.visual_mode == "auto"
+                        and tab not in state.visual_tabs
+                        and not state.vision_disabled):
+                    state.visual_tabs.add(tab)
+                    outcome.status = "continue"
+                    outcome.reason = "Visual recovery requested; a fresh screenshot follows."
+                    # A recoverable targeting failure gets this one different
+                    # approach before exhausting the existing failure budget.
+                    state.counters.consecutive_failures = 0
             # A goal_reached decision with no new mutation is a semantic
             # assessment of the fresh pre-step BrowserState. Do not grant the
             # same status to a step that just changed the page: that change
             # still needs a later observation or passing assertion.
-            if outcome.status == "goal_reached" and not failures and not mutated_this_step:
-                state.counters.verified_mutation_count = state.counters.mutation_count
             if outcome.status == "goal_reached" and failures:
                 outcome.status = "continue"
                 outcome.reason = failures[-1].error or "A required browser call did not succeed."
-            state.last_error = failures[-1].error if failures else None
+            rejection = None
+            if outcome.status == "goal_reached":
+                pending = [p for p in state.pending_changes.values() if p.goal_id == state.current_goal_id]
+                known = {item.id for item in state.evidence if item.verified and item.goal_id == state.current_goal_id}
+                if pending:
+                    rejection = "Goal verification required: run the declared check after the changes on " + ", ".join(p.tab for p in pending) + "."
+                elif not known or any(ref not in known for ref in outcome.evidence_ids):
+                    rejection = "Unknown or unverified evidence reference; cite runtime evidence IDs."
+                if rejection:
+                    outcome.status = "continue"
+                    outcome.reason = rejection
+            state.last_error = rejection or (failures[-1].error if failures else None)
             if any(RECOVERY_POLICY.get(record.code or "") == "reconcile_tab" for record in failures):
                 # Tab liveness is controller state. Reconcile it once instead
                 # of asking the model to guess or repeat an internal tab id.
                 self._reconcile_bound_tab()
             for item in outcome.evidence:
-                state.evidence.append(Evidence(kind="navigator", detail=item, tab=self.tab, verified=False))
+                state.add_evidence("navigator", item, tab=self.tab, verified=False)
             self._update_progress(browser_state, gate.records)
             self._emit(
                 "navigator_step",
@@ -555,6 +635,9 @@ class AxisOrchestrator:
                 if outcome.status == "goal_reached" and state.current_goal:
                     state.complete_goal(f"{state.current_goal} -> {outcome.summary}")
                     state.current_goal = None
+                    state.current_goal_id = None
+                return
+            if rejection:
                 return
             if gate.unknown_outcome:
                 state.last_error = (
@@ -571,7 +654,10 @@ class AxisOrchestrator:
             if state.counters.no_progress_steps >= 2:
                 state.last_error = "NO_PROGRESS: Two equivalent attempts made no useful change; choose a different strategy."
                 return
-            if state.counters.navigator_steps_since_plan >= self.config.run.planner_interval_steps:
+            interval = self.config.run.planner_interval_steps
+            if state.made_progress and not failures:
+                interval = max(interval, self.config.run.planner_max_interval_steps)
+            if state.counters.navigator_steps_since_plan >= interval:
                 return
 
     # -- planner ---------------------------------------------------------
@@ -589,12 +675,17 @@ class AxisOrchestrator:
             "current_plan_summary": state.current_plan_summary,
             "current_goal": state.current_goal,
             "success_condition": state.current_success_condition,
+            "verification": state.current_verification.model_dump() if state.current_verification else None,
             "completed_goals": state.completed_goal_summaries,
             "latest_navigator_outcome": (
                 state.latest_navigator_outcome.model_dump() if state.latest_navigator_outcome else None
             ),
             "recent_action_results": [record.model_dump() for record in state.actions[-state.max_recent_actions:]],
-            "relevant_extracted_data": state.relevant_extracted_data,
+            "relevant_extracted_data": state.relevant_extracted_data if not state.facts else [],
+            "facts": [fact.model_dump() for fact in state.facts],
+            "memory_truncated": state.memory_truncated,
+            "pending_changes": [change.model_dump() for change in state.pending_changes.values()],
+            "evidence": [item.model_dump() for item in state.evidence[-16:] if item.verified],
             "last_error": state.last_error,
             "unverified_page_changes": state.unverified_mutations,
             "remaining_steps": max(0, run.max_total_steps - state.counters.total_steps),
@@ -628,11 +719,8 @@ class AxisOrchestrator:
         state.record_actions(gate.records)
         state.counters.browser_actions += gate.actions_used
         for record, (mutated, verified) in zip(gate.records, gate.effects):
-            if mutated:
-                state.counters.mutation_count += 1
-            if verified:
-                state.counters.verified_mutation_count = state.counters.mutation_count
-            self._collect_record_evidence(record)
+            if not record.sequence:
+                self._register_action(record, mutated)
         if gate.active_tab_changed_to and gate.active_tab_changed_to in self.browser.tabs:
             self.tab = gate.active_tab_changed_to
         gate.committed = True
@@ -659,23 +747,37 @@ class AxisOrchestrator:
                 "browser_action", tool=tool, operation=operation, args=args,
                 success=False, error=f"{code}: {message}", refs_invalidated=False, skipped=True,
             ),
+            on_record=self._register_action,
         )
         deps = AxisDeps(browser=self.browser, gate=gate)
         self._emit("status", phase="navigator_step_started", goal=state.goal)
         prompt = format_as_xml(state.model_dump(exclude_none=True), root_tag="browser_state")
+        model_prompt = [prompt, self.browser.visual_content(state.screenshot)] if state.screenshot else prompt
         started = time.monotonic()
         try:
-            outcome = await self._run_agent(self.navigator, prompt, deps=deps)
+            try:
+                outcome = await self._run_agent(self.navigator, model_prompt, deps=deps)
+            except _VisionUnavailable:
+                task.vision_disabled = True
+                task.visual_tabs.clear()
+                self.browser.visual_enabled = False
+                self.browser.invalidate_visual()
+                self._sync_navigator_tools(visual=False)
+                task.last_error = "The configured provider does not support image input; continuing with text."
+                self._emit("status", phase="vision_unavailable", reason=task.last_error)
+                outcome = await self._run_agent(self.navigator, prompt + "\n" + task.last_error, deps=deps)
         except BaseException:
             task.browser_ms += gate.browser_ms
+            task.tool_model_ms += gate.browser_ms
             task.step_ms = int((time.monotonic() - started) * 1000)
             self._commit_gate(gate)
             raise
         task.browser_ms += gate.browser_ms
+        task.tool_model_ms += gate.browser_ms
         task.step_ms = int((time.monotonic() - started) * 1000)
         return outcome, gate
 
-    async def _run_agent(self, agent: Agent[Any, Any], prompt: str, *, deps: Any) -> Any:
+    async def _run_agent(self, agent: Agent[Any, Any], prompt: Any, *, deps: Any) -> Any:
         """One model request, with the shared usage record and limits.
 
         Pause/cancel are checked here, immediately before the request.
@@ -696,6 +798,12 @@ class AxisOrchestrator:
             raise _Stop(self._result("limit_reached", reason=clip(str(exc)) or "Usage limit exceeded.")) from exc
         except ModelHTTPError as exc:
             status = getattr(exc, "status_code", None)
+            if (isinstance(prompt, list) and deps is not None and deps.gate.actions_used == 0
+                    and status in {400, 422} and re.search(
+                        r"(?:image|vision|multimodal).*?(?:not supported|unsupported|not allowed)|"
+                        r"(?:does not support|unsupported|cannot accept).*?(?:image|vision|multimodal)",
+                        str(exc.body), re.IGNORECASE | re.DOTALL)):
+                raise _VisionUnavailable() from exc
             reason = (
                 "Provider authentication failed."
                 if status in (401, 403)
@@ -867,10 +975,10 @@ class AxisOrchestrator:
         )
         state.record_actions([record])
         state.counters.browser_actions += 1
+        self._register_action(record, record.success)
         if not record.success:
             state.last_error = record.error
             return
-        state.counters.mutation_count += 1
         state.direct_navigation_done = True
 
     def _arm_diagnostics(self, tab: str) -> None:
@@ -936,7 +1044,11 @@ class AxisOrchestrator:
         if observation is None:
             reason = clip(str(last)) if last else "The browser could not be observed."
             raise _Stop(self._result("failed", reason=reason or "The browser could not be observed."))
-        screenshot = self._screenshot(tab) if run.include_screenshot else None
+        want_visual = (tab in state.visual_tabs or run.include_screenshot or self.config.tools.visual)
+        want_visual = want_visual and run.visual_mode == "auto" and not state.vision_disabled
+        self.browser.visual_enabled = want_visual
+        self._sync_navigator_tools(visual=want_visual)
+        visual = self._screenshot(tab) if want_visual else None
         browser_state = BrowserState(
             tab=tab,
             url=observation.get("url"),
@@ -944,8 +1056,9 @@ class AxisOrchestrator:
             tabs=self._tab_summaries(),
             scroll=observation.get("scroll"),
             snapshot=observation.get("snapshot", ""),
-            truncated=bool(observation.get("truncated")),
-            screenshot=screenshot,
+            truncated=bool(observation.get("truncated")) or len(observation.get("snapshot", "")) > 12_000,
+            screenshot=visual.get("screenshot") if visual else None,
+            visual=visual,
             refs_fresh=tab in self.browser.observations,
             unverified_page_changes=state.unverified_mutations,
             site_pattern=observation.get("sitePattern"),
@@ -953,28 +1066,88 @@ class AxisOrchestrator:
             recent_actions=state.actions[-4:],
             goal=state.current_goal,
             success_condition=state.current_success_condition,
+            verification=state.current_verification,
             remaining_steps=max(0, run.max_total_steps - state.counters.total_steps),
             remaining_actions=min(
                 run.max_actions_per_step, max(0, run.max_browser_actions - state.counters.browser_actions)
             ),
             note=state.last_error,
             requirements=state.requirements,
+            goal_id=state.current_goal_id,
+            facts=state.facts,
+            memory_truncated=state.memory_truncated,
+            pending_changes=list(state.pending_changes.values()),
         )
         state.last_browser_state = browser_state
-        state.evidence.append(Evidence(
-            kind="observation", tab=tab,
-            detail=f"Observed {browser_state.url or 'unknown URL'} titled {browser_state.title or 'untitled'}.",
-        ))
-        # The automatic post-action observation is deterministic verification
-        # that the resulting page state was actually read.
-        if state.unverified_mutations:
-            state.counters.verified_mutation_count = state.counters.mutation_count
+        evidence = state.add_evidence("observation", f"Title: {browser_state.title or ''}\n{browser_state.snapshot}", tab=tab, source_url=browser_state.url)
+        browser_state.evidence_id = evidence.id
+        state.retain_fact(TaskFact(value=evidence.detail, tab=tab, source_url=browser_state.url,
+                                   goal_id=state.current_goal_id, evidence_id=evidence.id,
+                                   target="page", priority=0))
+        # Navigation has a concrete URL postcondition. This never verifies an
+        # input/click merely because the resulting page was observed.
+        for key, pending in list(state.pending_changes.items()):
+            if (pending.tab == tab and pending.goal_id == state.current_goal_id
+                    and pending.expected_url and pending.expected_url == browser_state.url):
+                state.counters.verified_mutation_count += pending.count
+                del state.pending_changes[key]
+        browser_state.unverified_page_changes = state.unverified_mutations
+        browser_state.pending_changes = list(state.pending_changes.values())
+        browser_state.facts = state.facts
+        browser_state.memory_truncated = state.memory_truncated
         return browser_state
+
+    def _register_action(self, record: ActionRecord, mutated: bool) -> None:
+        state = self.state
+        assert state is not None
+        record.sequence = state.next_sequence()
+        record.goal_id = state.current_goal_id
+        if record.tool == "browser_downloads" and record.tab is None:
+            record.tab = state.bound_tab
+        if record.target:
+            reference = re.search(r'"ref"\s*:\s*"(ref_\d+)"', record.target)
+            if reference:
+                record.target = self.browser.describe_ref(reference[1]) or record.target
+        tab = self.browser.tabs.get(record.tab) if record.tab else None
+        record.source_url = self.browser.safe_url(tab.url) if tab else None
+        if mutated and record.tab:
+            key = f"{record.goal_id}:{record.tab}"
+            previous = state.pending_changes.get(key)
+            check = state.current_verification
+            if check is None and record.operation == "fill" and record.expected_value is not None:
+                # Straightforward input goals have a deterministic target/value
+                # postcondition even with an older planner specification.
+                target = record.target
+                names = re.findall(r'"([^"\n]+)"', target or "")
+                if target and not target.startswith("{") and names:
+                    target = names[0]
+                elif target and target.startswith("{"):
+                    locator = json.loads(target).get("locator", {})
+                    target = next((locator[k] for k in ("name", "label", "text", "placeholder", "selector") if locator.get(k)), None)
+                check = GoalCheck(assertion="value", expected=record.expected_value, target=target) if target else None
+                if previous and previous.verification != check:
+                    check = None
+            state.pending_changes[key] = PendingChange(
+                goal_id=record.goal_id, tab=record.tab, sequence=record.sequence,
+                count=(previous.count if previous else 0) + 1,
+                expected_url=record.source_url if record.tool == "browser_navigate" and not previous else None,
+                verification=check,
+            )
+            state.counters.mutation_count += 1
+        self._collect_record_evidence(record)
 
     def _collect_record_evidence(self, record: ActionRecord) -> None:
         state = self.state
         assert state is not None
+        if not record.executed:
+            return
         data = record.result_data
+        def evidence(kind: str, detail: str, verified: bool = True) -> Evidence:
+            item = state.add_evidence(kind, detail, tab=record.tab, source_url=record.source_url,
+                                      sequence=record.sequence, verified=verified)
+            record.evidence_id = item.id
+            return item
+
         if record.tool == "browser_assert":
             assertion = AssertionRecord(
                 assertion=record.operation or "unknown",
@@ -982,28 +1155,134 @@ class AxisOrchestrator:
                 expected=data.get("expected"),
                 tab=record.tab,
                 message=record.message,
+                target=record.target,
+                goal_id=record.goal_id,
+                sequence=record.sequence,
+                match=data.get("match"),
             )
-            state.assertions.append(assertion)
-            state.evidence.append(Evidence(
-                kind="assertion", tab=record.tab, verified=assertion.passed,
-                detail=f"{assertion.assertion} passed={assertion.passed} expected={assertion.expected!r}",
-            ))
+            item = evidence("assertion", f"{assertion.assertion} {record.target} passed={assertion.passed} expected={assertion.expected!r}", assertion.passed)
+            assertion.evidence_id = item.id
+            state.assertions = (state.assertions + [assertion])[-128:]
+            key = f"{record.goal_id}:{record.tab}"
+            pending = state.pending_changes.get(key)
+            if (assertion.passed and pending and record.sequence > pending.sequence
+                    and self._matches_goal_check(pending.verification, record)):
+                state.counters.verified_mutation_count += pending.count
+                del state.pending_changes[key]
+        elif record.success and record.tool in {"browser_observe", "browser_navigate", "browser_tabs"}:
+            kind = "navigation" if record.tool == "browser_navigate" else (
+                "observation" if record.tool == "browser_observe" and "snapshot" in data else "extraction")
+            content = record.extracted_data
+            if content is not None:
+                item = evidence(kind, content)
+                state.retain_fact(TaskFact(value=content, tab=record.tab, source_url=record.source_url,
+                                          goal_id=record.goal_id, evidence_id=item.id,
+                                          tool=record.tool,
+                                          target=record.target or "page", priority=0 if kind == "observation" else 1))
         elif record.tool == "browser_capture_evidence" and record.success:
             capture = data.get("capture")
             if capture in {"page_screenshot", "element_screenshot"}:
-                state.evidence.append(Evidence(
-                    kind="screenshot", tab=record.tab,
-                    detail=f"Screenshot {data.get('evidence')} saved={data.get('saved')}: {data.get('path') or ''}",
-                ))
+                if data.get("saved"):
+                    evidence("screenshot", f"Screenshot {data.get('evidence')}: {data.get('path') or ''}")
         elif record.tool == "browser_downloads" and record.success:
-            item = Evidence(kind="download", tab=record.tab, detail=record.extracted_data or "Download verified.")
-            state.downloads.append(item)
-            state.evidence.append(item)
+            candidates = data.get("items", [data.get("download")])
+            for candidate in candidates if isinstance(candidates, list) else []:
+                if not isinstance(candidate, dict) or candidate.get("state") != "complete" or candidate.get("exists") is False:
+                    continue
+                try:
+                    started = datetime.fromisoformat(candidate.get("startTime", "").replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if started < state.started_wallclock or candidate.get("taskEligible") is False:
+                    continue
+                if not candidate.get("filename"):
+                    continue
+                check = state.current_verification
+                if check is None or check.assertion != "download" or not isinstance(check.expected, str) or not check.expected:
+                    continue
+                filename = candidate["filename"].replace("\\", "/").rsplit("/", 1)[-1]
+                if check.expected not in {filename, candidate.get("url"), candidate.get("finalUrl")}:
+                    continue
+                item = evidence("download", json.dumps(candidate, ensure_ascii=False))
+                state.downloads = (state.downloads + [item])[-16:]
+                for key, pending in list(state.pending_changes.items()):
+                    if (pending.goal_id == state.current_goal_id and pending.verification == check
+                            and pending.tab == record.tab
+                            and record.sequence > pending.sequence):
+                        state.counters.verified_mutation_count += pending.count
+                        del state.pending_changes[key]
         elif record.tool == "browser_diagnose" and record.success and record.operation in {"console", "network"}:
             detail = str(data.get("events", []))[:4_000]
-            item = Evidence(kind=record.operation, tab=record.tab, detail=detail or "No events were returned.")
-            state.diagnostic_evidence.append(item)
-            state.evidence.append(item)
+            item = evidence(record.operation, detail or "No events were returned.")
+            state.diagnostic_evidence = (state.diagnostic_evidence + [item])[-32:]
+            state.retain_fact(TaskFact(value=detail, tab=record.tab, source_url=record.source_url,
+                                      goal_id=record.goal_id, evidence_id=item.id,
+                                      tool=record.tool, target=record.operation, priority=1))
+
+    def _refine_verification(self, check: GoalCheck | None) -> bool:
+        """Correct inferred wording only with an actual post-mutation exact check.
+
+        Keep pending changes until a further check; retain superseded failures
+        with their replacement evidence ID for an auditable correction.
+        """
+        state = self.state
+        assert state is not None
+        old = state.current_verification
+        if (not old or not check or old == check or old.assertion != check.assertion
+                or old.assertion not in {"text", "title", "value"}
+                or (old.target and old.target != check.target)):
+            return False
+        user_text = "\n".join([state.original_request, *state.follow_ups,
+                               *state.requirements.required_text]).casefold()
+        if isinstance(old.expected, str) and old.expected.casefold() in user_text:
+            return False
+        pending = [p for p in state.pending_changes.values() if p.goal_id == state.current_goal_id]
+        if not pending:
+            return False
+        replacements = []
+        for change in pending:
+            replacement = next((a for a in reversed(state.assertions)
+                if a.passed and a.evidence_id and not a.superseded_by
+                and a.goal_id == change.goal_id and a.tab == change.tab
+                and a.sequence > change.sequence
+                and self._matches_goal_check(check, ActionRecord(
+                    tool="browser_assert", operation=a.assertion, target=a.target,
+                    result_data={"expected": a.expected, "match": a.match}))), None)
+            if replacement is None:
+                return False
+            replacements.append(replacement)
+        state.current_verification = check
+        for change, replacement in zip(pending, replacements):
+            change.verification = check
+            for assertion in state.assertions:
+                if (not assertion.passed and assertion.goal_id == change.goal_id
+                        and assertion.tab == change.tab and assertion.target == replacement.target
+                        and assertion.assertion == old.assertion and assertion.expected == old.expected):
+                    assertion.superseded_by = replacement.evidence_id
+        self._emit("verification_refined", verification=check.model_dump(),
+                   evidence_ids=[a.evidence_id for a in replacements])
+        return True
+
+    @staticmethod
+    def _matches_goal_check(check: GoalCheck | None, record: ActionRecord) -> bool:
+        if check is None or check.assertion != record.operation:
+            return False
+        actual = record.result_data.get("expected")
+        if record.result_data.get("match") in {"regex", "contains"}:
+            return False
+        if check.expected is not None and actual != check.expected:
+            return False
+        if check.target:
+            try:
+                identity = json.loads(record.target or "{}")
+                locator = identity.get("locator", {})
+                targets = [str(v).casefold() for k, v in locator.items()
+                           if k in {"name", "label", "text", "placeholder", "selector", "role"}]
+                if check.target.casefold() not in targets:
+                    return False
+            except (ValueError, TypeError, AttributeError):
+                return False
+        return True
 
     @staticmethod
     def _normalized_url(url: str | None) -> str:
@@ -1015,66 +1294,101 @@ class AxisOrchestrator:
 
     @classmethod
     def _page_fingerprint(cls, browser_state: BrowserState, records: list[ActionRecord]) -> str:
-        extracted = [record.extracted_data for record in records if record.extracted_data]
-        changes: list[dict[str, Any]] = []
-        for record in records:
-            changed = record.result_data.get("whatChanged")
-            if isinstance(changed, dict):
-                changes.append({
-                    key: changed.get(key)
-                    for key in ("urlChanged", "toUrl", "focusChanged", "newPopups", "a11yDiff")
-                    if key in changed
-                })
-        payload = {
-            "url": cls._normalized_url(browser_state.url),
-            "snapshot": hashlib.sha256(browser_state.snapshot.encode("utf-8", errors="replace")).hexdigest(),
-            "extracted": hashlib.sha256(
-                "\n".join(extracted).encode("utf-8", errors="replace")
-            ).hexdigest(),
-            "changes": changes,
-        }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, default=str).encode("utf-8", errors="replace")
-        ).hexdigest()
+        text = re.sub(r"\[ref_\d+\]", "[ref]", browser_state.snapshot)
+        text = " ".join(text.split())
+        return hashlib.sha256(f"{cls._normalized_url(browser_state.url)}|{text}".encode()).hexdigest()
 
     def _update_progress(self, browser_state: BrowserState, records: list[ActionRecord]) -> None:
         state = self.state
         assert state is not None
         page_fingerprint = self._page_fingerprint(browser_state, records)
-        if page_fingerprint == state.last_page_fingerprint:
-            state.counters.repeated_observations += 1
-        else:
-            state.counters.repeated_observations = 0
-        state.last_page_fingerprint = page_fingerprint
-
-        mutating = [record for record in records if record.executed and record.tool in {"browser_act", "browser_navigate"}]
-        if not mutating:
+        tab = browser_state.tab or ""
+        entry = state.progress_by_tab.setdefault(tab, {})
+        if not records:
+            state.made_progress = False
+            pending = entry.pop("pending", None)
+            if pending:
+                changed = pending["page"] != page_fingerprint
+                if changed or pending["positive"]:
+                    entry["streak"] = 0
+                    state.made_progress = True
+                    for other in state.progress_by_tab.values():
+                        other["streak"] = 0
+                elif pending["action"] == entry.get("last_action"):
+                    entry["streak"] = entry.get("streak", 0) + 1
+                else:
+                    entry["streak"] = 1
+                entry["last_action"] = pending["action"]
+            state.counters.repeated_observations = (
+                state.counters.repeated_observations + 1 if entry.get("page") == page_fingerprint else 0)
+            entry["page"] = page_fingerprint
+            state.counters.no_progress_steps = entry.get("streak", 0)
             return
-        record = mutating[-1]
-        normalized_args = re.sub(r"ref_\d+", "ref", record.args or "")
-        fingerprint = hashlib.sha256(
-            f"{record.tool}|{record.operation}|{normalized_args}".encode("utf-8", errors="replace")
-        ).hexdigest()
-        repeated = fingerprint == state.last_action_fingerprint
-        no_change = record.success and record.meaningful_change is False
-        if no_change:
-            state.counters.no_progress_steps += 1
-            state.counters.repeated_actions = state.counters.repeated_actions + 1 if repeated else 1
-        elif record.success:
-            state.counters.no_progress_steps = 0
-            state.counters.repeated_actions = 0
-        state.last_action_fingerprint = fingerprint
+        for record in records:
+            record_tab = record.tab or tab
+            tracked = state.progress_by_tab.setdefault(record_tab, {})
+            if record.success and record.tool in {"browser_observe", "browser_assert"}:
+                text = record.extracted_data
+                positive = record.tool == "browser_assert" or (text is not None and text != tracked.get("extracted"))
+                if record.tool == "browser_observe" and "snapshot" in record.result_data:
+                    observed = BrowserState(tab=record_tab, url=record.source_url or browser_state.url,
+                                            snapshot=record.result_data["snapshot"])
+                    fingerprint = self._page_fingerprint(observed, [])
+                    positive = fingerprint != tracked.get("page")
+                    tracked["page"] = fingerprint
+                tracked["extracted"] = text
+                if positive:
+                    state.made_progress = True
+                    tracked["streak"] = 0
+                    state.counters.no_progress_steps = 0
+                    if "pending" in tracked:
+                        tracked["pending"]["positive"] = True
+            if not record.success or record.tool not in {"browser_act", "browser_navigate", "browser_visual"} or record.operation == "capture":
+                continue
+            # Stable target descriptions distinguish two controls whose freshly
+            # minted references happen to have different numbers each step.
+            target = record.target or record.args or ""
+            target = re.sub(r"\b(ref|screenshot)_\d+\b", r"\1", target)
+            payload = re.sub(r"\b(ref|screenshot)_\d+\b", r"\1", record.args or "")
+            action = f"{record.tool}|{record.operation}|{target}|{payload}"
+            tracked["pending"] = {"page": tracked.get("page", page_fingerprint),
+                                  "action": action, "positive": record.meaningful_change is True}
 
-    def _screenshot(self, tab: str) -> str | None:
-        """Capture a screenshot and hand the model only its safe alias — image
-        bytes never enter the model history."""
-        result = bt.browser_capture_evidence(
-            browser_context(self.browser), tab,
-            bt.PageCapture(capture="page_screenshot", save=True),
-        )
-        if not result["ok"]:
+    def _screenshot(self, tab: str) -> dict[str, Any] | None:
+        """Capture bounded visual input through the same execution gate."""
+        state = self.state
+        assert state is not None
+        gate = StepGate(max_actions=1,
+                        remaining_total_actions=self.config.run.max_browser_actions - state.counters.browser_actions,
+                        approval_actions=frozenset(self.config.tools.approval_required_actions),
+                        approval=self.approval, forbidden_actions=frozenset(state.requirements.forbidden_actions),
+                        mutation_allowed=state.requirements.mutation_allowed,
+                        is_paused=lambda: state.status == "paused", is_cancelled=lambda: state.status == "cancelled",
+                        on_record=self._register_action)
+        kwargs = {"tab": tab, "command": bt.VisualCapture(operation="capture")}
+        current_url = self.browser.safe_url(self.browser.tab(tab).url)
+        refused = gate.check("browser_visual", kwargs, {
+            "tab": tab, "operation": "capture", "current_url": current_url,
+            "expected_effect": "capture", "reason": "This action is configured to require user approval.",
+        })
+        if refused:
+            self._commit_gate(gate)
+            state.last_error = "Visual recovery unavailable: " + (self._envelope_error(refused) or "capture refused")
+            state.visual_tabs.discard(tab)
+            self._emit("status", phase="vision_unavailable", reason=state.last_error)
             return None
-        return f"{result['data'].get('evidence')} (saved page screenshot)"
+        started = time.monotonic()
+        result = bt.browser_visual(browser_context(self.browser), **kwargs)
+        elapsed = int((time.monotonic() - started) * 1000)
+        gate.record("browser_visual", kwargs, result, elapsed)
+        self._commit_gate(gate)
+        state.browser_ms += elapsed
+        if not result["ok"]:
+            state.last_error = "Visual recovery unavailable: " + (self._envelope_error(result) or "capture failed")
+            state.visual_tabs.discard(tab)
+            self._emit("status", phase="vision_unavailable", reason=state.last_error)
+            return None
+        return result["data"]
 
 
 __all__ = ["AxisOrchestrator", "EventCallback", "ApprovalCallback"]

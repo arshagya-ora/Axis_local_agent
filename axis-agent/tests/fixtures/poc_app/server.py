@@ -29,11 +29,13 @@ button that would hang the session.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 # =====================================================================
 # Shared page chrome
@@ -709,6 +711,129 @@ def parse_multipart_filename(content_type: str, body: bytes) -> tuple[str | None
 # HTTP handler
 # =====================================================================
 
+class QualityState:
+    """One evaluation's independent oracle; stored on its HTTP server."""
+
+    def __init__(self, case_name: str):
+        self.case_name = case_name
+        self.lock = threading.Lock()
+        self.visits: list[str] = []
+        self.actions: dict[str, int] = {}
+        self.values: dict = {}
+
+    def visit(self, path: str) -> None:
+        with self.lock:
+            self.visits.append(path)
+
+    def action(self, name: str, value=None) -> None:
+        with self.lock:
+            self.actions[name] = self.actions.get(name, 0) + 1
+            self.values[name] = value
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return copy.deepcopy({"case": self.case_name, "visits": self.visits,
+                                  "actions": self.actions, "values": self.values})
+
+
+_QUALITY_SCRIPT = """
+async function record(action, value) {
+  const response = await fetch('/eval/action', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({action,value})});
+  if (!response.ok) throw new Error('Fixture action was rejected');
+}
+function show(text) { document.getElementById('result').textContent = text; }
+"""
+
+
+def quality_page(name: str) -> str | None:
+    """Small task-specific pages with server-observed, counted interactions."""
+    title = "Fixture Home" if name == "planner_decision_quality" else "AXIS quality fixture"
+    scripts = ""
+    bodies = {
+        "literal_preservation": '<h1>Report directory</h1><a href="/eval/report?case=Exact-42">Exact report</a>',
+        "report": '<h1>Exact report 42</h1>',
+        "planner_decision_quality": '<h1>Fixture Home</h1><p>You are on the fixture home page.</p>',
+        "correct_tool_selection": '<h1>Country selection</h1><label for="country">Country</label>'
+            '<select id="country"><option>United States</option><option>Canada</option></select>',
+        "ref_first_interaction": '<h1 id="heading">Step 1</h1><button id="continue">Continue</button>',
+        "grounded_final_answer": '<h1>Invoice</h1><p>Invoice total: <span id="total">$184.27</span></p>',
+        "no_invented_diagnostics": '<h1>Diagnostics</h1><button id="diagnostics">Run diagnostics</button>',
+        "unexpected_ui_recovery": '<h1>Preferences</h1><div id="settings-area"><button id="settings">Settings</button></div>',
+        "cross_provider_consistency": '<h1>Account</h1><p>Account status: <span id="status">Active</span></p>',
+        "multi_tab_memory": '<h1>Product Alpha</h1><p>Price: $31.50</p><a href="/eval/product-beta">Product Beta</a>',
+        "product-beta": '<h1>Product Beta</h1><p>Price: $24.25</p>',
+        "changing_spa_content": '<h1 id="heading">Step 1</h1><div id="workflow"><button id="advance">Advance</button></div>',
+        "download_completion": '<h1>Report export</h1><a href="/eval/axis-eval-report.csv" download>Download report</a>',
+        "canvas_interaction": '<h1>Canvas control</h1><p>The blue tile is inside this canvas. Use a screenshot to locate it.</p>'
+            '<canvas id="surface" width="640" height="360" style="border:1px solid #aaa;max-width:100%"></canvas>',
+    }
+    if name not in bodies:
+        return None
+    if name == "correct_tool_selection":
+        scripts = """
+document.getElementById('country').addEventListener('change', async e => {
+  await record('country', e.target.value); show('Country: ' + e.target.value);
+});"""
+    elif name == "ref_first_interaction":
+        scripts = """
+document.getElementById('continue').onclick = async () => {
+  await record('continue', true); document.getElementById('heading').textContent = 'Step 2';
+  show('Step 2');
+};"""
+    elif name == "no_invented_diagnostics":
+        scripts = """
+document.getElementById('diagnostics').onclick = async () => {
+  await record('diagnostics', true);
+  console.error(new TypeError('AXIS fixture diagnostic failure'));
+  await fetch('/eval/unavailable'); show('Diagnostics generated');
+};"""
+    elif name == "unexpected_ui_recovery":
+        # The runner reloads this page immediately before the first ref click.
+        # Reloading truly invalidates the bridge snapshot, not just a fake fault.
+        scripts = """
+document.getElementById('settings').onclick = async () => {
+  await record('settings', true);
+  document.getElementById('settings-area').innerHTML =
+    '<label><input id="compact" type="checkbox">Compact mode</label>';
+  document.getElementById('compact').onchange = async e => {
+    await record('compact', e.target.checked); show('Compact mode: ' + (e.target.checked ? 'enabled' : 'disabled'));
+  };
+};"""
+    elif name == "changing_spa_content":
+        scripts = """
+document.getElementById('advance').onclick = async () => {
+  await record('advance', true); document.getElementById('advance').disabled = true;
+  show('Loading Step 2');
+  setTimeout(() => {
+    document.getElementById('heading').textContent = 'Step 2';
+    document.getElementById('workflow').innerHTML = '<button id="finish">Finish</button>';
+    document.getElementById('finish').onclick = async () => {
+      await record('finish', true); show('Workflow complete');
+    }; show('Step 2 is ready');
+  }, 450);
+};"""
+    elif name == "canvas_interaction":
+        scripts = """
+const surface = document.getElementById('surface'), context = surface.getContext('2d');
+context.fillStyle = '#f8fafc'; context.fillRect(0, 0, 640, 360);
+context.fillStyle = '#2563eb'; context.fillRect(230, 130, 180, 90);
+context.fillStyle = '#fff'; context.font = '24px sans-serif';
+context.textAlign = 'center'; context.fillText('Confirm', 320, 185);
+surface.onclick = async e => {
+  const r = surface.getBoundingClientRect();
+  const x = (e.clientX-r.left)*640/r.width, y = (e.clientY-r.top)*360/r.height;
+  if (x >= 230 && x <= 410 && y >= 130 && y <= 220) {
+    await record('canvas_confirm', true); show('Canvas confirmed');
+  }
+};"""
+    return ("<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{title}</title><style>{STYLE}</style></head><body><main>"
+            + bodies[name] + '<p id="result" role="status"></p></main><script>'
+            + _QUALITY_SCRIPT + scripts + '</script></body></html>')
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AxisPocFixture/1.0"
 
@@ -735,6 +860,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         path = urlparse(self.path).path
+        if path.startswith("/eval/"):
+            state = getattr(self.server, "quality_state", None)
+            if state is None:
+                state = self.server.quality_state = QualityState("manual")
+            if path == "/eval/state":
+                self._send_json(state.snapshot())
+                return
+            state.visit(self.path)
+            if path == "/eval/unavailable":
+                self._send_json({"error": "AXIS fixture unavailable"}, status=503)
+                return
+            if path == "/eval/axis-eval-report.csv":
+                state.action("download", True)
+                body = b"product,price\nAlpha,31.50\nBeta,24.25\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv")
+                self.send_header("Content-Disposition", 'attachment; filename="axis-eval-report.csv"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            name = path.removeprefix("/eval/")
+            html = quality_page(name)
+            if name == "report" and parse_qs(urlparse(self.path).query).get("case") != ["Exact-42"]:
+                html = None
+            self._send_html(html or "<h1>404 Not Found</h1>", status=200 if html else 404)
+            return
         if path == "/api/ping":
             self._send_json({"status": "ok", "ts": time.time()})
             return
@@ -755,6 +907,21 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", "0") or "0")
         body = self.rfile.read(length) if length else b""
+
+        if path == "/eval/action":
+            state = getattr(self.server, "quality_state", None)
+            try:
+                data = json.loads(body)
+                action = data["action"]
+                if state is None or action not in {"country", "continue", "diagnostics", "settings", "compact",
+                                                   "advance", "finish", "canvas_confirm"}:
+                    raise ValueError("unknown action")
+                state.action(action, data.get("value"))
+            except (ValueError, KeyError, TypeError):
+                self._send_json({"error": "invalid fixture action"}, status=400)
+                return
+            self._send_json({"ok": True})
+            return
 
         if path == "/api/upload":
             content_type = self.headers.get("Content-Type", "")

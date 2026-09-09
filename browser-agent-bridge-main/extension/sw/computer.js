@@ -7,7 +7,8 @@ export function createComputerHandlers({
   cdp,
   indicatorSet,
   recordAction,
-  keyboardDispatcher
+  keyboardDispatcher,
+  validateVisualAction = async () => {}
 }) {
   async function computerClick(params) {
     const tabId = assertTabId(params.tabId);
@@ -16,6 +17,7 @@ export function createComputerHandlers({
     const x = assertNumber(params.x, 'x');
     const y = assertNumber(params.y, 'y');
     const button = params.button || 'left';
+    await validateVisualAction(tabId, params);
     await cdp(tabId, 'Input.dispatchMouseEvent', {
       type: 'mousePressed',
       x,
@@ -47,6 +49,7 @@ export function createComputerHandlers({
     const toY = assertNumber(params.toY, 'toY');
     const button = params.button || 'left';
     const steps = Number.isInteger(params.steps) && params.steps > 0 ? params.steps : 12;
+    await validateVisualAction(tabId, params);
     await cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: fromX, y: fromY, button, clickCount: 1 });
     for (let i = 1; i <= steps; i += 1) {
       const t = i / steps;
@@ -71,6 +74,7 @@ export function createComputerHandlers({
     await assertTabAllowed(tabId, 'computer.type');
     assertString(params.text, 'text');
     await attachDebugger(tabId);
+    await validateVisualAction(tabId, params);
     await keyboardDispatcher.typeText(tabId, params.text, params);
     await recordAction(tabId, 'computer.type', { text: params.text });
     return { ok: true };
@@ -81,6 +85,7 @@ export function createComputerHandlers({
     await assertTabAllowed(tabId, 'computer.key');
     assertString(params.key, 'key');
     await attachDebugger(tabId);
+    await validateVisualAction(tabId, params);
     await keyboardDispatcher.press(tabId, params.key, params);
     await recordAction(tabId, 'computer.key', { key: params.key });
     return { ok: true };
@@ -94,6 +99,7 @@ export function createComputerHandlers({
     const y = typeof params.y === 'number' ? params.y : 400;
     const deltaX = typeof params.deltaX === 'number' ? params.deltaX : 0;
     const deltaY = typeof params.deltaY === 'number' ? params.deltaY : 500;
+    await validateVisualAction(tabId, params);
     await cdp(tabId, 'Input.dispatchMouseEvent', {
       type: 'mouseWheel',
       x,
@@ -111,6 +117,7 @@ export function createComputerHandlers({
     await attachDebugger(tabId);
     const x = assertNumber(params.x, 'x');
     const y = assertNumber(params.y, 'y');
+    await validateVisualAction(tabId, params);
     await cdp(tabId, 'Input.dispatchMouseEvent', {
       type: 'mouseMoved',
       x,

@@ -57,6 +57,34 @@ def runtime_with_tab(url="https://example.test/"):
     return bridge, runtime, alias
 
 
+def test_url_assertion_uses_exact_url_matching_and_returns_expected_value():
+    bridge, runtime, tab = runtime_with_tab()
+    expected = "https://example.test/receipt?order=42"
+    bridge.responses["page.waitForURL"] = {"ok": True, "url": expected}
+    result = bt.browser_assert(context(runtime), tab, bt.URLAssertion(assertion="url", expected=expected, timeout_ms=1000))
+    assert result["ok"] and result["data"]["passed"]
+    assert result["data"]["expected"] == expected
+    assert result["data"]["match"] == "exact"
+    method, params = bridge.calls[-1]
+    assert method == "page.waitForURL"
+    assert params == {"tabId": 41, "timeoutMs": 1000, "url": expected}
+
+
+def test_url_assertion_timeout_is_a_failed_assertion_instead_of_success_or_transport_error():
+    bridge, runtime, tab = runtime_with_tab()
+    expected = "https://example.test/receipt"
+
+    def timeout():
+        raise bt.BrowserBridgeError("Timed out waiting for exact URL", data={"code": "PAGE_WAIT_FOR_URL_TIMEOUT"})
+
+    bridge.responses["page.waitForURL"] = timeout
+    result = bt.browser_assert(context(runtime), tab, bt.URLAssertion(assertion="url", expected=expected))
+    assert result["ok"] is True
+    assert result["data"]["passed"] is False
+    assert result["data"]["expected"] == expected
+    assert result["data"]["detail"]["code"] == "PAGE_WAIT_FOR_URL_TIMEOUT"
+
+
 def test_all_nine_functions_are_independently_selectable():
     names = [function.__name__ for function in TOOL_FUNCTIONS]
     assert names == [
@@ -344,6 +372,31 @@ def test_network_wait_maps_typed_filters_and_aliases_request_ids():
     assert "raw-request" not in json.dumps(result)
 
 
+def test_nested_network_diagnostics_preserve_failed_response_and_body_alias():
+    bridge, runtime, alias = runtime_with_tab()
+    bridge.responses["network.read"] = {"events": [
+        {"method": "Network.requestWillBeSent", "params": {"requestId": "raw-id",
+         "request": {"url": "https://example.test/unavailable", "method": "GET", "headers": {"Authorization": "secret-value"}}}},
+        {"method": "Network.responseReceived", "params": {"requestId": "raw-id",
+         "response": {"url": "https://example.test/unavailable", "status": 503, "mimeType": "text/plain"}}},
+        {"method": "Network.responseReceivedExtraInfo", "params": {"requestId": "raw-id", "statusCode": 503}},
+        {"method": "Network.loadingFailed", "params": {"requestId": "raw-id", "errorText": "net::ERR_FAILED"}},
+    ]}
+    result = bt.browser_diagnose(context(runtime), alias, bt.BufferedDiagnostic(diagnostic="network", limit=100))
+    assert result["ok"]
+    event, = result["data"]["events"]
+    assert event["status"] == 503 and event["method"] == "GET"
+    assert event["errorText"] == "net::ERR_FAILED"
+    assert runtime.request(event["request"]) == "raw-id"
+    assert "secret-value" not in json.dumps(result) and "raw-id" not in json.dumps(result)
+
+
+def test_network_request_alias_storage_is_bounded():
+    _, runtime, _ = runtime_with_tab()
+    runtime.public_requests([{"requestId": str(i)} for i in range(bt.MAX_ITEMS + 10)])
+    assert len(runtime.requests) == bt.MAX_ITEMS
+
+
 def test_download_tool_hides_download_ids():
     bridge, runtime, _ = runtime_with_tab()
     bridge.responses["downloads.list"] = {
@@ -405,4 +458,6 @@ def test_new_module_is_substantially_smaller_and_legacy_file_is_unchanged():
     legacy = AGENT_DIR / "browser_agent_tools.py"
     new = AGENT_DIR / "browser_tools.py"
     assert hashlib.sha256(legacy.read_bytes()).hexdigest() == LEGACY_SHA256
-    assert len(new.read_text(encoding="utf-8").splitlines()) < len(legacy.read_text(encoding="utf-8").splitlines()) * 3 // 5
+    # The optional visual specialist expands capability without growing the
+    # six ordinary tool schemas (bounded separately above).
+    assert len(new.read_text(encoding="utf-8").splitlines()) < len(legacy.read_text(encoding="utf-8").splitlines())

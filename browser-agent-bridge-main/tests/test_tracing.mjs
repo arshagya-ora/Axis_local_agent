@@ -74,6 +74,18 @@ test('trace records the structured error code and diagnostic', async () => {
   assert.equal(event.errorData.diagnostic.count, 3);
 });
 
+test('model-facing screenshots never persist image bytes even with full trace results', async () => {
+  const handlers = await makeHandlers();
+  await handlers.traceStart({ name: 'vision', includeResults: true, includeText: true });
+  const request = { method: 'page.screenshot', id: 'image', params: { tabId: 7, modelFacing: true } };
+  const token = await handlers.traceRpcStart(request);
+  await handlers.traceRpcEnd(token, request, { dataUrl: 'data:image/png;base64,c2VjcmV0', screenshotId: 'shot-1', image: { width: 800, height: 600 } });
+  const exported = await handlers.traceExport();
+  assert.equal(JSON.stringify(exported).includes('c2VjcmV0'), false);
+  assert.equal(exported.trace.events[0].result.screenshotId, 'shot-1');
+  assert.equal('dataUrl' in exported.trace.events[0].result, false);
+});
+
 test('traceStatus reports an errorCount', async () => {
   const handlers = await makeHandlers();
   await handlers.traceStart({ name: 'checkout' });

@@ -8,15 +8,81 @@ the bridge's ~150-method raw JSON-RPC surface.
 
 The AXIS planner/navigator runtime imports `browser_tools.py`. It keeps six
 semantic tools eager (`tabs`, `observe`, `act`, `navigate`, `wait`, `assert`),
-progressively adds evidence, diagnostics, and downloads only when relevant,
+progressively adds evidence, diagnostics, downloads, and visual recovery when relevant,
 and keeps capability negotiation, site-pattern lookup, popup registration, and
 debug recording/tracing inside `BrowserRuntime`. Setup, running, and evaluation
 instructions live in the [root README](../README.md); the runtime's own
 configurable values are documented inline in [axis.yaml](axis.yaml).
 
-The remainder of this README documents `browser_agent_tools.py`, the older
-eight-tool compatibility layer and its legacy tests. The active AXIS runtime
-does not load or require browser-contract snapshot files.
+### Active runtime behavior
+
+The planner declares a goal's expected result with `PlanDecision.verification`
+(`GoalCheck`). After a page-state mutation, a matching passing `browser_assert` on the
+affected tab must occur before the goal completes. Assertions retain their
+locator identity, goal, and action sequence. Observations alone do not clear
+pending changes. Runtime evidence carries IDs and source URLs; navigator prose
+alone cannot prove required text or a visited URL. A download goal instead uses
+completed-download evidence matching its declared filename or URL within the
+current task's download window to verify the triggering action.
+
+Both agents receive retained source facts: extracted scalars and structured
+values, source URL, tab, goal, target, and evidence ID. Repeated reads from the
+same source and target are deduplicated. At most 16 entries and 32,000 characters
+of values are retained, with explicit truncation and priority for extractions
+and completed goals. `/continue <follow-up>` retains this context; `/new <task>`
+starts independent task memory. Plain interactive replies continue only while
+paused or waiting for user input; otherwise they start a new task.
+
+`run.visual_mode: auto` enables on-demand image input when the navigator reports
+insufficient DOM information or repeated recoverable targeting failures occur.
+The optional `browser_visual` tool captures images and supports click, drag,
+hover, scroll, and type; keyboard presses still use the ordinary action tool.
+Images reach the model as pixels, bounded to 1,600 pixels on their longest edge.
+Coordinate actions require the newest screenshot for that tab and unchanged
+viewport, URL, and scroll state, and consume the screenshot after use. Existing
+firewall, approval, cancellation, mutation, and budget gates still apply.
+
+`browser.allow_coordinate_fallback: true` now enables those coordinate actions
+during visual recovery; `false` allows visual reading only. `--visual-mode off`
+overrides configuration to disable visual recovery. Automatic image bytes stay
+out of task memory, debug events, and persisted evaluation reports. Requested
+artifact captures use the separate `browser_capture_evidence` tool. A provider
+that explicitly rejects image input before any tool executes disables vision
+for that run and receives one text-only retry.
+
+Planner cadence starts at three navigator steps and can extend to six while
+fresh evidence shows progress (`run.planner_interval_steps` and
+`run.planner_max_interval_steps`). Set both to three for fixed cadence.
+Completion, blockers, verification failures, unknown outcomes, and follow-ups
+still trigger replanning. Progress compares meaningful page content and action
+results, ignoring regenerated reference IDs; missing change metadata is
+unknown rather than evidence of failure. Results include input/output token
+totals alongside action, request, and timing counts.
+
+### Executable workflow evaluations
+
+```bash
+uv run python -m evals.run --preflight
+uv run python -m evals.run --repeat 3
+uv run python -m evals.run --case canvas_interaction --config axis.yaml
+```
+
+Run these commands from `axis-agent`. The default evaluates all 12 cases three
+times sequentially, with fresh loopback origins and task-owned tabs. Independent
+fixture state, browser reads, and submission counters determine success and
+detect false completion and duplicate actions. Reports include latency, model
+requests, browser actions, and input/output tokens. Unavailable bridge/provider
+prerequisites are separate from task failures. `--judge` optionally adds a lazy
+model judge; it never replaces deterministic checks. Reports live under ignored
+`evals/results/` by default. See [evals/README.md](evals/README.md) for details.
+
+### Frozen compatibility reference
+
+The remainder of this README documents the **frozen** `browser_agent_tools.py`,
+the older eight-tool compatibility layer and its legacy tests. Its contracts,
+coordinate restrictions, and managed-tab binding behavior are preserved; the
+active runtime changes above do not apply to that module. The active AXIS
+runtime does not load or require browser-contract snapshot files.
 
 ```
 axis-agent/

@@ -10,14 +10,17 @@ from __future__ import annotations
 import base64
 import fnmatch
 import json
+import math
 import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pydantic_ai import RunContext
+from pydantic_ai import BinaryContent, RunContext
 
 from browser_bridge_client import BrowserBridgeClient, BrowserBridgeError
 
@@ -42,7 +45,7 @@ _SENSITIVE = re.compile(
     re.IGNORECASE,
 )
 _INTERNAL_KEYS = {
-    "tabId", "windowId", "groupId", "sessionId", "snapshotId", "frameId", "parentFrameId", "processId",
+    "tabId", "windowId", "groupId", "sessionId", "snapshotId", "screenshotId", "frameId", "parentFrameId", "processId",
     "targetId", "loaderId", "executionContextId", "traceId", "requestId",
 }
 _REF_LINE = re.compile(r"^\[f(\d+):([^\]]+)\](.*)$")
@@ -83,6 +86,7 @@ _ALLOWED_METHODS = frozenset({
     "console.read", "network.read", "network.getResponseBody", "trace.status",
     "downloads.list", "downloads.waitFor",
     "recording.start", "recording.stop", "recording.status", "recording.export", "recording.clear",
+    "page.visualState", "computer.click", "computer.drag", "computer.hover", "computer.scroll", "computer.type",
 })
 _ALLOWED_NATIVE_METHODS = frozenset({"native.saveDataUrl"})
 
@@ -364,6 +368,7 @@ WaitCommand = Annotated[ElementWait | ValueWait | RequestWait | ResponseWait | E
 class StateAssertion(Command):
     assertion: Literal["visible", "hidden", "enabled", "disabled", "editable", "checked"]
     locator: Locator
+    expected: bool = True
     timeout_ms: Timeout = DEFAULT_ACTION_TIMEOUT_MS
 
 
@@ -412,9 +417,15 @@ class AriaAssertion(Command):
     timeout_ms: Timeout = DEFAULT_ACTION_TIMEOUT_MS
 
 
+class URLAssertion(Command):
+    assertion: Literal["url"]
+    expected: NonEmpty
+    timeout_ms: Timeout = DEFAULT_ACTION_TIMEOUT_MS
+
+
 AssertCommand = Annotated[
     StateAssertion | ValueAssertion | TextAssertion | CountAssertion |
-    AttributeAssertion | TitleAssertion | AriaAssertion,
+    AttributeAssertion | TitleAssertion | AriaAssertion | URLAssertion,
     Field(discriminator="assertion"),
 ]
 
@@ -507,6 +518,51 @@ class WaitForDownload(Command):
 DownloadCommand = Annotated[ListDownloads | WaitForDownload, Field(discriminator="operation")]
 
 
+# browser_visual is disclosed only when DOM targeting needs visual recovery.
+ImageCoordinate = Annotated[float, Field(ge=0, le=1_600, allow_inf_nan=False)]
+
+
+class VisualCapture(Command):
+    operation: Literal["capture"]
+
+
+class VisualPoint(Command):
+    operation: Literal["click", "hover"]
+    screenshot: NonEmpty
+    x: ImageCoordinate
+    y: ImageCoordinate
+
+
+class VisualDrag(Command):
+    operation: Literal["drag"]
+    screenshot: NonEmpty
+    x: ImageCoordinate
+    y: ImageCoordinate
+    end_x: ImageCoordinate
+    end_y: ImageCoordinate
+
+
+class VisualScroll(Command):
+    operation: Literal["scroll"]
+    screenshot: NonEmpty
+    x: ImageCoordinate
+    y: ImageCoordinate
+    delta_x: ScrollDelta = 0
+    delta_y: ScrollDelta = 0
+
+
+class VisualType(Command):
+    operation: Literal["type"]
+    screenshot: NonEmpty
+    value: str
+
+
+VisualCommand = Annotated[
+    VisualCapture | VisualPoint | VisualDrag | VisualScroll | VisualType,
+    Field(discriminator="operation"),
+]
+
+
 @dataclass
 class TabState:
     raw_id: int
@@ -520,6 +576,16 @@ class TabState:
 class Observation:
     snapshot: str | None
     refs: dict[str, tuple[int, str]] = field(default_factory=dict)
+
+
+@dataclass(repr=False)
+class _VisualScreenshot:
+    alias: str
+    tab: str
+    bridge_id: str
+    state: dict[str, Any]
+    image: dict[str, int]
+    content: BinaryContent
 
 
 class ToolFault(RuntimeError):
@@ -640,6 +706,7 @@ class BrowserRuntime:
         deny_schemes: tuple[str, ...] = ("chrome", "chrome-extension", "devtools", "javascript"),
         allow_methods: tuple[str, ...] = ("*",),
         deny_methods: tuple[str, ...] = (),
+        allow_coordinate_fallback: bool = False,
     ):
         self.client = client
         self.max_tabs = max_tabs
@@ -652,6 +719,9 @@ class BrowserRuntime:
         self.deny_schemes = tuple(s.lower() for s in deny_schemes)
         self.allow_methods = allow_methods
         self.deny_methods = deny_methods
+        self.allow_coordinate_fallback = allow_coordinate_fallback
+        self.visual_enabled = False
+        self.task_started_wallclock = time.time()
         self.tabs: dict[str, TabState] = {}
         self.observations: dict[str, Observation] = {}
         self.issued_refs: dict[str, str] = {}
@@ -669,6 +739,25 @@ class BrowserRuntime:
         self._evidence_number = 0
         self.debug_recording: str | None = None
         self.debug_trace: str | None = None
+        self._visual_screenshot: _VisualScreenshot | None = None
+        self._visual_number = 0
+        self._observation_text: dict[str, str] = {}
+
+    def invalidate_visual(self, tab: str | None = None) -> None:
+        """Discard private pixels and the one-use coordinate lease."""
+        if self._visual_screenshot and (tab is None or self._visual_screenshot.tab == tab):
+            self._visual_screenshot = None
+
+    def visual_content(self, screenshot: str) -> BinaryContent:
+        """Return pixels only to trusted model-message assembly, never tool JSON."""
+        current = self._visual_screenshot
+        if not self.visual_enabled or current is None or current.alias != screenshot:
+            raise ToolFault("STALE_SCREENSHOT", "Capture a fresh screenshot before using visual input.", True)
+        return current.content
+
+    @staticmethod
+    def _normalized_observation(snapshot: str) -> str:
+        return " ".join(re.sub(r"\[(?:ref_\d+|f\d+:[^\]]+)\]", "[element]", snapshot).split())
 
     @staticmethod
     def _matches(value: str, patterns: tuple[str, ...]) -> bool:
@@ -729,6 +818,14 @@ class BrowserRuntime:
                     True,
                 ) from exc
             text = _safe_bridge_message(raw_text)
+            # These are the bridge's explicit pre-dispatch policy messages.
+            # Preserve denials as denials: classifying them as an unknown input
+            # outcome could incorrectly activate coordinate recovery.
+            if re.match(r"^Permission denied by user(?: for this session)?:", raw_text):
+                raise ToolFault("APPROVAL_DENIED", text, False, data) from exc
+            if (raw_text.startswith("Access denied:") or raw_text.startswith("Method blocked by policy:")
+                    or raw_text.startswith(f"{method} blocked by policy for ")):
+                raise ToolFault("FIREWALL_DENIED", text, False, data) from exc
             if bridge_code in _ASSERTION_MISMATCH or re.search(
                 r"timed out waiting for locator .* to be (attached|visible|hidden|detached)", text, re.IGNORECASE,
             ):
@@ -814,6 +911,7 @@ class BrowserRuntime:
 
     def invalidate(self, tab: str) -> None:
         self.observations.pop(tab, None)
+        self.invalidate_visual(tab)
 
     def observe_refs(self, tab: str, snapshot: str, snapshot_id: str | None) -> tuple[str, bool]:
         refs: dict[str, tuple[int, str]] = {}
@@ -856,7 +954,7 @@ class BrowserRuntime:
         if mode == "compact":
             params.update(format="compact", maxNodes=max_nodes)
         result = self._rpc(methods[mode], params, tab=tab) or {}
-        self.invalidate(tab)
+        self.observations.pop(tab, None)
         if mode == "compact":
             snapshot, truncated = self.observe_refs(tab, result.get("snapshot", ""), result.get("snapshotId"))
         else:
@@ -872,6 +970,14 @@ class BrowserRuntime:
         x, y = scroll.get("x", scroll.get("scrollX")), scroll.get("y", scroll.get("scrollY"))
         if isinstance(x, (int, float)) or isinstance(y, (int, float)):
             data["scroll"] = {"x": x, "y": y}
+        normalized = self._normalized_observation(snapshot)
+        visual = self._visual_screenshot
+        if visual is not None and visual.tab == tab:
+            previous = self._observation_text.get(tab)
+            if (previous is None or previous != normalized or visual.state["url"] != state.url
+                    or ("scroll" in data and data["scroll"] != visual.state["scroll"])):
+                self.invalidate_visual(tab)
+        self._observation_text[tab] = normalized
         pattern = self.site_pattern_for(state.url)
         if pattern:
             content = pattern.get("content", "")
@@ -1044,11 +1150,27 @@ class BrowserRuntime:
 
     def public_requests(self, events: list[Any]) -> list[Any]:
         public: list[Any] = []
+        grouped: dict[str, dict[str, Any]] = {}
         for raw in events:
             if not isinstance(raw, dict):
                 public.append(raw)
                 continue
             event = dict(raw)
+            # CDP emits several deeply nested events per request. Keep the
+            # useful request outcome together, without verbose headers/stacks.
+            nested = isinstance(raw.get("params"), dict) and str(raw.get("method", "")).startswith("Network.")
+            if nested:
+                params = raw["params"]
+                event = {key: params[key] for key in
+                         ("requestId", "errorText", "canceled", "blockedReason", "encodedDataLength") if key in params}
+                for part in (params.get("request", {}), params.get("response", {})):
+                    if isinstance(part, dict):
+                        event.update({key: part[key] for key in
+                                      ("url", "method", "status", "statusText", "mimeType", "fromDiskCache") if key in part})
+                if "statusCode" in params:
+                    event["status"] = params["statusCode"]
+                if isinstance(event.get("url"), str):
+                    event["url"] = self.safe_url(event["url"])
             bridge_id = event.pop("requestId", None)
             if isinstance(bridge_id, str):
                 alias = next((a for a, value in self.requests.items() if value == bridge_id), None)
@@ -1056,7 +1178,16 @@ class BrowserRuntime:
                     self._request_number += 1
                     alias = f"request_{self._request_number}"
                     self.requests[alias] = bridge_id
+                    if len(self.requests) > MAX_ITEMS:
+                        del self.requests[next(iter(self.requests))]
                 event["request"] = alias
+                if nested:
+                    if bridge_id in grouped:
+                        grouped[bridge_id].update(event)
+                        continue
+                    grouped[bridge_id] = event
+            if nested and not bridge_id:
+                continue
             public.append(event)
         return public
 
@@ -1150,7 +1281,7 @@ def browser_observe(
             if not attribute:
                 raise ToolFault("INVALID_ARGUMENT", "Attribute extraction requires attribute.")
             params["name"] = attribute
-        result = rt._rpc(methods[extract], params, tab=tab) or {}
+        result = rt._rpc(methods[extract], params, tab=tab)
         return _ok(tab, {"mode": "locator", "extract": extract, "result": result})
     except ToolFault as fault:
         return _error(tab, fault)
@@ -1242,6 +1373,7 @@ def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: ActComm
             params = {"tabId": state.raw_id}
             if command.action == "accept_dialog" and command.prompt_text is not None:
                 params["promptText"] = command.prompt_text
+        rt.invalidate_visual(tab)
         result = rt._rpc(method, params, tab=tab) or {}
         changed, popup_aliases = _public_action_change(rt, result.get("whatChanged"))
         invalidated = isinstance(changed, dict) and changed.get("urlChanged") is True
@@ -1278,6 +1410,7 @@ def browser_navigate(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Na
         target_url = command.url if isinstance(command, Open) else None
         if target_url:
             params["url"] = target_url
+        rt.invalidate_visual(tab)
         result = rt._rpc(methods[command.operation], params, tab=tab, url=target_url) or {}
         raw_tab = result.get("tab") if isinstance(result.get("tab"), dict) else {}
         state.url = raw_tab.get("url", target_url or state.url)
@@ -1286,6 +1419,112 @@ def browser_navigate(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Na
         return _ok(tab, {
             "operation": command.operation, "url": rt.safe_url(state.url), "title": state.title,
             "whatChanged": result.get("whatChanged"), "refsInvalidated": True,
+        })
+    except ToolFault as fault:
+        return _error(tab, fault)
+
+
+def _visual_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate the bridge's visual lease before retaining any pixels."""
+    viewport, scroll, dimensions = (result.get(key) for key in ("viewport", "scroll", "image"))
+    if not all(isinstance(value, dict) for value in (viewport, scroll, dimensions)):
+        raise ToolFault("VISUAL_METADATA_MISSING", "Reload the bridge: screenshots need viewport and image metadata.")
+    for key in ("width", "height"):
+        if (not isinstance(viewport.get(key), (int, float)) or isinstance(viewport.get(key), bool)
+                or not math.isfinite(viewport[key]) or viewport[key] <= 0):
+            raise ToolFault("VISUAL_METADATA_INVALID", "The screenshot viewport is invalid.")
+        if (not isinstance(dimensions.get(key), int) or isinstance(dimensions.get(key), bool)
+                or not 0 < dimensions[key] <= 1_600):
+            raise ToolFault("VISUAL_METADATA_INVALID", "Model screenshots must be bounded to 1,600 pixels.")
+    if any(not isinstance(scroll.get(key), (int, float)) or isinstance(scroll.get(key), bool)
+           or not math.isfinite(scroll[key]) for key in ("x", "y")):
+        raise ToolFault("VISUAL_METADATA_INVALID", "The screenshot scroll position is invalid.")
+    if not isinstance(result.get("url"), str) or not isinstance(result.get("screenshotId"), str) or not result["screenshotId"]:
+        raise ToolFault("VISUAL_METADATA_MISSING", "The bridge did not issue a usable screenshot lease.")
+    return {"url": result["url"], "viewport": viewport, "scroll": scroll}
+
+
+def _image_point(screenshot: _VisualScreenshot, x: float, y: float) -> tuple[float, float]:
+    if not (math.isfinite(x) and math.isfinite(y) and 0 <= x < screenshot.image["width"]
+            and 0 <= y < screenshot.image["height"]):
+        raise ToolFault("INVALID_ARGUMENT", "Coordinates must be inside the latest screenshot image.")
+    viewport = screenshot.state["viewport"]
+    return x * viewport["width"] / screenshot.image["width"], y * viewport["height"] / screenshot.image["height"]
+
+
+def browser_visual(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: VisualCommand) -> dict[str, Any]:
+    """Recover from insufficient DOM targeting using a fresh image and one bounded interaction.
+
+    Coordinates are pixels in the returned image. Each interaction consumes its
+    screenshot; capture again before another visual interaction. Type enters
+    text into the currently focused control; use browser_act for keyboard keys.
+    """
+    rt = ctx.deps
+    try:
+        state = rt.tab(tab)
+        if not rt.visual_enabled:
+            raise ToolFault("VISUAL_DISABLED", "Visual recovery has not been enabled for this run.")
+        if isinstance(command, VisualCapture):
+            rt.invalidate_visual()
+            result = rt._rpc("page.screenshot", {"tabId": state.raw_id, "modelFacing": True}, tab=tab) or {}
+            metadata = _visual_metadata(result)
+            if result.get("tabId") != state.raw_id:
+                raise ToolFault("VISUAL_METADATA_INVALID", "The screenshot belongs to a different tab.")
+            if not rt._url_allowed(metadata["url"]):
+                raise ToolFault("FIREWALL_DENIED", "The screenshot URL is blocked by browser policy.")
+            data_url = result.get("dataUrl", "")
+            if not isinstance(data_url, str) or not re.match(r"^data:image/(png|jpeg|webp);base64,", data_url):
+                raise ToolFault("VISUAL_IMAGE_INVALID", "The bridge did not return a supported image.")
+            header, encoded = data_url.split(",", 1)
+            try:
+                pixels = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ToolFault("VISUAL_IMAGE_INVALID", "The bridge returned malformed image content.") from exc
+            if not pixels or len(pixels) > 16_000_000:
+                raise ToolFault("VISUAL_IMAGE_INVALID", "The screenshot image is empty or too large.")
+            rt._visual_number += 1
+            alias = f"screenshot_{rt._visual_number}"
+            rt._visual_screenshot = _VisualScreenshot(
+                alias, tab, result["screenshotId"], {"tabId": state.raw_id, **metadata}, result["image"],
+                BinaryContent(data=pixels, media_type=header[5:].split(";", 1)[0]),
+            )
+            state.url = metadata["url"]
+            return _ok(tab, {
+                "operation": "capture", "screenshot": alias, "url": rt.safe_url(state.url),
+                "viewport": metadata["viewport"], "scroll": metadata["scroll"], "image": result["image"],
+            })
+        if not rt.allow_coordinate_fallback:
+            raise ToolFault("COORDINATE_FALLBACK_DISABLED", "Coordinate interaction is disabled by configuration.")
+        screenshot = rt._visual_screenshot
+        if screenshot is None or screenshot.alias != command.screenshot or screenshot.tab != tab:
+            raise ToolFault("STALE_SCREENSHOT", "Capture this tab again before a coordinate interaction.", True)
+        method = f"computer.{command.operation}"
+        params: dict[str, Any] = {
+            "tabId": state.raw_id, "screenshotId": screenshot.bridge_id, "expectedVisualState": screenshot.state,
+        }
+        if isinstance(command, VisualType):
+            params["text"] = command.value
+        else:
+            x, y = _image_point(screenshot, command.x, command.y)
+            if isinstance(command, VisualDrag):
+                end_x, end_y = _image_point(screenshot, command.end_x, command.end_y)
+                params.update(fromX=x, fromY=y, toX=end_x, toY=end_y)
+            else:
+                params.update(x=x, y=y)
+                if isinstance(command, VisualScroll):
+                    params.update(deltaX=command.delta_x, deltaY=command.delta_y)
+        # Consume locally before dispatch, including when input has an unknown
+        # outcome. The bridge independently checks live URL/viewport/scroll and
+        # consumes its own lease immediately before sending the actual input.
+        rt.invalidate(tab)
+        result = rt._rpc(method, params, tab=tab) or {}
+        changed, opened_tabs = _public_action_change(rt, result.get("whatChanged"))
+        if isinstance(changed, dict) and changed.get("urlChanged"):
+            state.url = changed.get("toUrl", state.url)
+        rt.note_ui_success(tab)
+        return _ok(tab, {
+            "operation": command.operation, "screenshot": command.screenshot, "screenshotConsumed": True,
+            "whatChanged": changed, "openedTabs": opened_tabs, "refsInvalidated": True,
         })
     except ToolFault as fault:
         return _error(tab, fault)
@@ -1374,12 +1613,19 @@ def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Asse
             "value": "expect.locator.toHaveValue", "text": "expect.locator.toHaveText",
             "count": "expect.locator.toHaveCount", "attribute": "expect.locator.toHaveAttribute",
             "title": "expect.page.toHaveTitle", "aria_snapshot": "expect.page.toMatchAriaSnapshot",
+            "url": "page.waitForURL",
         }
         params: dict[str, Any] = {"tabId": state.raw_id, "timeoutMs": command.timeout_ms}
         expected: Any = None
-        if not isinstance(command, (TitleAssertion, AriaAssertion)):
+        if not isinstance(command, (TitleAssertion, AriaAssertion, URLAssertion)):
             params.update(_locator_params(command.locator))
-        if isinstance(command, (ValueAssertion, TextAssertion)):
+        if isinstance(command, StateAssertion):
+            expected = command.expected
+            if command.assertion == "checked":
+                params["checked"] = command.expected
+            elif not command.expected:
+                raise ToolFault("INVALID_ARGUMENT", "Use the opposite state assertion (hidden/visible or disabled/enabled) for a negative check.")
+        elif isinstance(command, (ValueAssertion, TextAssertion)):
             expected = command.expected
             params["expected"] = expected
             if isinstance(command, TextAssertion) and command.contains:
@@ -1392,19 +1638,22 @@ def browser_assert(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Asse
         elif isinstance(command, AttributeAssertion):
             expected = command.expected
             params.update(attribute=command.attribute, expected=expected)
-        elif isinstance(command, (TitleAssertion, AriaAssertion)):
+        elif isinstance(command, (TitleAssertion, AriaAssertion, URLAssertion)):
             expected = command.expected
             if isinstance(command, TitleAssertion):
                 params["titleContains" if command.contains else "title"] = expected
+            elif isinstance(command, URLAssertion):
+                params["url"] = expected
             else:
                 params["expected"] = expected
         try:
             actual = rt._rpc(methods[command.assertion], params, tab=tab)
         except ToolFault as fault:
-            if fault.code != "ASSERTION_FAILED":
+            if fault.code not in {"ASSERTION_FAILED", "PAGE_WAIT_FOR_URL_TIMEOUT"}:
                 raise
             return _ok(tab, {"assertion": command.assertion, "passed": False, "expected": expected, "detail": fault.detail})
-        return _ok(tab, {"assertion": command.assertion, "passed": True, "expected": expected, "actual": actual})
+        return _ok(tab, {"assertion": command.assertion, "passed": True, "expected": expected, "actual": actual,
+                         "match": "regex" if getattr(command, "regex", False) else "contains" if getattr(command, "contains", False) else "exact"})
     except ToolFault as fault:
         return _error(tab, fault)
 
@@ -1517,11 +1766,51 @@ def browser_diagnose(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: Di
 def _public_download(rt: BrowserRuntime, item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
         return {}
-    return {
+    result = {
         key: rt.safe_url(value) if key in {"url", "finalUrl"} and isinstance(value, str) else value
         for key, value in item.items()
         if key != "id"
     }
+    started = _download_started(item)
+    result["taskEligible"] = started is not None and started >= rt.task_started_wallclock
+    return result
+
+
+def _download_started(item: Any) -> float | None:
+    if not isinstance(item, dict) or not isinstance(item.get("startTime"), str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(item["startTime"].replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.tzinfo is not None else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _download_matches(item: dict[str, Any], command: WaitForDownload) -> bool:
+    if command.state != "any" and item.get("state") != command.state:
+        return False
+    if command.state == "complete" and item.get("exists") is False:
+        return False
+    urls = [str(item.get(key) or "") for key in ("url", "finalUrl")]
+    filename = str(item.get("filename") or "")
+    if command.url and command.url not in urls:
+        return False
+    if command.url_contains and not any(command.url_contains in url for url in urls):
+        return False
+    if command.filename and filename != command.filename:
+        return False
+    if command.filename_contains and command.filename_contains not in filename:
+        return False
+    try:
+        if command.filename_regex and not re.search(command.filename_regex, filename):
+            return False
+        if command.url_regex and not any(re.search(command.url_regex, url) for url in urls):
+            return False
+    except re.error as exc:
+        raise ToolFault("INVALID_ARGUMENT", "Download regular expression is invalid.") from exc
+    if command.query and command.query.lower() not in " ".join([filename, *urls]).lower():
+        return False
+    return True
 
 
 def browser_downloads(ctx: RunContext[BrowserRuntime], command: DownloadCommand) -> dict[str, Any]:
@@ -1537,15 +1826,26 @@ def browser_downloads(ctx: RunContext[BrowserRuntime], command: DownloadCommand)
             mapping.get(key, key): value
             for key, value in command.model_dump(exclude={"operation"}, exclude_none=True).items()
         }
+        params["startedAfter"] = int(rt.task_started_wallclock * 1_000)
         method = "downloads.list" if isinstance(command, ListDownloads) else "downloads.waitFor"
         result = rt._rpc(method, params) or {}
         if isinstance(command, ListDownloads):
-            items = [_public_download(rt, item) for item in result.get("items", [])[:command.limit]]
+            items = [
+                _public_download(rt, item) for item in result.get("items", [])[:command.limit]
+                if isinstance(item, dict) and (
+                    _download_started(item) is None or _download_started(item) >= rt.task_started_wallclock
+                )
+            ]
             data = {"operation": "list", "items": items, "count": len(items)}
         else:
+            item = result.get("item")
+            started = _download_started(item)
+            if (not isinstance(item, dict) or started is None or started < rt.task_started_wallclock
+                    or not _download_matches(item, command)):
+                raise ToolFault("DOWNLOAD_NOT_MATCHED", "No matching download from the current task was returned.", True)
             data = {
                 "operation": "wait", "matched": True,
-                "download": _public_download(rt, result.get("item")),
+                "download": _public_download(rt, item),
                 "elapsedMs": result.get("elapsedMs"),
             }
         return _ok(None, data)
@@ -1558,4 +1858,5 @@ __all__ = [
     "browser_tabs", "browser_observe", "browser_act", "browser_navigate",
     "browser_wait", "browser_assert", "browser_capture_evidence", "browser_diagnose",
     "browser_downloads",
+    "browser_visual",
 ]

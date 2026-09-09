@@ -131,3 +131,49 @@ test('initDownloadEvents is a no-op when downloads API is unavailable', async ()
   const h = createDownloadsHandlers({ chromeApi: {} });
   assert.doesNotThrow(() => h.initDownloadEvents());
 });
+
+test('task start window accepts completed downloads begun before wait and excludes older items', async () => {
+  const { createDownloadsHandlers } = await importModule();
+  const taskStart = Date.now() - 10_000;
+  const { chromeApi, searchCalls } = makeChrome([
+    { ...FULL_ITEM, id: 1, startTime: new Date(taskStart - 1).toISOString() },
+    { ...FULL_ITEM, id: 2, startTime: new Date(taskStart + 1).toISOString() }
+  ]);
+  const h = createDownloadsHandlers({ chromeApi });
+  const res = await h.downloadsWaitFor({ startedAfter: taskStart, filenameContains: 'f.pdf' });
+  assert.equal(res.item.id, 2);
+  assert.equal(searchCalls.at(-1).startedAfter, new Date(taskStart).toISOString());
+  const list = await h.downloadsList({ startedAfter: new Date(taskStart).toISOString() });
+  assert.deepEqual(list.items.map(item => item.id), [2]);
+});
+
+test('task window takes precedence over includeExisting and rejects unknown timestamps', async () => {
+  const { createDownloadsHandlers } = await importModule();
+  const taskStart = Date.now();
+  const { chromeApi } = makeChrome([
+    { ...FULL_ITEM, startTime: new Date(taskStart - 1).toISOString() },
+    { ...FULL_ITEM, startTime: undefined }, { ...FULL_ITEM, startTime: 'invalid' }
+  ]);
+  const h = createDownloadsHandlers({ chromeApi });
+  await assert.rejects(() => h.downloadsWaitFor({ startedAfter: taskStart, includeExisting: true, timeoutMs: 5, intervalMs: 1 }), /Timed out/);
+  assert.deepEqual((await h.downloadsList({ startedAfter: taskStart })).items, []);
+});
+
+test('task window does not turn interrupted or absent downloads into successful completion', async () => {
+  const { createDownloadsHandlers } = await importModule();
+  for (const items of [[], [{ ...FULL_ITEM, state: 'interrupted' }]]) {
+    const { chromeApi } = makeChrome(items);
+    await assert.rejects(() => createDownloadsHandlers({ chromeApi }).downloadsWaitFor({ startedAfter: 0, timeoutMs: 5, intervalMs: 1 }), /Timed out/);
+  }
+});
+
+test('invalid task start time is rejected before querying downloads', async () => {
+  const { createDownloadsHandlers } = await importModule();
+  const { chromeApi, searchCalls } = makeChrome([]);
+  const h = createDownloadsHandlers({ chromeApi });
+  for (const startedAfter of ['bad', -1, {}, Infinity]) {
+    await assert.rejects(() => h.downloadsList({ startedAfter }), /startedAfter/);
+    await assert.rejects(() => h.downloadsWaitFor({ startedAfter }), /startedAfter/);
+  }
+  assert.equal(searchCalls.length, 0);
+});

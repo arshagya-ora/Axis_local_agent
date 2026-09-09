@@ -17,9 +17,9 @@ browser:
   # needs. Raise it if you regularly run with many tabs open.
   max_open_tabs: 60
   allow_response_body: false
-  # Recorded for forward-compatibility only: no tool schema in this layer
-  # accepts coordinates, so this has no effect yet (see browser_tools.py).
-  allow_coordinate_fallback: false
+  # Coordinate actions are available only during visual recovery and always
+  # require the latest screenshot. Set false to allow visual reading only.
+  allow_coordinate_fallback: true
   # Where browser_capture_evidence writes artifacts; null = the bridge default.
   artifact_directory: null
   # Directories locator uploads may read from. Empty = uploads are refused.
@@ -66,6 +66,9 @@ run:
   # Planner cadence: one planner pass every N navigator steps, plus every
   # event listed in the orchestrator (goal reached, blocked, follow-up, ...).
   planner_interval_steps: 3
+  # Extend successful execution up to this interval; set equal to the base
+  # interval above for fixed planner cadence.
+  planner_max_interval_steps: 6
   # Browser tool calls the navigator may make inside one navigator step.
   max_actions_per_step: 3
   max_total_steps: 30
@@ -75,9 +78,10 @@ run:
   # Observation taken programmatically before every navigator step.
   observation_mode: compact
   observation_max_nodes: 1000
-  # Screenshots are off by default: only the safe evidence alias would ever
-  # reach the model, and the capture still costs a bridge round trip.
+  # Force images every step. Normally automatic recovery requests them only
+  # when the DOM view is insufficient. Images are not persisted by default.
   include_screenshot: false
+  visual_mode: auto
   tool_timeout_seconds: 120.0
 
 tools:
@@ -102,7 +106,7 @@ memory:
   max_recent_actions: 8
   max_completed_goals: 8
   max_followups: 5
-  max_extracted_data: 8
+  max_extracted_data: 16
 
 # Where each Pydantic AI AgentSpec is defined (loaded with Agent.from_file);
 # this file only points at them. Relative to this file's directory.

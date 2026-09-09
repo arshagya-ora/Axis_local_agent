@@ -175,7 +175,12 @@ export function createTraceHandlers({
       event.params = sanitizeForTrace(request.params, trace);
     }
     if (outcome.ok && trace.includeResults && outcome.result !== undefined) {
-      event.result = compactForTrace(outcome.result, trace);
+      // Model-only images must never enter persisted trace previews, even when
+      // the caller enabled full result/text recording.
+      const result = request?.method === 'page.screenshot' && request?.params?.modelFacing === true
+        ? Object.fromEntries(Object.entries(outcome.result).filter(([key]) => key !== 'dataUrl'))
+        : outcome.result;
+      event.result = compactForTrace(result, trace);
     }
     if (!outcome.ok) {
       event.error = errorMessage(outcome.error);

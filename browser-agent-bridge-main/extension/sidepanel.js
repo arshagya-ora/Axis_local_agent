@@ -204,7 +204,7 @@ function renderStatus(status) {
   const connected = status?.state === 'connected';
   const stopped = status?.state === 'stopped';
   latestBridgeEnabled = status?.bridgeEnabled === true;
-  statusEl.textContent = connected ? 'Connected' : stopped ? 'Stopped' : 'Disconnected';
+  statusEl.textContent = connected ? 'Connected' : stopped ? 'Stopped' : status?.state === 'connecting' ? 'Connecting' : 'Disconnected';
   statusEl.classList.toggle('connected', connected);
   statusEl.classList.toggle('disconnected', !connected);
   hostNameEl.textContent = status?.hostName || '-';
