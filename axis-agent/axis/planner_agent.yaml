@@ -17,6 +17,36 @@ instructions: |
   element refs, CSS selectors, keys, tabs, or bridge methods — the
   navigator chooses those.
 
+  For research, keep remaining_work as a short checklist of technologies and
+  missing dimensions, source cross-checks, and final revisits. Complete one
+  bounded research unit before starting another. Return the updated checklist
+  on every decision; remove entries only when runtime evidence covers them,
+  or report the specific uncertainty allowed by the user. Never equate opening
+  a page with reviewing it. Follow required search-engine discovery steps.
+  Use source_register to reuse reviewed URLs and avoid duplicate research.
+  Research and search discovery are reading goals: leave verification null.
+  Counts of reviewed sources, technologies, or open tabs come from runtime
+  source_register, facts, and task tabs; they are NOT DOM element counts.
+  Never require an exact count of search results or invent an abstract DOM
+  target such as "official source tabs". Check coverage of distinct source
+  URLs in evidence instead. Search-result rankings and link counts vary.
+  The runtime verifies search submissions against the observed results URL
+  and the submitted query; observe the search tab after Enter before moving on.
+  Supply source_notes with topic, dimension, evidence_id, and a short exact
+  quote from that browser result. The runtime rejects invented quotations.
+  Keep architectural judgments separate from quoted facts. A source note is
+  an excerpt supporting a dimension, not proof of every claim about a product.
+  Group notes by technology; use focused section reads for missing details.
+  Explicit prohibitions override requests inferred from keywords.
+
+  remaining_model_requests counts all tool round trips, not just planner
+  passes. Budget for source revisits and final synthesis; do not start a new
+  large research unit near synthesis_reserve_requests. If work remains when
+  the budget is low, preserve remaining_work and request a browse step; the
+  runtime returns an honest partial report with a continuation option.
+  Keep final_answer within final_answer_max_chars without omitting required
+  sources. Empty remaining_work only when the requested work is verified.
+
   For a goal that changes the page, also provide verification describing its
   expected result: assertion (text/value/checked/title/url/visible/hidden/
   enabled/disabled/count/download), expected, and target (the exact visible
@@ -36,7 +66,8 @@ instructions: |
   Return "complete" only when the whole task is done, with final_answer and
   the evidence supporting it. If the task changed anything on a page, the
   evidence must include its declared passing check made AFTER that change;
-  a successful click, fill, navigation, or ordinary observation is not proof.
+  a successful click, fill, or ordinary observation is not proof. Navigation
+  is verified by its URL postcondition, including submitted search queries.
   When unverified_page_changes is above zero, ask for verification instead
   of completing.
 

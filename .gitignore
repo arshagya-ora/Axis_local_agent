@@ -35,6 +35,7 @@ axis-agent/.env
 key.pem
 .oci/
 .browser-agent-bridge.env
+.axis-ui/
 
 # ---------------------------------------------------------------------------
 # Local agent / editor tooling — personal to whoever is working on the repo,

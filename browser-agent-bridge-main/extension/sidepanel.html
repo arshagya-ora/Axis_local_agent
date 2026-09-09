@@ -1,80 +1,145 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Browser Agent Bridge</title>
-    <link rel="stylesheet" href="sidepanel.css">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AXIS workspace</title>
+    <link rel="stylesheet" href="sidepanel.css" />
   </head>
   <body>
-    <!-- Main Content Screen -->
-    <main id="main-content">
-      <!-- Permission Approval Card -->
-      <div id="permission-card" style="display: none;" class="permission-card">
-        <h3>⚠️ Authorization Request</h3>
-        <div id="permission-details" class="permission-details"></div>
-        <div class="permission-actions">
-          <button id="perm-allow-btn" class="primary-btn">Allow</button>
-          <button id="perm-session-allow-btn">Always</button>
-          <button id="perm-deny-btn" class="danger-btn">Deny</button>
+    <div id="workspace" class="app">
+      <header class="toolbar">
+        <div class="brand">
+          <span class="axis-mark" aria-hidden="true"></span
+          ><strong>AXIS</strong>
         </div>
-      </div>
-
-      <header>
-        <h1>Browser Agent Bridge</h1>
-        <span id="status" class="status disconnected">Disconnected</span>
+        <nav aria-label="Workspace">
+          <button
+            id="history-button"
+            class="icon-button"
+            aria-label="Conversation history"
+            data-icon="history"
+          ></button
+          ><button
+            id="new-conversation"
+            class="icon-button"
+            aria-label="New conversation"
+            data-icon="edit"
+          ></button
+          ><button
+            id="settings-button"
+            class="icon-button"
+            aria-label="Settings"
+            data-icon="settings"
+          ></button>
+        </nav>
       </header>
-
-      <section>
-        <h2>Native Host</h2>
-        <dl>
-          <div>
-            <dt>Host</dt>
-            <dd id="host-name">-</dd>
-          </div>
-          <div>
-            <dt>Last checked</dt>
-            <dd id="last-checked">-</dd>
-          </div>
-          <div>
-            <dt>Error</dt>
-            <dd id="error">-</dd>
-          </div>
-        </dl>
-        <div class="native-actions">
-          <button id="bridge-toggle-btn" class="primary-btn">Start Bridge</button>
-          <button id="refresh">Refresh</button>
+      <div class="conversation-heading">
+        <h1 id="conversation-title">New conversation</h1>
+        <div class="context-line">
+          <span id="browser-context" class="tab-context"></span
+          ><button
+            id="connection-button"
+            class="connection"
+            aria-label="Connection details"
+          >
+            Service offline
+          </button>
         </div>
-      </section>
-      <section>
-        <h2>Settings</h2>
-        <!-- Port Setting (At the top) -->
-        <div class="setting-item port-settings">
-          <label for="bridge-port">Bridge Port:</label>
-          <div class="port-input-group">
-            <input type="number" id="bridge-port" min="1024" max="65535" value="8765">
-            <button id="save-port-btn">Save & Restart</button>
+        <div id="connection-details" class="notice" hidden></div>
+      </div>
+      <button id="return-active" class="active-strip" hidden>
+        Return to active task <span aria-hidden="true">→</span>
+      </button>
+      <section
+        id="approval-region"
+        aria-label="Browser bridge approvals"
+        hidden
+      ></section>
+      <main id="conversation" tabindex="-1" aria-label="Conversation">
+        <div id="timeline"></div>
+      </main>
+      <button id="new-activity" class="new-activity" hidden>
+        ↓ New activity
+      </button>
+      <div class="composer-wrap">
+        <p id="workspace-error" class="feedback error" role="alert" hidden></p>
+        <form id="composer" class="composer">
+          <div id="context-chip" class="context-chip" hidden></div>
+          <label class="sr-only" for="instruction">Instruction</label
+          ><textarea
+            id="instruction"
+            rows="2"
+            maxlength="4000"
+            placeholder="Ask or add an instruction…"
+          ></textarea>
+          <div class="composer-controls">
+            <label class="sr-only" for="message-mode">Message target</label
+            ><select id="message-mode">
+              <option value="new_task">New task</option>
+              <option value="follow_up">Current task</option></select
+            ><button
+              id="send"
+              class="send-button"
+              aria-label="Send instruction"
+              type="submit"
+              data-icon="send"
+            ></button>
           </div>
+          <p id="composer-hint" class="composer-hint">
+            Connect AXIS in Settings to start a browser task.
+          </p>
+        </form>
+      </div>
+    </div>
+    <section
+      id="settings-view"
+      class="settings-view"
+      aria-label="Settings"
+      hidden
+    ></section>
+    <dialog
+      id="history-drawer"
+      class="history-drawer"
+      aria-labelledby="history-title"
+    >
+      <header class="toolbar">
+        <div class="brand">
+          <span class="axis-mark" aria-hidden="true"></span
+          ><strong>AXIS</strong>
         </div>
-
-        <!-- Bypass CSP -->
-        <div class="setting-item">
-          <label>
-            <input type="checkbox" id="bypass-csp">
-            Allow temporary CSP bypass for target site
-          </label>
+        <button
+          id="close-history"
+          class="icon-button"
+          aria-label="Close history"
+          data-icon="close"
+        ></button>
+      </header>
+      <div class="history-heading">
+        <div class="row">
+          <h1 id="history-title">Conversations</h1>
+          <button
+            id="history-new"
+            class="icon-button outlined"
+            aria-label="New conversation"
+            data-icon="edit"
+          ></button>
         </div>
-
-        <!-- Enable Runtime Approval -->
-        <div class="setting-item">
-          <label>
-            <input type="checkbox" id="enable-runtime-approval" checked>
-            Enable Runtime Approval
-          </label>
-        </div>
-
-      </section>
-    </main>
+        <label class="search"
+          ><span data-icon="search"></span
+          ><input
+            id="history-search"
+            type="search"
+            placeholder="Search conversations…"
+            aria-label="Search conversations"
+        /></label>
+      </div>
+      <div id="history-list" class="history-list"></div>
+      <footer class="history-footer">
+        <span data-icon="monitor"></span>Local history
+        <span class="muted">Saved on this computer</span>
+      </footer>
+    </dialog>
     <script type="module" src="sidepanel.js"></script>
   </body>
 </html>

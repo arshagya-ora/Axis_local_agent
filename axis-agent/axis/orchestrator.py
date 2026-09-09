@@ -89,7 +89,11 @@ _REQUIRED_TEXT = re.compile(
     r"(?:assert|verify|contains?|subject(?: is|:)?|exact text(?: is|:)?)\s+(?:that\s+)?[\"“`]([^\"”`]{1,300})[\"”`]",
     re.IGNORECASE,
 )
-_FORBIDDEN = re.compile(r"\bdo not\s+(send|submit|delete|purchase|buy|post|transfer|upload)\b", re.IGNORECASE)
+_NEGATED = re.compile(r"\b(?:do not|don't|never|avoid|without)\s+[^.!?;\n]+", re.IGNORECASE)
+_FORBIDDEN = re.compile(
+    r"\b(send|submit|delete|purchase|buy|post|transfer|upload|download|log in|login|sign in|modify)\b",
+    re.IGNORECASE,
+)
 _DOWNLOAD_REQUEST = re.compile(
     r"\bdownload(?:ed|ing|s)?\b|\bexport\b.*\b(file|csv|xlsx|pdf|zip)\b|"
     r"\bsave\b.*\b(file|report|attachment|csv|xlsx|pdf|zip)\b",
@@ -102,23 +106,42 @@ def evidence_requested(*texts: str | None) -> bool:
 
 
 def downloads_requested(*texts: str | None) -> bool:
-    return any(_DOWNLOAD_REQUEST.search(text) for text in texts if text)
+    for text in texts:
+        if not text:
+            continue
+        for clause in re.split(r"[.!?;\n]", _NEGATED.sub("", text)):
+            if (re.search(r"\b(research|investigate|compare|explain|support|handling)\b", clause, re.I)
+                    and not re.match(r"\s*(?:please\s+)?(?:download|export|save)\b", clause, re.I)):
+                continue
+            if _DOWNLOAD_REQUEST.search(clause):
+                return True
+    return False
 
 
 def extract_requirements(*texts: str | None) -> TaskRequirements:
     combined = "\n".join(text for text in texts if text)
     urls = list(dict.fromkeys(match.rstrip(".,);]") for match in _URL.findall(combined)))
     required = list(dict.fromkeys(_REQUIRED_TEXT.findall(combined)))
-    forbidden = {match.lower() for match in _FORBIDDEN.findall(combined)}
+    forbidden = {match.lower() for clause in _NEGATED.findall(combined)
+                 for match in _FORBIDDEN.findall(clause)}
+    forbidden = {"login" if item in {"log in", "sign in"} else item for item in forbidden}
+    def minimum(noun: str) -> int:
+        match = re.search(r"at least\s+(\d+)\s+(?:\w+\s+){0,3}" + noun + r"\b", combined, re.I)
+        return min(int(match[1]), 128) if match else 0
     return TaskRequirements(
         literal_urls=urls,
         required_text=required,
         require_screenshot=bool(_SCREENSHOT_REQUEST.search(combined)),
-        require_download=downloads_requested(combined),
+        require_download=downloads_requested(combined) and "download" not in forbidden,
         require_console_check=bool(_CONSOLE_REQUEST.search(combined)),
         require_network_check=bool(_NETWORK_REQUEST.search(combined)),
         mutation_allowed=not bool(re.search(r"\bread[- ]only\b|\bdo not (?:change|modify)\b", combined, re.IGNORECASE)),
         forbidden_actions=forbidden,
+        prohibitions=_NEGATED.findall(combined)[:16],
+        min_sources=minimum("pages"),
+        min_tabs=minimum("tabs"),
+        min_actions=minimum("actions"),
+        require_search=bool(re.search(r"\buse\s+(?:google|bing|duckduckgo|(?:a|another) search engine)\b", combined, re.I)),
     )
 
 
@@ -137,6 +160,11 @@ def _merge_requirements(current: TaskRequirements, added: TaskRequirements) -> T
         require_network_check=current.require_network_check or added.require_network_check,
         mutation_allowed=current.mutation_allowed and added.mutation_allowed,
         forbidden_actions=current.forbidden_actions | added.forbidden_actions,
+        prohibitions=list(dict.fromkeys(current.prohibitions + added.prohibitions))[:16],
+        min_sources=max(current.min_sources, added.min_sources),
+        min_tabs=max(current.min_tabs, added.min_tabs),
+        min_actions=max(current.min_actions, added.min_actions),
+        require_search=current.require_search or added.require_search,
     )
 
 
@@ -155,6 +183,17 @@ def verify_completion(state: TaskRunState, browser_state: BrowserState | None) -
     if state.unverified_mutations:
         reasons.append(f"{state.unverified_mutations} page mutation(s) remain unverified.")
     requirements = state.requirements
+    if len(state.source_register) < requirements.min_sources:
+        reasons.append(f"Reviewed {len(state.source_register)} of {requirements.min_sources} required source pages.")
+    if len(state.task_tabs) < requirements.min_tabs:
+        reasons.append(f"Used {len(state.task_tabs)} of {requirements.min_tabs} required tabs.")
+    if state.successful_actions < requirements.min_actions:
+        reasons.append(f"Only {state.successful_actions} successful actions; {requirements.min_actions} required.")
+    if requirements.require_search and not state.search_observed:
+        reasons.append("The requested interactive search-engine research has not been observed.")
+    if state.remaining_work:
+        reasons.append("Research checklist remains incomplete: " + "; ".join(state.remaining_work[:6]))
+    reasons.extend(state.source_note_errors)
     if requirements.require_screenshot and not state.evidence_by_kind("screenshot"):
         reasons.append("The requested screenshot is missing.")
     if requirements.require_download and not state.downloads:
@@ -179,6 +218,8 @@ def verify_completion(state: TaskRunState, browser_state: BrowserState | None) -
         reasons.append("The final URL condition is not met.")
     unresolved_refusals: dict[tuple[str, str | None], ActionRecord] = {}
     for record in state.actions:
+        if record.recovered:
+            continue
         key = (record.tool, record.operation)
         if not record.executed:
             unresolved_refusals[key] = record
@@ -262,7 +303,7 @@ class AxisOrchestrator:
         if self.state is not None:
             self.state.bound_tab = value
             if value and value not in self.state.task_tabs:
-                self.state.task_tabs = (self.state.task_tabs + [value])[-8:]
+                self.state.task_tabs = (self.state.task_tabs + [value])[-128:]
 
     # -- timing ----------------------------------------------------------
 
@@ -290,9 +331,13 @@ class AxisOrchestrator:
 
     # -- entry points ----------------------------------------------------
 
-    async def start_task(self, task: str) -> AxisResult:
+    async def start_task(self, task: str, *, task_id: str | None = None) -> AxisResult:
         """Start an independent task while reusing the connected browser."""
         self.state = self.config.new_memory(task, extract_requirements(task))
+        for tab in self.browser.tabs.values():
+            tab.task_created = False
+        if task_id is not None:
+            self.state.task_id = task_id
         self.browser.task_started_wallclock = self.state.started_wallclock
         self.browser.visual_enabled = False
         self.browser.invalidate_visual()
@@ -308,6 +353,21 @@ class AxisOrchestrator:
     async def run(self, task: str) -> AxisResult:
         """Compatibility alias for start_task()."""
         return await self.start_task(task)
+
+    async def resume_run(self) -> AxisResult:
+        """Re-enter a paused run without replacing its identity, memory or budgets.
+
+        The caller must wait for the previous entry point to return first.
+        """
+        if self.state is None or self.state.status != "paused":
+            raise ValueError("Only a paused live task can be resumed.")
+        self.resume()
+        try:
+            return await self._loop()
+        except RunCancelled:
+            return self._result("cancelled", reason="The user cancelled the run.")
+        finally:
+            self._close_telemetry()
 
     async def continue_task(self, follow_up: str) -> AxisResult:
         """Append a follow-up and force an immediate planner pass.
@@ -355,6 +415,8 @@ class AxisOrchestrator:
             self._close_telemetry()
 
     def _set_navigator_tools(self) -> None:
+        if self.state is not None:
+            self.browser.forbidden_actions = frozenset(self.state.requirements.forbidden_actions)
         state = self.state
         assert state is not None
         self._sync_navigator_tools(
@@ -421,10 +483,60 @@ class AxisOrchestrator:
 
     # -- budgets and stopping --------------------------------------------
 
+    def _run_limits(self):
+        state = self.state
+        run = self.config.run
+        if state is None:
+            return run
+        return run.model_copy(update={
+            "max_model_requests": run.max_model_requests + state.extra_model_requests,
+            "max_browser_actions": run.max_browser_actions + state.extra_browser_actions,
+            "max_total_steps": run.max_total_steps + state.extra_steps,
+        })
+
+    async def extend_budget(self, requests: int, *, steps: int = 0, actions: int = 0) -> AxisResult:
+        """Explicitly add task budget while preserving evidence and lifetime usage."""
+        if self.state is None or self.state.status != "limit_reached":
+            raise ValueError("Budget extension requires a task stopped at its limit.")
+        if requests <= 0 or steps < 0 or actions < 0:
+            raise ValueError("Requests must be positive; steps and actions must be non-negative.")
+        self.state.extra_model_requests += requests
+        self.state.extra_steps += steps
+        self.state.extra_browser_actions += actions
+        self.state.status = "active"
+        self.state.last_error = "The user extended this task's budget. Resume the remaining work using retained sources."
+        try:
+            # A budget can stop immediately after the planner chose a goal,
+            # before its first observation. Resume that already-authorized
+            # step instead of asking a planner to complete an unread page.
+            if (self.state.current_goal and self.state.last_browser_state is None
+                    and self.state.latest_navigator_outcome is None):
+                await self._navigator_burst()
+            return await self._loop()
+        except _Stop as stopped:
+            return stopped.result
+        finally:
+            self._close_telemetry()
+
+    def _partial_answer(self, reason: str = "The execution budget was reached.", *, budget_exhausted: bool = True) -> str:
+        state = self.state
+        assert state is not None
+        lines = ["Task incomplete. " + reason,
+                 "Remaining work: " + "; ".join(state.remaining_work or [state.current_goal or "Final verification and synthesis"])]
+        for fact in state.facts:
+            if fact.tool == "source_note":
+                lines.append(fact.value)
+        if state.source_register:
+            lines.append("Reviewed sources (this list does not imply every requested claim was verified):")
+            lines.extend(f"- {item['title']}: {url}" for url, item in state.source_register.items())
+        lines.append("Use /extend REQUESTS [STEPS ACTIONS] to resume with these sources and existing tabs." if budget_exhausted else
+                     "Use /continue with recovery instructions to retain these sources and existing tabs.")
+        return clip("\n".join(lines), self.config.run.final_answer_max_chars) or ""
+
     def _stop_reason(self) -> AxisResult | None:
         state = self.state
         assert state is not None
-        run = self.config.run
+        run = self._run_limits()
         if state.status == "cancelled":
             return self._result("cancelled", reason="The user cancelled the run.")
         if state.status == "paused":
@@ -444,6 +556,9 @@ class AxisOrchestrator:
     def _result(self, status: str, *, answer: str | None = None, evidence: list[str] | None = None,
                 reason: str = "") -> AxisResult:
         state = self.state
+        if state and answer is None and (status == "limit_reached" or
+                                        (status == "failed" and state.source_register)):
+            answer = self._partial_answer(reason or "Execution stopped before completion.", budget_exhausted=status == "limit_reached")
         if state:
             state.status = status  # type: ignore[assignment]
         result = AxisResult(
@@ -499,6 +614,9 @@ class AxisOrchestrator:
             self._emit("planner_decision", **plan.model_dump(), duration_ms=state.plan_ms)
 
             if plan.decision == "complete":
+                if plan.final_answer and len(plan.final_answer) > self.config.run.final_answer_max_chars:
+                    state.last_error = f"Shorten the answer to {self.config.run.final_answer_max_chars} characters while preserving required sources."
+                    continue
                 verdict = verify_completion(state, state.last_browser_state)
                 if not verdict.valid:
                     state.completion_rejected = True
@@ -513,6 +631,11 @@ class AxisOrchestrator:
                                     reason=plan.reason)
             if plan.decision == "fail":
                 return self._result("failed", evidence=plan.evidence, reason=plan.reason)
+
+            if (state.remaining_work or state.requirements.min_sources) and (
+                    self._run_limits().max_model_requests - int(state.usage.requests)
+                    <= self.config.run.synthesis_reserve_requests):
+                return self._result("limit_reached", reason="Research budget reached its synthesis reserve; progress is preserved.")
 
             # A repair stays attached to the unfinished goal; changing its wording
             # never silently completes it or abandons pending changes.
@@ -565,7 +688,7 @@ class AxisOrchestrator:
             # Follow a tab the navigator switched to, so the next observation
             # targets the page it actually moved to rather than the one it
             # left — otherwise it must burn a whole step re-activating.
-            failures = [record for record in gate.records if not record.success]
+            failures = [record for record in gate.records if not record.success and not record.recovered]
             recoverable = {"STALE_REFERENCE", "REF_NOT_FOUND", "LOCATOR_ACTIONABILITY_TIMEOUT", "LOCATOR_NOT_FOUND", "LOCATOR_STRICT_MODE_VIOLATION"}
             tab = browser_state.tab
             if tab:
@@ -596,7 +719,11 @@ class AxisOrchestrator:
                 pending = [p for p in state.pending_changes.values() if p.goal_id == state.current_goal_id]
                 known = {item.id for item in state.evidence if item.verified and item.goal_id == state.current_goal_id}
                 if pending:
-                    rejection = "Goal verification required: run the declared check after the changes on " + ", ".join(p.tab for p in pending) + "."
+                    rejection = "Goal verification required: " + "; ".join(
+                        f"{p.tab}: observe search results for {p.search_query!r}" if p.search_query is not None else
+                        f"{p.tab}: observe URL {p.expected_url!r}" if p.expected_url else
+                        f"{p.tab}: run {p.verification.model_dump_json(exclude_none=True) if p.verification else 'a goal-specific check'}"
+                        for p in pending) + "."
                 elif not known or any(ref not in known for ref in outcome.evidence_ids):
                     rejection = "Unknown or unverified evidence reference; cite runtime evidence IDs."
                 if rejection:
@@ -665,7 +792,7 @@ class AxisOrchestrator:
     async def _plan(self) -> PlanDecision:
         state = self.state
         assert state is not None
-        run = self.config.run
+        run = self._run_limits()
         context: dict[str, Any] = {
             "task_id": state.task_id,
             "original_request": state.original_request,
@@ -680,12 +807,17 @@ class AxisOrchestrator:
             "latest_navigator_outcome": (
                 state.latest_navigator_outcome.model_dump() if state.latest_navigator_outcome else None
             ),
-            "recent_action_results": [record.model_dump() for record in state.actions[-state.max_recent_actions:]],
+            "recent_action_results": [record.model_dump(exclude={"extracted_data"}) for record in state.actions[-state.max_recent_actions:]],
             "relevant_extracted_data": state.relevant_extracted_data if not state.facts else [],
             "facts": [fact.model_dump() for fact in state.facts],
             "memory_truncated": state.memory_truncated,
             "pending_changes": [change.model_dump() for change in state.pending_changes.values()],
-            "evidence": [item.model_dump() for item in state.evidence[-16:] if item.verified],
+            "evidence": [item.model_dump(exclude={"detail"} if item.kind in {"observation", "extraction"} else set())
+                         for item in state.evidence[-16:] if item.verified],
+            "source_register": list(state.source_register.values()),
+            "remaining_work": state.remaining_work,
+            "final_answer_max_chars": run.final_answer_max_chars,
+            "synthesis_reserve_requests": run.synthesis_reserve_requests,
             "last_error": state.last_error,
             "unverified_page_changes": state.unverified_mutations,
             "remaining_steps": max(0, run.max_total_steps - state.counters.total_steps),
@@ -706,29 +838,75 @@ class AxisOrchestrator:
             deps=None,
         )
         state.plan_ms = int((time.monotonic() - started) * 1000)
+        self._retain_source_notes(decision)
         return decision
+
+    def _retain_source_notes(self, decision: PlanDecision) -> None:
+        state = self.state
+        assert state is not None
+        state.remaining_work = [clip(item, 200) or "" for item in decision.remaining_work]
+        state.source_note_errors = []
+        for note in decision.source_notes:
+            source = next((e for e in state.evidence if e.id == note.evidence_id and e.verified
+                           and e.kind in {"observation", "extraction"} and e.source_url), None)
+            text = source.detail if source else ""
+            try:
+                parsed = json.loads(text)
+                def strings(value):
+                    if isinstance(value, str):
+                        return value
+                    if isinstance(value, dict):
+                        return " ".join(strings(v) for v in value.values())
+                    if isinstance(value, list):
+                        return " ".join(strings(v) for v in value)
+                    return ""
+                text = strings(parsed)
+            except (ValueError, TypeError):
+                pass
+            if source is None or " ".join(note.quote.split()) not in " ".join(text.split()):
+                state.last_error = f"Source note rejected: {note.evidence_id} does not contain the quoted text. Read the relevant section."
+                state.source_note_errors.append(state.last_error)
+                continue
+            target = "research:" + note.topic.casefold()
+            existing = next((f for f in state.facts if f.tool == "source_note" and f.target == target), None)
+            notes = json.loads(existing.value) if existing else []
+            item = {"dimension": note.dimension, "quote": note.quote, "url": source.source_url,
+                    "evidence_id": source.id, "tab": source.tab}
+            notes = [n for n in notes if (n["url"], n["dimension"]) != (item["url"], item["dimension"])]
+            notes.append(item)
+            while len(json.dumps(notes, ensure_ascii=False)) > 3_800:
+                notes.pop(0)
+                state.memory_truncated = True
+            state.retain_fact(TaskFact(value=json.dumps(notes, ensure_ascii=False), target=target,
+                evidence_id=source.id, goal_id=source.goal_id, tool="source_note", priority=3))
 
     # -- navigator -------------------------------------------------------
 
     def _commit_gate(self, gate: StepGate) -> None:
         """Persist a step gate exactly once, including cancelled runs."""
-        if gate.committed:
-            return
-        state = self.state
-        assert state is not None
-        state.record_actions(gate.records)
-        state.counters.browser_actions += gate.actions_used
-        for record, (mutated, verified) in zip(gate.records, gate.effects):
-            if not record.sequence:
-                self._register_action(record, mutated)
-        if gate.active_tab_changed_to and gate.active_tab_changed_to in self.browser.tabs:
-            self.tab = gate.active_tab_changed_to
-        gate.committed = True
+        with gate.lock:
+            if gate.committed:
+                return
+            if gate.in_flight:
+                tool, kwargs, started = gate.in_flight
+                gate.record(tool, kwargs, {"ok": False, "error": {"code": "BRIDGE_ERROR",
+                    "message": "The run ended while the browser call was in flight; its outcome is unknown. Do not replay it."}},
+                    int((time.perf_counter() - started) * 1000))
+            state = self.state
+            assert state is not None
+            state.record_actions(gate.records)
+            state.counters.browser_actions += gate.actions_used
+            for record, (mutated, verified) in zip(gate.records, gate.effects):
+                if not record.sequence:
+                    self._register_action(record, mutated)
+            if gate.active_tab_changed_to and gate.active_tab_changed_to in self.browser.tabs:
+                self.tab = gate.active_tab_changed_to
+            gate.committed = True
 
     async def _navigate(self, state: BrowserState) -> tuple[NavigatorOutcome, StepGate]:
         task = self.state
         assert task is not None
-        run = self.config.run
+        run = self._run_limits()
         gate = StepGate(
             max_actions=run.max_actions_per_step,
             remaining_total_actions=max(0, run.max_browser_actions - task.counters.browser_actions),
@@ -751,7 +929,8 @@ class AxisOrchestrator:
         )
         deps = AxisDeps(browser=self.browser, gate=gate)
         self._emit("status", phase="navigator_step_started", goal=state.goal)
-        prompt = format_as_xml(state.model_dump(exclude_none=True), root_tag="browser_state")
+        prompt = format_as_xml(state.model_dump(exclude_none=True,
+            exclude={"recent_actions": {"__all__": {"extracted_data"}}}), root_tag="browser_state")
         model_prompt = [prompt, self.browser.visual_content(state.screenshot)] if state.screenshot else prompt
         started = time.monotonic()
         try:
@@ -791,7 +970,8 @@ class AxisOrchestrator:
         started = time.monotonic()
         try:
             result = await agent.run(
-                prompt, deps=deps, usage=state.usage, usage_limits=self.usage_limits,
+                prompt, deps=deps, usage=state.usage,
+                usage_limits=UsageLimits(request_limit=self._run_limits().max_model_requests),
                 cancellation_token=state.cancellation_token,
             )
         except UsageLimitExceeded as exc:
@@ -919,7 +1099,7 @@ class AxisOrchestrator:
     def _tab_summaries(self) -> list[TabSummary]:
         state = self.state
         assert state is not None
-        candidates = list(dict.fromkeys(([self.tab] if self.tab else []) + state.task_tabs[-7:]))
+        candidates = list(dict.fromkeys(([self.tab] if self.tab else []) + state.task_tabs[-63:]))
         return [
             TabSummary(**self.browser.public_tab(alias))
             for alias in candidates
@@ -1011,7 +1191,7 @@ class AxisOrchestrator:
         """
         state = self.state
         assert state is not None
-        run = self.config.run
+        run = self._run_limits()
         tab = self._ensure_tab()
         self._arm_diagnostics(tab)
         self._maybe_direct_navigate(tab)
@@ -1021,7 +1201,7 @@ class AxisOrchestrator:
 
         observation: dict[str, Any] | None = None
         last: ToolFault | None = None
-        observe_started = time.monotonic()
+        observe_started = time.perf_counter()
         for attempt in range(2):  # one tab reconciliation/observation repair, then stop
             try:
                 observation = self.browser.observe(tab, run.observation_mode, run.observation_max_nodes)
@@ -1035,7 +1215,7 @@ class AxisOrchestrator:
                     continue
                 if fault.code in FATAL_BRIDGE_CODES or not fault.retryable or attempt == 1:
                     break
-        observe_ms = int((time.monotonic() - observe_started) * 1000)
+        observe_ms = int((time.perf_counter() - observe_started) * 1000)
         state.browser_ms += observe_ms
         self._emit(
             "status", phase="observed", tab=tab, success=observation is not None,
@@ -1074,26 +1254,24 @@ class AxisOrchestrator:
             note=state.last_error,
             requirements=state.requirements,
             goal_id=state.current_goal_id,
-            facts=state.facts,
+            facts=sorted(state.facts, key=lambda f: (
+                f.tool == "source_note", f.goal_id == state.current_goal_id, f.tab == tab, f.priority), reverse=True)[:6],
+            source_register=list(state.source_register.values()),
+            remaining_work=state.remaining_work,
+            remaining_model_requests=max(0, run.max_model_requests - int(state.usage.requests)),
             memory_truncated=state.memory_truncated,
             pending_changes=list(state.pending_changes.values()),
         )
         state.last_browser_state = browser_state
+        self._record_search(browser_state.url)
         evidence = state.add_evidence("observation", f"Title: {browser_state.title or ''}\n{browser_state.snapshot}", tab=tab, source_url=browser_state.url)
         browser_state.evidence_id = evidence.id
         state.retain_fact(TaskFact(value=evidence.detail, tab=tab, source_url=browser_state.url,
                                    goal_id=state.current_goal_id, evidence_id=evidence.id,
                                    target="page", priority=0))
-        # Navigation has a concrete URL postcondition. This never verifies an
-        # input/click merely because the resulting page was observed.
-        for key, pending in list(state.pending_changes.items()):
-            if (pending.tab == tab and pending.goal_id == state.current_goal_id
-                    and pending.expected_url and pending.expected_url == browser_state.url):
-                state.counters.verified_mutation_count += pending.count
-                del state.pending_changes[key]
+        self._verify_navigation(tab, browser_state.url, evidence.sequence)
         browser_state.unverified_page_changes = state.unverified_mutations
         browser_state.pending_changes = list(state.pending_changes.values())
-        browser_state.facts = state.facts
         browser_state.memory_truncated = state.memory_truncated
         return browser_state
 
@@ -1110,10 +1288,25 @@ class AxisOrchestrator:
                 record.target = self.browser.describe_ref(reference[1]) or record.target
         tab = self.browser.tabs.get(record.tab) if record.tab else None
         record.source_url = self.browser.safe_url(tab.url) if tab else None
+        if record.success:
+            state.successful_actions += 1
+            if record.tab and record.tab not in state.task_tabs:
+                state.task_tabs = (state.task_tabs + [record.tab])[-128:]
         if mutated and record.tab:
             key = f"{record.goal_id}:{record.tab}"
             previous = state.pending_changes.get(key)
-            check = state.current_verification
+            search_query = None
+            search_host = None
+            search_submitted = False
+            engine = self._search_location(record.source_url)
+            if record.success and record.tool == "browser_act" and (not previous or previous.search_query is not None):
+                if record.operation == "fill" and isinstance(record.expected_value, str) and engine and self._search_target(record.target):
+                    search_query, search_host = record.expected_value, engine[0]
+                elif (record.operation == "press" and (record.key or "").casefold() == "enter" and previous
+                      and previous.search_query is not None and (record.target == "press" or self._search_target(record.target))):
+                    search_query, search_host = previous.search_query, previous.search_host
+                    search_submitted = True
+            check = None if search_query is not None else state.current_verification
             if check is None and record.operation == "fill" and record.expected_value is not None:
                 # Straightforward input goals have a deterministic target/value
                 # postcondition even with an older planner specification.
@@ -1130,11 +1323,56 @@ class AxisOrchestrator:
             state.pending_changes[key] = PendingChange(
                 goal_id=record.goal_id, tab=record.tab, sequence=record.sequence,
                 count=(previous.count if previous else 0) + 1,
-                expected_url=record.source_url if record.tool == "browser_navigate" and not previous else None,
-                verification=check,
+                expected_url=record.source_url if record.success and record.tool == "browser_navigate" and
+                    (not previous or previous.search_query is not None or previous.expected_url) else None,
+                search_query=search_query, search_host=search_host, search_submitted=search_submitted,
+                verification=None if search_submitted else check,
             )
             state.counters.mutation_count += 1
         self._collect_record_evidence(record)
+
+    @staticmethod
+    def _search_location(url: str | None) -> tuple[str, str] | None:
+        if not url:
+            return None
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        engine = bool(re.fullmatch(r"(?:www\.)?google\.[a-z.]+", host)) or host in {
+            "bing.com", "www.bing.com", "duckduckgo.com", "www.duckduckgo.com", "html.duckduckgo.com"}
+        if engine and parts.scheme in {"http", "https"} and parts.path.rstrip("/") in {"", "/search", "/webhp", "/html"}:
+            return host, dict(parse_qsl(parts.query)).get("q", "")
+        return None
+
+    @staticmethod
+    def _search_target(target: str | None) -> bool:
+        if not target:
+            return False
+        if target.startswith("{"):
+            locator = json.loads(target).get("locator", {})
+            return (locator.get("role") == "searchbox" or
+                    any(str(locator.get(k, "")).casefold() in {"search", "search google", "search the web"}
+                        for k in ("name", "label", "placeholder")) or
+                    locator.get("selector") in {'[name="q"]', 'input[name="q"]', 'textarea[name="q"]'})
+        return bool(re.search(r'\b(?:combobox|textbox|searchbox)\s+"(?:Search|Search Google|Search the web)"', target, re.I))
+
+    def _verify_navigation(self, tab: str | None, url: str | None, sequence: int) -> None:
+        state = self.state
+        assert state is not None
+        search = self._search_location(url)
+        for key, pending in list(state.pending_changes.items()):
+            if pending.tab != tab or pending.goal_id != state.current_goal_id or sequence <= pending.sequence:
+                continue
+            url_matches = bool(pending.expected_url and pending.expected_url == url)
+            query_matches = (pending.search_submitted and bool(pending.search_query) and search is not None and
+                             search == (pending.search_host, pending.search_query))
+            if url_matches or query_matches:
+                state.counters.verified_mutation_count += pending.count
+                del state.pending_changes[key]
+
+    def _record_search(self, url: str | None) -> None:
+        search = self._search_location(url)
+        if self.state is not None and search and search[1]:
+            self.state.search_observed = True
 
     def _collect_record_evidence(self, record: ActionRecord) -> None:
         state = self.state
@@ -1148,7 +1386,7 @@ class AxisOrchestrator:
             record.evidence_id = item.id
             return item
 
-        if record.tool == "browser_assert":
+        if record.tool == "browser_assert" and record.execution_success:
             assertion = AssertionRecord(
                 assertion=record.operation or "unknown",
                 passed=record.semantic_success is True,
@@ -1170,11 +1408,26 @@ class AxisOrchestrator:
                 state.counters.verified_mutation_count += pending.count
                 del state.pending_changes[key]
         elif record.success and record.tool in {"browser_observe", "browser_navigate", "browser_tabs"}:
+            if record.tool == "browser_observe":
+                self._record_search(record.source_url)
+                # Locator extractions do not read the live URL. Cached tab
+                # metadata alone cannot verify a delayed navigation.
+                self._verify_navigation(record.tab, data.get("url"), record.sequence)
             kind = "navigation" if record.tool == "browser_navigate" else (
                 "observation" if record.tool == "browser_observe" and "snapshot" in data else "extraction")
             content = record.extracted_data
             if content is not None:
                 item = evidence(kind, content)
+                if (record.tool == "browser_observe" and (kind == "extraction" or record.operation == "text")
+                        and len(re.findall(r"[a-zA-Z]", content)) >= 40 and record.source_url):
+                    state.source_register[record.source_url] = {
+                        "url": record.source_url,
+                        "title": clip(self.browser.tabs[record.tab].title, 150) or record.source_url,
+                        "tab": record.tab, "evidence_id": item.id,
+                    }
+                    while len(state.source_register) > 128 or len(json.dumps(state.source_register)) > 8_000:
+                        del state.source_register[next(iter(state.source_register))]
+                        state.memory_truncated = True
                 state.retain_fact(TaskFact(value=content, tab=record.tab, source_url=record.source_url,
                                           goal_id=record.goal_id, evidence_id=item.id,
                                           tool=record.tool,
@@ -1359,7 +1612,7 @@ class AxisOrchestrator:
         state = self.state
         assert state is not None
         gate = StepGate(max_actions=1,
-                        remaining_total_actions=self.config.run.max_browser_actions - state.counters.browser_actions,
+                        remaining_total_actions=self._run_limits().max_browser_actions - state.counters.browser_actions,
                         approval_actions=frozenset(self.config.tools.approval_required_actions),
                         approval=self.approval, forbidden_actions=frozenset(state.requirements.forbidden_actions),
                         mutation_allowed=state.requirements.mutation_allowed,

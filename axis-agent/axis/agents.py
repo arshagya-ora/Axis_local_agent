@@ -14,7 +14,9 @@ import dataclasses
 import functools
 import inspect
 import json
+import re
 import time
+from threading import RLock
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -211,6 +213,8 @@ class StepGate:
     effects: list[tuple[bool, bool]] = field(default_factory=list)
     refusals: int = 0
     committed: bool = False
+    lock: Any = field(default_factory=RLock, repr=False)
+    in_flight: tuple[str, dict[str, Any], float] | None = None
 
     def _interrupt(self, reason: str) -> None:
         if not self.interrupted:
@@ -263,10 +267,22 @@ class StepGate:
             return refuse("ACTION_BUDGET_EXHAUSTED", "The run's browser action budget is exhausted.")
         mutating = tool in MUTATING_TOOLS and (tool == "browser_navigate" or operation in MUTATING_ACTIONS)
         target_text = str((approval_detail or {}).get("target") or "").lower()
+        patterns = {
+            "download": r"\bdownload\b|source code.*(?:zip|tar)|\.(?:zip|tar|gz|exe|msi|csv|xlsx)(?:\b|$)|/archive/refs/",
+            "login": r"\blog[ -]?in\b|\bsign[ -]?in\b",
+            "submit": r"\bsubmit\b", "purchase": r"\bpurchase\b|\bbuy\b|\bcheckout\b",
+            "modify": r"\b(?:edit|commit|merge|save changes)\b",
+        }
+        effect_target = tool in MUTATING_TOOLS or (tool == "browser_tabs" and operation == "create")
         forbidden = next(
-            (item for item in self.forbidden_actions if item.lower() in target_text or item == operation),
+            (item for item in self.forbidden_actions if item == operation or
+             (effect_target and re.search(patterns.get(item, r"\b" + re.escape(item) + r"\b"), target_text))),
             None,
         )
+        if "download" in self.forbidden_actions and tool == "browser_downloads":
+            forbidden = "download"
+        if self.forbidden_actions and tool == "browser_visual" and operation in {"click", "drag", "type"}:
+            forbidden = "coordinate interaction without a policy-checkable DOM target"
         if forbidden:
             self.non_retryable = True
             self._interrupt(f"the task forbids {forbidden!r}")
@@ -288,6 +304,17 @@ class StepGate:
     def record(
         self, tool: str, kwargs: dict[str, Any], result: dict[str, Any], duration_ms: int = 0,
     ) -> ActionRecord:
+        with self.lock:
+            if self.committed:
+                # Cancellation already preserved this call as outcome-unknown.
+                # Its worker must not append a second record after the run ends.
+                return self.records[-1]
+            self.in_flight = None
+            return self._record(tool, kwargs, result, duration_ms)
+
+    def _record(
+        self, tool: str, kwargs: dict[str, Any], result: dict[str, Any], duration_ms: int = 0,
+    ) -> ActionRecord:
         """Turn one executed call into a bounded record and decide whether the
         rest of this step must be interrupted."""
         operation = _command_operation(kwargs)
@@ -298,7 +325,7 @@ class StepGate:
         if tool == "browser_assert" and execution_success:
             semantic_success = bool(data.get("passed"))
         success = execution_success and semantic_success is not False
-        code = error.get("code")
+        code = error.get("code") or ("ASSERTION_FAILED" if semantic_success is False else None)
         changed = data.get("whatChanged") if isinstance(data.get("whatChanged"), dict) else {}
         refs_invalidated = bool(data.get("refsInvalidated")) or bool(changed.get("urlChanged"))
         rerendered = bool(changed.get("domChanged")) or bool(changed.get("navigated"))
@@ -309,6 +336,10 @@ class StepGate:
         ) else None
         mutated = mutating and (success or code in UNKNOWN_OUTCOME_CODES)
         verified = success and tool == "browser_assert" and bool(data.get("passed"))
+        if mutated and isinstance(kwargs.get("tab"), str):
+            # Delayed navigation may have no immediate change metadata. Observe
+            # the action's tab next, even when another tab was previously active.
+            self.active_tab_changed_to = kwargs["tab"]
 
         if not success:
             if code in STOP_CODES:
@@ -326,6 +357,8 @@ class StepGate:
             else:
                 self._interrupt(f"an action failed ({code})")
         elif refs_invalidated:
+            if isinstance(kwargs.get("tab"), str):
+                self.active_tab_changed_to = kwargs["tab"]
             self._interrupt("the page navigated and the current refs are invalid")
         elif rerendered:
             self._interrupt("the page rerendered substantially")
@@ -358,7 +391,8 @@ class StepGate:
 
         record = ActionRecord(
             tool=tool,
-            tab=kwargs.get("tab") if isinstance(kwargs.get("tab"), str) else None,
+            tab=kwargs.get("tab") if isinstance(kwargs.get("tab"), str) else
+                result.get("tab") if tool == "browser_tabs" else None,
             operation=operation,
             args=_describe_args(kwargs),
             executed=True,
@@ -384,6 +418,7 @@ class StepGate:
         )
         command = kwargs.get("command")
         record.expected_value = getattr(command, "value", None)
+        record.key = getattr(command, "key", None)
         locator = getattr(command, "locator", None) or kwargs.get("locator")
         if locator is not None:
             identity = {"locator": locator.model_dump(exclude_none=True),
@@ -401,6 +436,11 @@ class StepGate:
                 result["data"]["evidence_id"] = record.evidence_id
         self.records.append(record)
         self.effects.append((mutated, verified))
+        if record.success:
+            for earlier in self.records[:-1]:
+                if (earlier.code == "INVALID_ARGUMENT"
+                        and earlier.tool == record.tool and earlier.tab == record.tab):
+                    earlier.recovered = True
         self.actions_used += 1
         self.browser_ms += duration_ms
         if self.on_action is not None:
@@ -430,17 +470,16 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
         command = named.get("command")
         target = getattr(command, "target", None)
         target_type = getattr(target, "kind", None)
-        target_text = None
+        target_text = getattr(command, "url", None)
         if target_type == "ref":
             target_text = deps.browser.describe_ref(getattr(target, "ref", ""))
         elif target_type == "locator":
             locator = getattr(target, "locator", None)
             if locator is not None:
-                target_text = next(
-                    (value for value in (
+                target_text = " ".join(
+                    value for value in (
                         locator.name, locator.label, locator.text, locator.placeholder, locator.selector,
-                    ) if value),
-                    None,
+                    ) if value
                 )
         elif getattr(command, "locator", None) is not None:
             locator = command.locator
@@ -471,6 +510,10 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             return refusal
         browser_ctx = dataclasses.replace(ctx, deps=deps.browser)
         started = time.perf_counter()
+        with deps.gate.lock:
+            if deps.gate.committed:
+                return _refusal(tab, "RUN_CANCELLED", "The step ended before this call could execute.")
+            deps.gate.in_flight = (function.__name__, named, started)
         result = function(browser_ctx, *rest, **kwargs)
         duration_ms = int((time.perf_counter() - started) * 1000)
         record = deps.gate.record(function.__name__, named, result, duration_ms)
@@ -533,8 +576,14 @@ def browser_validation_hooks() -> Hooks:
     def record_validation_failure(ctx: Any, *, call: Any, tool_def: Any, args: Any, error: Exception) -> Any:
         deps: AxisDeps = ctx.deps
         message = clip(str(error)) or "The browser tool arguments are invalid."
+        try:
+            raw = json.loads(args) if isinstance(args, str) else args
+        except ValueError:
+            raw = {}
+        raw = raw if isinstance(raw, dict) else {}
         record = ActionRecord(
             tool=call.tool_name,
+            tab=raw.get("tab") if isinstance(raw.get("tab"), str) else None,
             args=clip(repr(args)),
             executed=False,
             execution_success=False,

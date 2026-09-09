@@ -390,6 +390,8 @@
       element: {
         ref,
         tagName: element.tagName.toLowerCase(),
+        href: (element.closest?.('a[href]') || element).href || '',
+        download: (element.closest?.('a[href]') || element).hasAttribute('download'),
         id: element.id || '',
         role: element.getAttribute('role') || globalThis.__browserAgentBridgeDomA11y.implicitRole(element) || '',
         accessibleName: globalThis.__browserAgentBridgeDomA11y.accessibleName(element),

@@ -4,6 +4,69 @@ Python browser-control layers that let an LLM-based agent drive Chrome tabs
 through [Browser Agent Bridge](../browser-agent-bridge-main) without exposing
 the bridge's ~150-method raw JSON-RPC surface.
 
+## Browser UI setup
+
+Follow the [UI setup instructions in the main README](../README.md#browser-ui-setup)
+for extension installation, service startup and pairing. Once dependencies and
+credentials are configured, start the service from this directory:
+
+```powershell
+uv run python -m axis.ui_service --debug
+```
+
+Keep it running and enter tasks in the extension. Pair through
+**Settings → Connection → Pair AXIS service** using `http://127.0.0.1:8766` and
+the `token` in `.axis-ui/pairing.json`. Start the browser bridge in Settings if
+needed. Run the UI service or the CLI at a time. The [detailed UI guide](../docs/AXIS_UI.md)
+covers controls, debug output, approvals and restart limits.
+
+## CLI command reference
+
+Run AXIS from this directory:
+
+```powershell
+uv run python -m axis.cli --help
+uv run python -m axis.cli --debug --max-requests 120 --max-steps 60 --max-actions 120
+```
+
+The [complete CLI usage reference](../README.md#complete-cli-usage) documents
+every flag, its default, configuration precedence, and runnable examples.
+The [interactive command reference](../README.md#interactive-commands-and-budget-continuation)
+covers `/continue`, `/new`, and `/extend`.
+
+## Long research tasks
+
+For a multi-technology review, allocate a bounded budget explicitly:
+
+```powershell
+uv run python -m axis.cli --debug --max-requests 120 --max-steps 60 --max-actions 120
+```
+
+The planner keeps a short remaining-work checklist and source notes containing
+exact quotations checked against runtime evidence. The source register records
+substantive reads, not just opened URLs. Notes, extracts, and the register share
+the 32,000-character retention budget; clipping or eviction is reported.
+The Navigator receives relevant facts, source URLs, and remaining model requests.
+Duplicate source-tab creation reuses the open URL by default; tools can specify
+`reuse=false` when a genuinely separate tab is needed. Existing user tabs are
+not automatically closed to make room.
+
+If a task reaches its budget, AXIS returns an explicitly incomplete report with
+retained sources and remaining work. In the same interactive process, use
+`/extend 60` to add model requests, or `/extend 60 30 60` to add requests,
+steps, and browser actions respectively. Usage totals remain cumulative; a new
+task returns to the configured base limits. `/continue <follow-up>` retains
+context without increasing limits; `/new <task>` starts fresh.
+
+`run.synthesis_reserve_requests` defaults to 3 for research planning.
+`run.final_answer_max_chars` defaults to 24,000, including citations; the planner
+must rewrite oversized answers rather than silently truncate them. These are
+in-process continuations, not crash-safe durable execution.
+
+After updating the extension, reload it at `chrome://extensions` and reconnect
+the bridge. The resolved-target check blocks prohibited download attributes and
+archive links before a click, in addition to the agent's task restrictions.
+
 ## Active AXIS runtime versus frozen compatibility layer
 
 The AXIS planner/navigator runtime imports `browser_tools.py`. It keeps six

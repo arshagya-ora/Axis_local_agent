@@ -1,3 +1,16 @@
+export function assertTaskTargetAllowed(params, element) {
+  const forbidden = params.forbiddenActions || [];
+  const text = [element?.text, element?.accessibleName, element?.ariaLabel, element?.href].filter(Boolean).join(' ');
+  const download = element?.download === true || /\bdownload\b|source code.*(?:zip|tar)|\.(?:zip|tar|gz|exe|msi|csv|xlsx)(?:[?#\s]|$)|\/archive\/refs\//i.test(text);
+  const denied = (forbidden.includes('download') && download) ||
+    (forbidden.includes('login') && /\blog[ -]?in\b|\bsign[ -]?in\b/i.test(text));
+  if (denied) {
+    const error = new Error('The resolved target is prohibited by this task.');
+    error.code = 'POLICY_DENIED';
+    throw error;
+  }
+}
+
 export function createLocatorHandlers({
   assertTabId,
   assertTabAllowed,
@@ -354,6 +367,7 @@ export function createLocatorHandlers({
       ? await runLocatorScript(tabId, { ...params, index, actionKind: 'click' }, 'actionability', frameTarget)
       : await waitForLocatorActionable(tabId, { ...params, index }, 'click', frameTarget);
     if (!target?.element?.clickPoint) throw new Error(`Element has no clickable point for locator ${describeLocator(params)}`);
+    assertTaskTargetAllowed(params, target.element);
     if (frameTarget.frameOffset) frameTarget = await resolveFrameTarget(tabId, params);
     await dispatchRealClick(tabId, applyFrameOffset(target.element.clickPoint, frameTarget), params);
     const result = { element: target.element };
@@ -381,6 +395,7 @@ export function createLocatorHandlers({
       throw createLocatorRefNotActionableError(params, frameTarget, target);
     }
     if (!target?.element?.clickPoint) throw new Error(`Element has no clickable point for ref ${ref}`);
+    assertTaskTargetAllowed(params, target.element);
     if (frameTarget.frameOffset) frameTarget = await resolveFrameTarget(tabId, { ...params, frameId });
     await dispatchRealClick(tabId, applyFrameOffset(target.element.clickPoint, frameTarget), params);
     const result = { element: target.element };
@@ -1085,13 +1100,14 @@ export function createLocatorHandlers({
       wait: params.wait || null
     };
 
-    const [{ result }] = await chromeApi.scripting.executeScript({
+    const injections = await chromeApi.scripting.executeScript({
       target: frameTarget?.target || { tabId },
-      func: options => {
+      func: async options => {
+        try {
         const domA11y = globalThis.__browserAgentBridgeDomA11y;
         if (!domA11y) throw new Error('DOM a11y atom is not loaded');
         const root = resolveDomRoot(options.locator.frameSelector);
-        if (options.wait) return waitForLocatorCondition(root, options);
+        if (options.wait) return await waitForLocatorCondition(root, options);
 
         const matches = findLocatorMatches(root, options.locator);
         const elements = matches.slice(0, options.limit).map((element, index) => summarizeElement(element, index));
@@ -1717,6 +1733,8 @@ export function createLocatorHandlers({
             index,
             tagName: element.tagName.toLowerCase(),
             id: element.id || '',
+            href: (element.closest?.('a[href]') || element).href || '',
+            download: (element.closest?.('a[href]') || element).hasAttribute('download'),
             name: element.getAttribute('name') || '',
             role: inferredRole(element),
             type: element.getAttribute('type') || '',
@@ -1952,10 +1970,26 @@ export function createLocatorHandlers({
             throw new Error(`Frame is not accessible, likely cross-origin: ${frameSelector}`);
           }
         }
+        } catch (error) {
+          // Chrome can discard a thrown/rejected in-page exception and return
+          // null. Transport it explicitly so it cannot become a zero count or
+          // an unrelated TypeError in the service worker.
+          return { locatorScriptError: {
+            code: error?.name === 'SyntaxError' ? 'INVALID_ARGUMENT' : 'BRIDGE_ERROR',
+            message: String(error?.message || error)
+          } };
+        }
       },
       args: [options],
       world: 'MAIN'
     });
+    const result = injections?.[0]?.result;
+    if (!result || typeof result !== 'object' || result.locatorScriptError) {
+      const detail = result?.locatorScriptError;
+      const error = new Error(detail?.message || 'Locator script returned no usable result; observe the page before retrying.');
+      error.code = detail?.code || 'BRIDGE_ERROR';
+      throw error;
+    }
     return result;
   }
 

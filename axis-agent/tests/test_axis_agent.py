@@ -931,7 +931,7 @@ async def test_a_simple_search_completes_through_fill_enter_observation_and_the_
 
     assert result.status == "completed"
     assert result.answer == "The top result is the Pydantic AI docs."
-    assert "<unverified_page_changes>2</unverified_page_changes>" in script.navigator_prompts[1]
+    assert "<unverified_page_changes>0</unverified_page_changes>" in script.navigator_prompts[1]
     assert bridge.methods == [
         "extension.info",          # one-time capability negotiation
         "native.sitePatterns",     # site-pattern preflight

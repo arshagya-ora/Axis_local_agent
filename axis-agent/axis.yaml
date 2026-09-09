@@ -75,6 +75,10 @@ run:
   max_model_requests: 60
   max_browser_actions: 90
   max_consecutive_failures: 3
+  # Reserve room for an honest partial research report near the request limit.
+  synthesis_reserve_requests: 3
+  # Includes the comparison and source register; oversized answers are rewritten.
+  final_answer_max_chars: 24000
   # Observation taken programmatically before every navigator step.
   observation_mode: compact
   observation_max_nodes: 1000

@@ -8,6 +8,10 @@ Chrome extension called **Browser Agent Bridge**.
 You give it a task in plain English. It plans, opens/reads/clicks pages, verifies
 what it did, and answers you.
 
+The extension also provides a conversation workspace with task controls, history,
+and Settings. Follow [Browser UI setup](#browser-ui-setup) below to start and pair
+it, or see the [detailed UI guide](docs/AXIS_UI.md) for controls and continuity.
+
 ```
 You: "Open Hacker News and give me the top five stories with points and comments."
 
@@ -128,9 +132,10 @@ is never shared or committed.
 
 1. Go back to `chrome://extensions` and click **Reload** on the extension.
 2. Open the extension's **side panel** (click the extension icon).
-3. Accept the permission prompts it shows.
-4. Click **Start Bridge**.
-5. The side panel must say **Connected**.
+3. Open **Settings → Connection** and click **Start bridge**.
+4. Accept Chrome's permission prompts when requested.
+5. The **Browser bridge** row must say **Connected**. The **AXIS agent** row
+   connects separately when you start and pair the UI service in Step 4.
 
 Verify from the terminal:
 
@@ -227,8 +232,74 @@ a signing identity.
 
 ## Step 4 — Run it
 
-Make sure Chrome is open, the bridge side panel says **Connected**, and the tab
-you want AXIS to start on is the **active tab**. Then:
+Choose the browser UI or the terminal CLI. Both use the same agent and browser
+bridge. Run one against this checkout at a time; an ownership lock prevents a
+CLI and UI service from controlling the browser simultaneously.
+
+### Browser UI setup
+
+Complete Steps 1–3 first: install dependencies, load the extension and native
+host, and configure `axis-agent/.env`.
+
+1. **Start the UI service.** From the repository root:
+
+   ```powershell
+   cd axis-agent
+   uv run python -m axis.ui_service --debug
+   ```
+
+   If your terminal is already in `axis-agent`, run only the second command.
+   Keep this terminal running while using AXIS. The service prints its local
+   address and pairing-file location. `--debug` shows the same detailed trace
+   as the CLI: planner/navigator outputs, tool arguments and outcomes, evidence,
+   final answers, token usage, timing and unexpected-error tracebacks. Use
+   `--verbose` for compact events, or omit both flags for quiet operation.
+
+2. **Get the UI pairing credential.** Open the generated
+   `axis-agent/.axis-ui/pairing.json` and copy the value of its `token` field.
+   From inside `axis-agent`, the file is `.axis-ui/pairing.json`. This local
+   credential is separate from your model API key and the bridge token from
+   Step 2b; enter it only in the pairing form.
+
+3. **Pair the extension.** Open the AXIS side panel, then
+   **Settings → Connection → Pair AXIS service**. Set **Service address** to
+   `http://127.0.0.1:8766`, paste the token into **UI pairing credential**, and
+   click **Save and connect**. The **AXIS agent** row should show **Connected**.
+
+4. **Check the browser connection.** If the **Browser bridge** row is stopped,
+   click **Start bridge** and accept Chrome's permission prompts. The workspace
+   shows **Connected** when both the UI service and browser bridge are ready.
+   The UI service defaults to port **8766**; browser RPC uses **8765**.
+
+5. **Send a task.** Use the back arrow to return to the workspace, enter an
+   instruction and click Send. Activity appears in one expandable task card.
+   Use **Pause**, **Resume**, or **Stop** there; use **Current task** to attach
+   a follow-up and **New task** for independent work. History and Settings are
+   available from the toolbar. Instructions are entered in the extension even
+   when the terminal is displaying debug output.
+
+Pairing and appearance persist between launches. After updating the checkout,
+run `uv sync` from the repository root and reload the extension at
+`chrome://extensions`. For later sessions, start the UI service again, open the
+panel, and start the bridge if needed; reuse the saved pairing credential.
+Use `uv run python -m axis.ui_service --help` for options such as `--port` and
+`--config`. If you change the service port, update **Service address** to match.
+
+Closing the panel leaves the Python task running, and reopening restores its
+view. Stopping/restarting Python restores saved history but marks unfinished
+work **Interrupted**. Pause/resume and **Extend budget** require the original
+live process. For an exhausted task, the composer also accepts
+`/extend 60 30 60` to add model requests, steps and browser actions while keeping
+the task's tabs, sources and evidence.
+
+See the [UI guide](docs/AXIS_UI.md) for advanced settings, approvals and recovery
+limits, and the [delivery report](docs/AXIS_UI_DELIVERY.md) for screenshots.
+
+### Run the terminal CLI
+
+Make sure Chrome is open, **Settings → Connection → Browser bridge** says
+**Connected**, and the tab you want AXIS to start on is the **active tab**.
+Stop the UI service before starting the CLI. From the repository root:
 
 ```bash
 cd axis-agent
@@ -247,19 +318,94 @@ planner decision, every navigator step, every browser call with its arguments
 and whether it passed, failed, or was refused. It also keeps the session open so
 you can type follow-up questions.
 
-### The flags that matter
+### Complete CLI usage
 
-| Flag | What it does |
+Run these commands from `axis-agent`. Omit the optional quoted task to enter it
+at the `You:` prompt. CLI overrides take precedence over the selected YAML file.
+
+```text
+uv run python -m axis.cli [task]
+    [-h | --help] [--config PATH]
+    [--interactive] [--verbose] [--debug]
+    [--approve] [--capture] [--diagnose]
+    [--visual-mode {auto,off}]
+    [--max-steps N] [--max-requests N] [--max-actions N]
+```
+
+The brackets above indicate optional arguments; do not type them in a command.
+
+| Argument / flag | Default | What it does |
+| --- | --- | --- |
+| `"task"` | Prompt for input | The task or question, supplied as one quoted positional argument. |
+| `-h`, `--help` | — | Print all arguments and exit without starting a task. |
+| `--config PATH` | `axis-agent/axis.yaml` | Load another YAML configuration; an explicit relative path is relative to the working directory. |
+| `--interactive` | Off | Keep the terminal session open for follow-ups after the first result. |
+| `--verbose` | Off | Print short orchestrator events. |
+| `--debug` | Off | Print the full planner, navigator, and browser-call trace. Implies `--interactive` and takes precedence over `--verbose`. |
+| `--approve` | Off | Prompt for operations listed in `tools.approval_required_actions` (shipped configuration: upload and drag). Other runtime and bridge restrictions still apply. |
+| `--capture` | Configuration/task-driven | Enable `browser_capture_evidence`. This makes the tool available; it does not itself take a screenshot. |
+| `--diagnose` | Configuration/task-driven | Enable `browser_diagnose` for console, network, and other diagnostics. This does not itself collect them. |
+| `--visual-mode auto` | `run.visual_mode` (`auto`) | Allow automatic visual recovery when DOM information is insufficient. |
+| `--visual-mode off` | — | Disable automatic image input and coordinate recovery for this run. |
+| `--max-steps N` | `run.max_total_steps` (`30`) | Set the task's total Navigator-step limit. |
+| `--max-requests N` | `run.max_model_requests` (`60`) | Set the shared model-request limit, including Planner calls and Navigator tool round trips. |
+| `--max-actions N` | `run.max_browser_actions` (`90`) | Set the total browser-action limit. The per-step limit remains configured separately in YAML. |
+
+Use positive integers for all three budget flags. The parenthesized defaults
+above are the shipped YAML values; a custom config can change them. Increasing
+one budget does not increase the other two.
+
+### Command examples
+
+Interactive mode with short progress output:
+
+```powershell
+uv run python -m axis.cli --interactive --verbose
+```
+
+Long research with an explicit budget and full trace:
+
+```powershell
+uv run python -m axis.cli --debug --max-requests 120 --max-steps 60 --max-actions 120
+```
+
+An explicit config with approval prompts, optional tools, and visual recovery:
+
+```powershell
+uv run python -m axis.cli --config .\axis.yaml --debug --approve --capture --diagnose --visual-mode auto --max-requests 120 --max-steps 60 --max-actions 120 "Open https://example.com, summarize the page, check console and network errors, and save a screenshot."
+```
+
+DOM-only browsing and the built-in help reference:
+
+```powershell
+uv run python -m axis.cli --visual-mode off "Summarize the current page."
+uv run python -m axis.cli --help
+```
+
+### Interactive commands and budget continuation
+
+Enter these at `You (blank to quit) >` after starting with `--interactive` or
+`--debug`. They are session commands, not launch flags.
+
+| Command | Behavior |
 | --- | --- |
-| `--debug` | Full trace + interactive follow-ups. **Use this for evaluation.** |
-| `--verbose` | One short line per event instead of the full trace |
-| `--interactive` | Follow-up questions, without the full trace |
-| `--max-steps N` | Stop a run after N navigator steps. Useful for capping runaway tasks |
-| `--capture` | Force the screenshot/evidence tool on |
-| `--diagnose` | Force the console/network diagnostic tool on |
-| `--visual-mode auto\|off` | Enable automatic visual recovery (default `auto`) or use DOM observations only |
-| `--approve` | Ask you for confirmation before consequential actions (upload, drag) |
-| `--config PATH` | Use a different config file instead of `axis.yaml` |
+| `/continue <follow-up>` | Retain the current task's facts, sources, and context; does not increase its budgets. |
+| `/new <task>` | Start independent task memory with the configured base budgets, including launch-time overrides. |
+| `/extend 60` | After `limit_reached`, add 60 model requests and resume the same task. |
+| `/extend 60 30 60` | After `limit_reached`, add 60 model requests, 30 Navigator steps, and 60 browser actions, in that order. |
+| Blank input | Exit the interactive session. |
+| `Ctrl+C` | Interrupt execution; completed browser actions are not undone. |
+
+`/extend` preserves sources, tabs, and cumulative usage counts; it requires a
+task stopped at its budget limit. An unprefixed reply continues a paused task
+or a task waiting for user input; otherwise it starts a new task. Continuation
+requires the same running process.
+
+Answer length and the research synthesis reserve are YAML settings:
+`run.final_answer_max_chars: 24000` and `run.synthesis_reserve_requests: 3`.
+There are no separate CLI flags for these settings. See
+[long research tasks](axis-agent/README.md#long-research-tasks) for the memory
+and source-retention behavior.
 
 ### Verification, memory, and visual recovery
 
@@ -269,6 +415,17 @@ expected result; simply reading the page again or writing a confident summary
 does not verify a mutation. Reading tasks use runtime-issued evidence from
 observations and extractions. A download goal is verified by a completed file
 matching its declared filename or URL within the current task's download window.
+
+Navigation uses an observed URL postcondition. On supported Google, Bing, and
+DuckDuckGo search pages, submitting a search is verified by a fresh results URL
+with the submitted query. Source and tab coverage comes from retained browser
+evidence, not exact counts of search-result links. CSS locators use native CSS;
+use `has_text` rather than Playwright's `:has-text()` extension.
+
+If research fails, AXIS returns the retained source register and remaining work
+with the failure reason. Use `/continue <recovery instructions>` in the same
+interactive session to retain that context. Debug output includes the planner's
+verification check and remaining-work list.
 
 Useful extracted facts retain their source URL, tab, goal, and evidence ID
 across steps and planner passes. Memory holds at most 16 fact entries and
@@ -423,7 +580,10 @@ are the ones I want to fix first.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `BRIDGE_UNAVAILABLE` on every call | The bridge is not running. Open the extension side panel and click **Start Bridge**. It must say Connected. |
+| `BRIDGE_UNAVAILABLE` on every call | Open the extension side panel → **Settings → Connection → Start bridge**. The **Browser bridge** row must say Connected. |
+| UI shows **Service offline** | Keep `uv run python -m axis.ui_service --debug` running from `axis-agent`, then check the paired service address (default `http://127.0.0.1:8766`). |
+| **Pairing credential was rejected** | Reopen **Pair AXIS service**, copy `token` from the pairing file printed by the running service, and choose **Save and connect**. Use the UI credential, not the provider key or browser RPC token. |
+| **AXIS runtime is owned by another CLI or UI service** | Stop the other AXIS process before launching this one. Only one CLI or UI service can own this checkout's runtime. |
 | `NO_MANAGED_TAB` | No usable Chrome tab was found. Make sure Chrome is open with at least one ordinary tab, and that the tab you want is the active one. |
 | `Missing provider configuration: set AXIS_...` | That variable is missing from `axis-agent/.env`. See the table in [Option A](#option-a--api-key-use-this-one). |
 | `401` / `invalid_api_key` / `authentication` error | Using Option A: the key in `AXIS_API_KEY` is wrong, expired, or has stray whitespace or quotes around it. Re-copy it, then tell me if it still fails. |
@@ -447,6 +607,7 @@ prompts, and this guide.
 **Never committed** — and blocked by [.gitignore](.gitignore):
 
 - `axis-agent/.env` — your filled-in environment values, **including your API key**
+- `axis-agent/.axis-ui/` — the local UI pairing credential and conversation database
 - `~/.oci/config` and any `.pem` private key — these live in your home directory
 - `~/.browser-agent-bridge.env` — your locally generated bridge token
 - `.venv/`, `__pycache__/`, `.pytest_cache/` — rebuild with `uv sync`

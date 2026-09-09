@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import vm from 'node:vm';
 
 async function importLocatorModule() {
   const source = await readFile(new URL('../extension/sw/locator.js', import.meta.url), 'utf8');
@@ -24,7 +25,7 @@ async function makeHandlers(result) {
     keyboardDispatcher: {},
     sleep,
     defaultTimeoutMs: 30,
-    chromeApi: { scripting: { executeScript: async () => [{ result }] } }
+    chromeApi: { scripting: { executeScript: async (options) => [{ result: typeof result === 'function' ? await result(options) : result }] } }
   });
 }
 
@@ -38,6 +39,44 @@ async function captureRejection(promise) {
 }
 
 const COMMON = { tabId: 1, selector: 'x', timeoutMs: 25, intervalMs: 10 };
+
+test('missing locator script results never satisfy zero-count or hidden assertions', async () => {
+  for (const result of [null, undefined]) {
+    const handlers = await makeHandlers(result);
+    for (const operation of [
+      () => handlers.expectLocatorToHaveCount({ ...COMMON, count: 0 }),
+      () => handlers.expectLocatorToBeHidden(COMMON),
+      () => handlers.locatorCount(COMMON)
+    ]) {
+      const error = await captureRejection(operation());
+      assert.equal(error.code, 'BRIDGE_ERROR');
+      assert.match(error.message, /no usable result/);
+    }
+  }
+});
+
+test('invalid CSS in the actual injected script returns a correction, not a null count', async () => {
+  const handlers = await makeHandlers(async ({ func, args }) => {
+    const context = vm.createContext({
+      document: {},
+      __browserAgentBridgeDomA11y: {
+        querySelectorAllDeep: () => { throw new DOMException('Invalid CSS :has-text()', 'SyntaxError'); }
+      }
+    });
+    const run = vm.runInContext('(' + func.toString() + ')', context);
+    return run(args[0]);
+  });
+  const error = await captureRejection(handlers.locatorCount({ ...COMMON, selector: 'a:has-text("Docs")' }));
+  assert.equal(error.code, 'INVALID_ARGUMENT');
+  assert.match(error.message, /Invalid CSS/);
+});
+
+test('transported rejected locator waits preserve their error code', async () => {
+  const handlers = await makeHandlers({ locatorScriptError: { code: 'INVALID_ARGUMENT', message: 'Invalid selector' } });
+  const error = await captureRejection(handlers.expectLocatorToHaveCount({ ...COMMON, count: 3 }));
+  assert.equal(error.code, 'INVALID_ARGUMENT');
+  assert.equal(error.message, 'Invalid selector');
+});
 
 test('toBeEnabled passes for an enabled element', async () => {
   const handlers = await makeHandlers({ element: { disabled: false, editable: true, checked: false, value: '' } });

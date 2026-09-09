@@ -115,6 +115,8 @@ class Locator(Command):
     def has_strategy(self) -> Locator:
         if not any((self.selector, self.text, self.role, self.name, self.label, self.placeholder)):
             raise ValueError("A locator needs selector, text, role/name, label, or placeholder.")
+        if self.selector and re.search(r":(?:has-text|text-is|text-matches|text|visible|nth-match)\s*(?:\(|$)", self.selector):
+            raise ValueError("selector must be native CSS. Use has_text/text, visible, within, or index instead of Playwright pseudo-selectors.")
         return self
 
     def bridge_value(self) -> dict[str, Any]:
@@ -162,6 +164,7 @@ class ListTabs(Command):
 class CreateTab(Command):
     operation: Literal["create"]
     url: NonEmpty = "about:blank"
+    reuse: bool = True
 
 
 class ExistingTab(Command):
@@ -570,6 +573,7 @@ class TabState:
     title: str | None = None
     active: bool = False
     closed: bool = False
+    task_created: bool = False
 
 
 @dataclass
@@ -722,6 +726,7 @@ class BrowserRuntime:
         self.allow_coordinate_fallback = allow_coordinate_fallback
         self.visual_enabled = False
         self.task_started_wallclock = time.time()
+        self.forbidden_actions: frozenset[str] = frozenset()
         self.tabs: dict[str, TabState] = {}
         self.observations: dict[str, Observation] = {}
         self.issued_refs: dict[str, str] = {}
@@ -894,12 +899,15 @@ class BrowserRuntime:
                 raise ToolFault("TAB_LIMIT", "The browser tab limit has been reached.")
             self._tab_number += 1
             alias = f"tab_{self._tab_number}"
-        self.tabs[alias] = TabState(raw_id, raw.get("url"), raw.get("title"), bool(raw.get("active")))
+        created = self.tabs[alias].task_created if alias in self.tabs else False
+        self.tabs[alias] = TabState(raw_id, raw.get("url"), raw.get("title"), bool(raw.get("active")),
+                                   task_created=created)
         return alias
 
     def public_tab(self, alias: str) -> dict[str, Any]:
         state = self.tabs[alias]
-        return {"tab": alias, "title": state.title, "url": self.safe_url(state.url), "active": state.active}
+        return {"tab": alias, "title": state.title, "url": self.safe_url(state.url),
+                "active": state.active, "task_created": state.task_created}
 
     @staticmethod
     def safe_url(url: str | None) -> str | None:
@@ -1223,9 +1231,16 @@ def browser_tabs(ctx: RunContext[BrowserRuntime], command: TabCommand) -> dict[s
                         raise
             return _ok(None, {"tabs": [rt.public_tab(alias) for alias in aliases]})
         if isinstance(command, CreateTab):
+            if command.reuse and command.url != "about:blank":
+                existing = next((a for a, t in rt.tabs.items() if not t.closed and t.url == command.url), None)
+                if existing:
+                    return _ok(existing, {**rt.public_tab(existing), "reused": True})
+            if sum(not tab.closed for tab in rt.tabs.values()) >= rt.max_tabs:
+                raise ToolFault("TAB_LIMIT", "Tab capacity is full; reuse an existing task tab. No tab was created.")
             result = rt._rpc("tabs.create", {"url": command.url, "active": True}, url=command.url) or {}
             raw = result.get("tab") if isinstance(result.get("tab"), dict) else result
             alias = rt._register(raw)
+            rt.tabs[alias].task_created = True
             return _ok(alias, rt.public_tab(alias))
         state = rt.tab(command.tab)
         if command.operation == "activate":
@@ -1373,6 +1388,8 @@ def browser_act(ctx: RunContext[BrowserRuntime], tab: NonEmpty, command: ActComm
             params = {"tabId": state.raw_id}
             if command.action == "accept_dialog" and command.prompt_text is not None:
                 params["promptText"] = command.prompt_text
+        if rt.forbidden_actions:
+            params["forbiddenActions"] = sorted(rt.forbidden_actions)
         rt.invalidate_visual(tab)
         result = rt._rpc(method, params, tab=tab) or {}
         changed, popup_aliases = _public_action_change(rt, result.get("whatChanged"))

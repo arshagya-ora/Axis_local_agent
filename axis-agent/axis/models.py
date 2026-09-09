@@ -8,6 +8,7 @@ to a browser, a provider, or Pydantic AI's runtime.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import time
 from typing import Any, Literal
 from uuid import uuid4
@@ -20,6 +21,7 @@ from pydantic_ai import CancellationToken, RunUsage
 # instead, so a chatty model costs a truncation rather than a retry.
 MAX_STRING = 600
 MAX_ANSWER = 4_000
+MAX_REQUEST = 16_000
 MAX_SNAPSHOT = 12_000
 MAX_EVIDENCE = 6
 MAX_EXTRACT = 4_000
@@ -72,6 +74,16 @@ class GoalCheck(BaseModel):
         return self
 
 
+class SourceNote(BaseModel):
+    """A proposed short excerpt, accepted only after runtime citation validation."""
+
+    model_config = ConfigDict(extra="forbid")
+    topic: str = Field(min_length=1, max_length=120)
+    dimension: str = Field(min_length=1, max_length=120)
+    evidence_id: str
+    quote: str = Field(min_length=8, max_length=800)
+
+
 class PlanDecision(BaseModel):
     """The planner's typed decision. The planner has no tools; this is its
     only channel, and it is the only place overall completion is decided."""
@@ -86,6 +98,8 @@ class PlanDecision(BaseModel):
     final_answer: str | None = None
     evidence: list[str] = Field(default_factory=list)
     reason: str = ""
+    source_notes: list[SourceNote] = Field(default_factory=list, max_length=24)
+    remaining_work: list[str] = Field(default_factory=list, max_length=24)
 
     @field_validator("plan_summary", "next_goal", "success_condition", "reason")
     @classmethod
@@ -95,7 +109,9 @@ class PlanDecision(BaseModel):
     @field_validator("final_answer")
     @classmethod
     def _answer(cls, value: str | None) -> str | None:
-        return clip(value, MAX_ANSWER)
+        if value is not None and len(value) > 64_000:
+            raise ValueError("Final answer must fit within 64,000 characters.")
+        return value
 
     @field_validator("evidence")
     @classmethod
@@ -138,6 +154,7 @@ class ActionRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool: str
+    recovered: bool = False
     tab: str | None = None
     operation: str | None = None
     args: str | None = None
@@ -157,6 +174,7 @@ class ActionRecord(BaseModel):
     target: str | None = None
     evidence_id: str | None = None
     expected_value: Any = None
+    key: str | None = None
 
     @computed_field
     @property
@@ -245,6 +263,9 @@ class PendingChange(BaseModel):
     sequence: int
     count: int = 1
     expected_url: str | None = None
+    search_query: str | None = None
+    search_host: str | None = None
+    search_submitted: bool = False
     verification: GoalCheck | None = None
 
 
@@ -262,6 +283,11 @@ class TaskRequirements(BaseModel):
     require_network_check: bool = False
     mutation_allowed: bool = True
     forbidden_actions: set[str] = Field(default_factory=set)
+    prohibitions: list[str] = Field(default_factory=list)
+    min_sources: int = 0
+    min_tabs: int = 0
+    min_actions: int = 0
+    require_search: bool = False
 
 
 class RunCounters(BaseModel):
@@ -293,6 +319,7 @@ class TabSummary(BaseModel):
     title: str | None = None
     url: str | None = None
     active: bool = False
+    task_created: bool = False
 
 
 class BrowserState(BaseModel):
@@ -330,6 +357,9 @@ class BrowserState(BaseModel):
     facts: list[TaskFact] = Field(default_factory=list)
     memory_truncated: bool = False
     pending_changes: list[PendingChange] = Field(default_factory=list)
+    remaining_model_requests: int = 0
+    remaining_work: list[str] = Field(default_factory=list)
+    source_register: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("snapshot")
     @classmethod
@@ -358,6 +388,14 @@ class TaskRunState(BaseModel):
     assertions: list[AssertionRecord] = Field(default_factory=list)
     downloads: list[Evidence] = Field(default_factory=list)
     diagnostic_evidence: list[Evidence] = Field(default_factory=list)
+    source_register: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    source_note_errors: list[str] = Field(default_factory=list)
+    remaining_work: list[str] = Field(default_factory=list)
+    successful_actions: int = 0
+    search_observed: bool = False
+    extra_model_requests: int = 0
+    extra_browser_actions: int = 0
+    extra_steps: int = 0
     last_browser_state: BrowserState | None = Field(default=None, exclude=True)
     usage: RunUsage = Field(default_factory=RunUsage, exclude=True)
     cancellation_token: CancellationToken = Field(default_factory=CancellationToken, exclude=True)
@@ -410,7 +448,7 @@ class TaskRunState(BaseModel):
     max_extracted_data: int = 16
 
     def add_followup(self, follow_up: str) -> None:
-        self.follow_ups = (self.follow_ups + [clip(follow_up, MAX_ANSWER) or ""])[-self.max_followups:]
+        self.follow_ups = (self.follow_ups + [clip(follow_up, MAX_REQUEST) or ""])[-self.max_followups:]
 
     def complete_goal(self, summary: str) -> None:
         self.completed_goal_summaries = (
@@ -456,7 +494,8 @@ class TaskRunState(BaseModel):
             self.memory_truncated = True
         fact.value = clip(fact.value, MAX_EXTRACT) or ""
         self.facts.append(fact)
-        while len(self.facts) > min(self.max_extracted_data, 16) or sum(len(f.model_dump_json()) for f in self.facts) > 32_000:
+        while self.facts and (len(self.facts) > min(self.max_extracted_data, 16)
+                or sum(len(f.model_dump_json()) for f in self.facts) + len(json.dumps(self.source_register)) > 32_000):
             index = min(range(len(self.facts)), key=lambda i: (self.facts[i].priority, i))
             self.facts.pop(index)
             self.memory_truncated = True
@@ -596,6 +635,8 @@ class RunConfig(BaseModel):
     max_model_requests: int = Field(default=60, ge=1)
     max_browser_actions: int = Field(default=90, ge=1)
     max_consecutive_failures: int = Field(default=3, ge=1)
+    final_answer_max_chars: int = Field(default=24_000, ge=1_000, le=64_000)
+    synthesis_reserve_requests: int = Field(default=3, ge=0, le=10)
     observation_mode: Literal["compact", "aria", "text"] = "compact"
     observation_max_nodes: int = Field(default=1_000, ge=1, le=2_000)
     include_screenshot: bool = False
@@ -658,7 +699,7 @@ class AxisConfig(BaseModel):
 
     def new_memory(self, task: str, requirements: TaskRequirements | None = None) -> TaskRunState:
         return TaskRunState(
-            original_request=clip(task, MAX_ANSWER) or "",
+            original_request=clip(task, MAX_REQUEST) or "",
             requirements=requirements or TaskRequirements(),
             **self.memory.model_dump(),
         )

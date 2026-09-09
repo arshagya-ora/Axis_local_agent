@@ -12,10 +12,13 @@ dependencies = [
     "pydantic==2.13.5",
     "pydantic-ai-slim[openai]==2.40.0",
     "pyyaml==6.0.3",
+    "starlette>=1.6.0",
+    "uvicorn>=0.52.4",
 ]
 
 [dependency-groups]
 dev = [
+    "playwright>=1.62.0",
     "pydantic-evals==2.40.0",
     "pytest==8.4.2",
 ]

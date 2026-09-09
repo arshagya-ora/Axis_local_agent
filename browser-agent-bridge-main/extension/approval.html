@@ -1,28 +1,15 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Browser Agent Bridge Approval</title>
-    <link rel="stylesheet" href="sidepanel.css">
+    <link rel="stylesheet" href="sidepanel.css" />
   </head>
-  <body>
+  <body class="approval-page">
     <main>
-      <header>
-        <h1>Authorization Request</h1>
-        <span class="status disconnected">Review</span>
-      </header>
-      <div id="permission-card" class="permission-card">
-        <h3>⚠️ Authorization Request</h3>
-        <div id="permission-details" class="permission-details">
-          Waiting for a pending request...
-        </div>
-        <div class="permission-actions">
-          <button id="perm-allow-btn" class="primary-btn">Allow</button>
-          <button id="perm-session-allow-btn">Always</button>
-          <button id="perm-deny-btn" class="danger-btn">Deny</button>
-        </div>
-      </div>
+      <header><h1>AXIS · Browser approval</h1></header>
+      <div id="permission-card">Restoring pending requests…</div>
     </main>
     <script type="module" src="approval.js"></script>
   </body>

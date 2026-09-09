@@ -16,15 +16,7 @@ from typing import Any
 if __package__ in (None, ""):  # `python axis/cli.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Web content (page titles, model answers) routinely contains characters a
-# default console codepage can't encode (e.g. Windows cp1252) — without this,
-# printing them raises UnicodeEncodeError, which AxisOrchestrator._emit()
-# swallows silently for event callbacks, so output just vanishes or garbles
-# (e.g. curly quotes rendering as `<63>`). UTF-8 with replacement keeps the
-# CLI legible regardless of the host console's default encoding.
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+from axis.console import configure_console, print_event, print_debug_event, print_result
 
 from browser_bridge_client import BrowserBridgeClient
 from browser_tools import BrowserRuntime
@@ -34,177 +26,8 @@ from axis.models import AxisConfig, AxisEvent, AxisResult
 from axis.orchestrator import AxisOrchestrator
 
 
-def build_runtime(config: AxisConfig, client: Any | None = None) -> BrowserRuntime:
-    """One :class:`BrowserRuntime` configured from ``axis.yaml``."""
-    browser = config.browser
-    firewall = browser.firewall
-    return BrowserRuntime(
-        client or BrowserBridgeClient(),
-        max_tabs=browser.max_open_tabs,
-        allow_response_body=browser.allow_response_body,
-        upload_roots=tuple(browser.upload_roots),
-        artifact_directory=browser.artifact_directory,
-        firewall_default=firewall.default,
-        allow_urls=tuple(firewall.allow_urls),
-        deny_urls=tuple(firewall.deny_urls),
-        deny_schemes=tuple(firewall.deny_schemes),
-        allow_methods=tuple(firewall.allow_methods),
-        deny_methods=tuple(firewall.deny_methods),
-        allow_coordinate_fallback=browser.allow_coordinate_fallback,
-    )
-
-
-def build_orchestrator(
-    config: AxisConfig,
-    *,
-    bridge: Any | None = None,
-    openai_client: Any | None = None,
-    model_name: str | None = None,
-    on_event: Any | None = None,
-    approval: Any | None = None,
-) -> AxisOrchestrator:
-    """Wire config -> one shared model -> planner + navigator -> orchestrator."""
-    model = build_model(config, client=openai_client, model_name=model_name)
-
-    def navigator_factory(*, capture: bool, diagnose: bool, downloads: bool, visual: bool = False):
-        """Rebuild the navigator when an opt-in tool becomes necessary. Cheap:
-        the model instance is shared, only the tool list changes."""
-        variant = config.model_copy(deep=True)
-        variant.tools.capture_evidence = capture
-        variant.tools.diagnose = diagnose
-        variant.tools.downloads = downloads
-        variant.tools.visual = visual
-        return build_navigator(variant, model)
-
-    return AxisOrchestrator(
-        browser=build_runtime(config, bridge),
-        planner=build_planner(config, model),
-        navigator=build_navigator(config, model),
-        config=config,
-        on_event=on_event,
-        approval=approval,
-        navigator_factory=navigator_factory,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Plain event printing (--verbose)
-# ---------------------------------------------------------------------------
-
-def print_event(event: AxisEvent) -> None:
-    detail = ", ".join(f"{key}={value!r}" for key, value in event.detail.items() if value not in (None, ""))
-    print(f"  · {event.kind}: {detail}", file=sys.stderr, flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Full-trace debug printing (--debug): every planner/navigator output in
-# full, every browser tool call — including ones the runtime refused to
-# execute — with its arguments and pass/fail status, so a failure or a
-# success can be traced back to its exact step.
-# ---------------------------------------------------------------------------
-
-_RULE = "-" * 72  # plain ASCII: box-drawing/emoji chars silently vanish on a
-# non-UTF-8 console (e.g. Windows cp1252) since AxisOrchestrator._emit()
-# swallows callback exceptions rather than letting a print failure end a run.
-
-
-def _kv(detail: dict[str, Any], *keys: str) -> str:
-    return "  ".join(f"{k}={detail[k]!r}" for k in keys if detail.get(k) not in (None, "", []))
-
-
-def _stamp(detail: dict[str, Any]) -> str:
-    """Wall-clock offset since the run started, as [mm:ss.mmm]."""
-    ms = int(detail.get("at_ms") or 0)
-    return f"[{ms // 60000:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}]"
-
-
-def _took(detail: dict[str, Any]) -> str:
-    ms = detail.get("duration_ms")
-    return f"  ({ms / 1000:.1f}s)" if isinstance(ms, int) and ms else ""
-
-
-def print_debug_event(event: AxisEvent) -> None:
-    d = event.detail
-    at = _stamp(d)
-    if event.kind == "status":
-        phase = d.get("phase", "")
-        if phase == "planner_started":
-            print(f"\n{_RULE}\n{at} >> PLANNER  (steps_since_plan={d.get('steps_since_plan')})", flush=True)
-        elif phase == "navigator_step_started":
-            print(f"\n{_RULE}\n{at} >> NAVIGATOR STEP  goal={d.get('goal')!r}", flush=True)
-        elif phase == "tools_changed":
-            print(f"{at}   [TOOLS] capture={d.get('capture')} diagnose={d.get('diagnose')}")
-        elif phase == "observed":
-            print(f"{at}   [OBSV] tab={d.get('tab')}{_took(d)}")
-        elif phase == "vision_unavailable":
-            print(f"{at}   [VISION] {d.get('reason')}")
-        elif phase in ("tab_list", "tab_create", "tab_selected"):
-            icon = "OK  " if d.get("success", True) else "FAIL"
-            print(f"{at}   [{icon}] {phase}  {_kv(d, 'tabs', 'tab', 'url')}")
-            if d.get("error"):
-                print(f"          error: {d['error']}")
-        return
-
-    if event.kind == "planner_decision":
-        print(f"  decision={d.get('decision')}{_took(d)}  {_kv(d, 'reason')}")
-        for key in ("plan_summary", "next_goal", "success_condition", "final_answer"):
-            if d.get(key):
-                print(f"  {key}: {d[key]}")
-        for item in d.get("evidence") or []:
-            print(f"  evidence: {item}")
-        return
-
-    if event.kind == "navigator_step":
-        browser_ms = d.get("browser_ms") or 0
-        print(
-            f"  status={d.get('status')}  actions_used={d.get('actions')}{_took(d)}"
-            f"{f' [browser {browser_ms / 1000:.1f}s]' if browser_ms else ''}  {_kv(d, 'interrupted')}"
-        )
-        if d.get("summary"):
-            print(f"  summary: {d['summary']}")
-        if d.get("reason"):
-            print(f"  reason: {d['reason']}")
-        for item in d.get("evidence") or []:
-            print(f"  evidence: {item}")
-        return
-
-    if event.kind == "browser_action":
-        icon = "SKIP" if d.get("skipped") else ("OK  " if d.get("success") else "FAIL")
-        call = f"{d.get('tool')}.{d.get('operation')}" if d.get("operation") else str(d.get("tool"))
-        line = f"{at}   [{icon}] {call}{_took(d)}"
-        if d.get("args"):
-            line += f"  ({d['args']})"
-        print(line)
-        if d.get("error"):
-            print(f"          error: {d['error']}")
-        if d.get("refs_invalidated"):
-            print("          refs invalidated -> fresh observation next")
-        return
-
-    if event.kind == "final":
-        print(f"\n{_RULE}\n{at} == FINAL  status={d.get('status')}  {_kv(d, 'reason')}\n{_RULE}", flush=True)
-        return
-
-
-def print_result(result: AxisResult) -> None:
-    print(f"\n[{result.status}] {result.reason}")
-    if result.answer:
-        print(f"\n{result.answer}")
-    for item in result.evidence:
-        print(f"  - {item}")
-    for limitation in result.limitations:
-        print(f"Limitation: {limitation}")
-    other_ms = max(0, result.duration_ms - result.model_ms - result.browser_ms)
-    print(
-        f"\nsteps={result.total_steps} planner_passes={result.planner_passes} "
-        f"browser_actions={result.browser_actions} model_requests={result.model_requests}"
-    )
-    print(f"tokens: input={result.input_tokens} output={result.output_tokens}")
-    print(
-        f"time: total={result.duration_ms / 1000:.1f}s "
-        f"model={result.model_ms / 1000:.1f}s browser={result.browser_ms / 1000:.1f}s "
-        f"other={other_ms / 1000:.1f}s"
-    )
+from axis.bootstrap import build_runtime, build_orchestrator
+from axis.ownership import RuntimeOwnership
 
 
 def confirm(tool: str, operation: str | None, detail: dict[str, Any]) -> bool:
@@ -225,6 +48,10 @@ async def run(args: argparse.Namespace) -> int:
     config = AxisConfig.load(args.config)
     if args.max_steps is not None:
         config.run.max_total_steps = args.max_steps
+    if getattr(args, "max_requests", None) is not None:
+        config.run.max_model_requests = args.max_requests
+    if getattr(args, "max_actions", None) is not None:
+        config.run.max_browser_actions = args.max_actions
     if args.capture:
         config.tools.capture_evidence = True
     if args.diagnose:
@@ -255,6 +82,18 @@ async def run(args: argparse.Namespace) -> int:
             break
         if not follow_up:
             break
+        if follow_up.lower().startswith("/extend"):
+            try:
+                amounts = [int(value) for value in follow_up.split()[1:]]
+                if len(amounts) not in {1, 3}:
+                    raise ValueError("Use /extend REQUESTS [STEPS ACTIONS].")
+                result = await orchestrator.extend_budget(amounts[0],
+                    steps=amounts[1] if len(amounts) == 3 else 0,
+                    actions=amounts[2] if len(amounts) == 3 else 0)
+                print_result(result)
+            except ValueError as exc:
+                print(str(exc))
+            continue
         explicit_continue = follow_up.lower().startswith("/continue ")
         explicit_new = follow_up.lower().startswith("/new ")
         if explicit_continue or explicit_new:
@@ -268,6 +107,7 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("task", nargs="?", default=None, help="The task or question for AXIS (omit to be prompted).")
     parser.add_argument("--config", default=None, help="Path to axis.yaml (default: axis-agent/axis.yaml).")
@@ -284,8 +124,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--diagnose", action="store_true", help="Add browser_diagnose for this run.")
     parser.add_argument("--visual-mode", choices=("auto", "off"), help="Automatic visual recovery, or text-only browsing.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override run.max_total_steps.")
+    parser.add_argument("--max-requests", type=int, default=None, help="Override the task's model request budget.")
+    parser.add_argument("--max-actions", type=int, default=None, help="Override the task's browser action budget.")
     try:
-        return asyncio.run(run(parser.parse_args(argv)))
+        args = parser.parse_args(argv)
+        with RuntimeOwnership():
+            return asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\n[cancelled] Interrupted by user.")
         return 130
