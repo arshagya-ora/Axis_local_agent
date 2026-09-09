@@ -31,7 +31,7 @@ AXIS  →  planner decides a goal
 
 ## Before you start: what you need
 
-You need **five** things. Three you install yourself, two I send you on Slack.
+You need **four** things. Three you install yourself, one I send you on Slack.
 
 **Install yourself:**
 
@@ -41,15 +41,17 @@ You need **five** things. Three you install yourself, two I send you on Slack.
    - Windows (PowerShell): `powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"`
    - macOS / Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
-**I send you on Slack** (these are credentials, so they are deliberately **not**
-in this repository):
+**I send you on Slack** (credentials, so they are deliberately **not** in this
+repository):
 
-4. Your **OCI API signing key** (a `.pem` private key file) and the four
-   identity values that go with it.
-5. The **AXIS model / project values** that go into your `.env` file.
+4. An **API key**, plus the model name and project OCID that go with it. You
+   paste these three values into one file and you are done — see
+   [Step 3](#step-3-add-your-credentials).
 
-Exactly which values, and exactly where to put them, is in
-[Step 3](#step-3-add-your-credentials) below.
+That is the normal path. There is a second, heavier auth option using an OCI
+signing key and `~/.oci/config`, documented in
+[Step 3, Option B](#option-b--oci-request-signing). **Use Option A unless I
+told you otherwise.**
 
 ---
 
@@ -72,7 +74,7 @@ Check it worked:
 uv run python -m pytest axis-agent/tests -q
 ```
 
-You should see **208 passed**. These tests need no Chrome and no credentials —
+You should see **219 passed**. These tests need no Chrome and no credentials —
 if they pass, your Python side is set up correctly.
 
 ---
@@ -144,64 +146,80 @@ python scripts/doctor.py --skip-live
 
 ## Step 3 — Add your credentials
 
-There are two separate credential systems, and they are unrelated to each other.
-
-### 3a. The OCI signing key (this is the actual secret)
-
-AXIS calls the model through Oracle Cloud's GenAI endpoint. Oracle does not use
-a simple API key — it signs each request with a **private key file**, and the
-config that points at it lives **outside this repository**, in your home
-directory.
-
-Create the folder and file:
-
-- Windows: `C:\Users\<you>\.oci\config`
-- macOS / Linux: `~/.oci/config`
-
-Put your `.pem` private key file next to it (for example
-`~/.oci/axis_api_key.pem`), then write `~/.oci/config` like this, filling in the
-five values I send you on Slack:
-
-```ini
-[DEFAULT]
-user=<user OCID — from Slack>
-fingerprint=<key fingerprint — from Slack>
-key_file=<full path to the .pem file you saved, e.g. C:\Users\you\.oci\axis_api_key.pem>
-tenancy=<tenancy OCID — from Slack>
-region=us-ashburn-1
-```
-
-Notes:
-
-- `key_file` must be the **absolute path** on your machine. It is the one value
-  that is different for each person.
-- On macOS / Linux, lock the key down: `chmod 600 ~/.oci/axis_api_key.pem`.
-  Oracle's SDK will refuse a world-readable key.
-- **Never** copy the `.pem` file or the `~/.oci/` folder into this repository.
-  `.gitignore` blocks `*.pem` and `.oci/` as a safety net, but the real rule is:
-  it lives in your home directory, not in the project.
-
-### 3b. The AXIS `.env` file (endpoint and model settings)
+Everything goes in one file. Create it from the committed template:
 
 ```bash
 cd axis-agent
 cp .env.example .env      # Windows PowerShell: Copy-Item .env.example .env
 ```
 
-Then open `axis-agent/.env` and fill in the values. Here is what each one is:
+`axis-agent/.env` is gitignored, so it can never be committed by accident.
 
-| Variable | Required? | What to put | Comes from Slack? |
-| --- | --- | --- | --- |
-| `AXIS_OCI_GENAI_REGION` | Yes | `us-ashburn-1` — the region the endpoint URL is built from | No, use this value |
-| `AXIS_OCI_GENAI_MODEL` | Yes | The model alias, e.g. `openai.gpt-5.4-mini` | **Yes** |
-| `AXIS_OCI_GENAI_PROJECT_OCID` | Yes | The GenAI project OCID, a long `ocid1....` string | **Yes** |
-| `AXIS_OCI_PROFILE` | No | Which profile in `~/.oci/config` to use. Leave as `DEFAULT` | No |
-| `AXIS_OCI_GENAI_BASE_URL` | No | Full endpoint URL. Leave commented out — it is derived from the region | No |
-| `AXIS_OCI_GENAI_API_VERSION` | No | Leave commented out | No |
-| `BROWSER_AGENT_BRIDGE_HOST` / `_PORT` / `_TOKEN` | No | Leave all three commented out. AXIS defaults to `127.0.0.1:8765` and reads your own token file from Step 2b | No |
+Now pick **one** of the two auth options below and fill in only that one. AXIS
+decides which to use by a single rule: **if `AXIS_API_KEY` has a value, it uses
+the key; if it is blank, it falls back to OCI request signing.**
 
-`axis-agent/.env` is gitignored. It will never be committed. If AXIS starts and
-a required value is missing, it tells you exactly which variable to set.
+### Option A — API key (use this one)
+
+Paste the three values I sent you into `axis-agent/.env`:
+
+| Variable | What to put | From Slack? |
+| --- | --- | --- |
+| `AXIS_API_KEY` | The API key, starting `sk-...`. **This is the secret.** | **Yes** |
+| `AXIS_MODEL` | The model alias, e.g. `openai.gpt-5.6-sol` | **Yes** |
+| `AXIS_OCI_GENAI_PROJECT_OCID` | The project OCID, a long `ocid1.generativeaiproject.oc1...` string | **Yes** |
+| `AXIS_OCI_GENAI_REGION` | Already set to `us-ashburn-1`. Leave it — the endpoint URL is built from it | No |
+| `AXIS_BASE_URL` | Leave commented out unless you are pointing at a different OpenAI-compatible endpoint | No |
+
+That is the whole setup. **No `~/.oci/config`, no `.pem` file, no OCI CLI.**
+
+Treat the key like a password:
+
+- It lives in `axis-agent/.env` and nowhere else. Not in a commit, not in a
+  screenshot, not pasted into a ticket or a doc.
+- Do not share it onward. If someone else needs one, ask me — I would rather
+  issue a second key than have one key circulating.
+- If you think it leaked, tell me immediately. Rotating it is quick; finding out
+  late is not.
+
+### Option B — OCI request signing
+
+Only if you were specifically given an OCI signing identity instead of a key.
+Leave `AXIS_API_KEY` blank, set `AXIS_OCI_GENAI_MODEL` and
+`AXIS_OCI_GENAI_PROJECT_OCID` in `.env`, and then create the OCI config
+**outside this repository**, in your home directory:
+
+- Windows: `C:\Users\<you>\.oci\config`
+- macOS / Linux: `~/.oci/config`
+
+Put your `.pem` private key file next to it, then write `~/.oci/config` as:
+
+```ini
+[DEFAULT]
+user=<user OCID — from Slack>
+fingerprint=<key fingerprint — from Slack>
+key_file=<absolute path to your .pem, e.g. C:\Users\you\.oci\axis_signing_key.pem>
+tenancy=<tenancy OCID — from Slack>
+region=us-ashburn-1
+```
+
+- `key_file` must be an **absolute path**, and it is different on every machine.
+- On macOS / Linux: `chmod 600` the `.pem`. Oracle's SDK refuses a
+  world-readable key.
+- Never copy the `.pem` or `~/.oci/` into this repository. `.gitignore` blocks
+  `*.pem` and `.oci/` as a safety net, but the real rule is that they live in
+  your home directory.
+- `AXIS_OCI_PROFILE` selects the profile inside `~/.oci/config`; leave it as
+  `DEFAULT`.
+
+### Either way
+
+`BROWSER_AGENT_BRIDGE_HOST` / `_PORT` / `_TOKEN` stay commented out. AXIS
+defaults to `127.0.0.1:8765` and reads your own token file from Step 2b.
+
+If a required value is missing, AXIS names the exact variable on startup —
+including telling you to set `AXIS_API_KEY` if you would rather use a key than
+a signing identity.
 
 ---
 
@@ -345,9 +363,11 @@ are the ones I want to fix first.
 | --- | --- |
 | `BRIDGE_UNAVAILABLE` on every call | The bridge is not running. Open the extension side panel and click **Start Bridge**. It must say Connected. |
 | `NO_MANAGED_TAB` | No usable Chrome tab was found. Make sure Chrome is open with at least one ordinary tab, and that the tab you want is the active one. |
-| `Missing provider configuration: set AXIS_...` | That variable is missing from `axis-agent/.env`. See the table in [Step 3b](#3b-the-axis-env-file-endpoint-and-model-settings). |
-| An OCI authentication or signing error | `~/.oci/config` is wrong. Most often `key_file` points at a path that does not exist, or the fingerprint does not match the key. |
-| `Could not find config file` from the OCI SDK | `~/.oci/config` does not exist yet. See [Step 3a](#3a-the-oci-signing-key-this-is-the-actual-secret). |
+| `Missing provider configuration: set AXIS_...` | That variable is missing from `axis-agent/.env`. See the table in [Option A](#option-a--api-key-use-this-one). |
+| `401` / `invalid_api_key` / `authentication` error | Using Option A: the key in `AXIS_API_KEY` is wrong, expired, or has stray whitespace or quotes around it. Re-copy it, then tell me if it still fails. |
+| `404` / `model_not_found` | `AXIS_MODEL` does not match a model this project can reach. Check it against the value I sent. |
+| `Could not find config file` from the OCI SDK | AXIS fell back to Option B because `AXIS_API_KEY` is blank. If you meant to use a key, set it. If you meant Option B, create `~/.oci/config` — see [Option B](#option-b--oci-request-signing). |
+| An OCI authentication or signing error | Only affects Option B. `~/.oci/config` is wrong — most often `key_file` points at a path that does not exist, or the fingerprint does not match the key. |
 | Extension shows an error after `git pull` | Reload the extension at `chrome://extensions`, then Start Bridge again. |
 | Native host not found / not registered | Re-run the installer from Step 2b with the current extension ID, then reload the extension. |
 | Garbled or missing characters in terminal output | Only affects display. Run with `PYTHONIOENCODING=utf-8` if it bothers you. |
@@ -358,13 +378,13 @@ are the ones I want to fix first.
 
 ## What is and is not in this repository
 
-**Committed here:** all source code, all 208 tests, `axis.yaml`, the
+**Committed here:** all source code, all 219 tests, `axis.yaml`, the
 `.env.example` template, the vendored Browser Agent Bridge extension, the test
 prompts, and this guide.
 
 **Never committed** — and blocked by [.gitignore](.gitignore):
 
-- `axis-agent/.env` — your filled-in environment values
+- `axis-agent/.env` — your filled-in environment values, **including your API key**
 - `~/.oci/config` and any `.pem` private key — these live in your home directory
 - `~/.browser-agent-bridge.env` — your locally generated bridge token
 - `.venv/`, `__pycache__/`, `.pytest_cache/` — rebuild with `uv sync`
@@ -372,4 +392,4 @@ prompts, and this guide.
 - Local editor and agent config (`.claude/`, `.vscode/`, `.idea/`)
 
 If you ever find yourself about to commit a credential, stop and tell me instead.
-Rotating a leaked signing key is a bigger job than asking.
+Rotating a leaked key is quick; cleaning it out of pushed git history is not.

@@ -51,6 +51,9 @@ _PROVIDER_ENV_VARS = (
     "AXIS_OCI_GENAI_REGION",
     "AXIS_OCI_GENAI_MODEL",
     "AXIS_OCI_GENAI_PROJECT_OCID",
+    "AXIS_API_KEY",
+    "AXIS_BASE_URL",
+    "AXIS_MODEL",
 )
 
 
@@ -233,6 +236,173 @@ class TestProviderConfig(unittest.TestCase):
         ):
             config = load_provider_config()
         self.assertEqual(config.endpoint_host, "example.invalid")
+
+
+class TestApiKeyAuthMode(unittest.TestCase):
+    """AXIS_API_KEY selects plain bearer auth instead of OCI request signing.
+
+    This is the path a teammate uses when they have been handed a key rather
+    than an OCI signing key + ~/.oci/config. It must never require a project
+    OCID or an OCI profile, and it must not disturb the signing path.
+    """
+
+    def test_signing_mode_is_the_default_when_no_api_key_is_set(self):
+        with _EnvSandbox(
+            remove=("AXIS_API_KEY", "AXIS_BASE_URL", "AXIS_MODEL", "AXIS_OCI_GENAI_BASE_URL"),
+            set_values={
+                "AXIS_OCI_GENAI_REGION": "us-ashburn-1",
+                "AXIS_OCI_GENAI_MODEL": "test-model",
+                "AXIS_OCI_GENAI_PROJECT_OCID": "ocid1.generativeaiproject.oc1..testonly",
+            },
+        ):
+            config = load_provider_config()
+        self.assertEqual(config.auth_mode, "oci_signing")
+        self.assertIsNone(config.api_key)
+
+    def test_api_key_selects_api_key_mode_without_a_project_ocid(self):
+        with _EnvSandbox(
+            remove=("AXIS_OCI_GENAI_PROJECT_OCID", "AXIS_OCI_GENAI_BASE_URL", "AXIS_BASE_URL"),
+            set_values={
+                "AXIS_API_KEY": "test-key-value",
+                "AXIS_OCI_GENAI_REGION": "us-ashburn-1",
+                "AXIS_MODEL": "test-model",
+            },
+        ):
+            config = load_provider_config()
+        self.assertEqual(config.auth_mode, "api_key")
+        self.assertEqual(config.api_key, "test-key-value")
+        self.assertIsNone(config.project_ocid)
+        self.assertEqual(config.model, "test-model")
+
+    def test_api_key_mode_accepts_a_non_oci_base_url_and_model(self):
+        with _EnvSandbox(
+            remove=("AXIS_OCI_GENAI_PROJECT_OCID", "AXIS_OCI_GENAI_REGION", "AXIS_OCI_GENAI_BASE_URL"),
+            set_values={
+                "AXIS_API_KEY": "test-key-value",
+                "AXIS_BASE_URL": "https://api.example.invalid/v1",
+                "AXIS_MODEL": "some-model",
+            },
+        ):
+            config = load_provider_config()
+        self.assertEqual(config.endpoint_host, "api.example.invalid")
+        self.assertEqual(config.model, "some-model")
+
+    def test_neutral_names_win_over_the_oci_prefixed_ones(self):
+        with _EnvSandbox(
+            set_values={
+                "AXIS_API_KEY": "test-key-value",
+                "AXIS_BASE_URL": "https://neutral.invalid/v1",
+                "AXIS_MODEL": "neutral-model",
+                "AXIS_OCI_GENAI_BASE_URL": "https://oci.invalid/v1",
+                "AXIS_OCI_GENAI_MODEL": "oci-model",
+            },
+        ):
+            config = load_provider_config()
+        self.assertEqual(config.endpoint_host, "neutral.invalid")
+        self.assertEqual(config.model, "neutral-model")
+
+    def test_api_key_mode_still_requires_a_model(self):
+        with _EnvSandbox(
+            remove=("AXIS_MODEL", "AXIS_OCI_GENAI_MODEL", "AXIS_OCI_GENAI_PROJECT_OCID"),
+            set_values={
+                "AXIS_API_KEY": "test-key-value",
+                "AXIS_BASE_URL": "https://api.example.invalid/v1",
+            },
+        ):
+            with self.assertRaises(ProviderConfigError) as caught:
+                load_provider_config()
+        self.assertIn("AXIS_MODEL", str(caught.exception))
+
+    def test_api_key_mode_requires_an_endpoint(self):
+        with _EnvSandbox(
+            remove=("AXIS_BASE_URL", "AXIS_OCI_GENAI_BASE_URL", "AXIS_OCI_GENAI_REGION"),
+            set_values={"AXIS_API_KEY": "test-key-value", "AXIS_MODEL": "test-model"},
+        ):
+            with self.assertRaises(ProviderConfigError) as caught:
+                load_provider_config()
+        self.assertIn("AXIS_BASE_URL", str(caught.exception))
+
+    def test_signing_mode_still_requires_a_project_ocid(self):
+        with _EnvSandbox(
+            remove=("AXIS_API_KEY", "AXIS_OCI_GENAI_PROJECT_OCID", "AXIS_OCI_GENAI_BASE_URL"),
+            set_values={
+                "AXIS_OCI_GENAI_REGION": "us-ashburn-1",
+                "AXIS_OCI_GENAI_MODEL": "test-model",
+            },
+        ):
+            with self.assertRaises(ProviderConfigError) as caught:
+                load_provider_config()
+        self.assertIn("AXIS_OCI_GENAI_PROJECT_OCID", str(caught.exception))
+
+    def test_a_blank_api_key_is_treated_as_unset(self):
+        """`.env.example` ships `AXIS_API_KEY=` with no value. An empty string
+        must not silently select key auth and then fail with a 401."""
+        with _EnvSandbox(
+            remove=("AXIS_OCI_GENAI_BASE_URL",),
+            set_values={
+                "AXIS_API_KEY": "   ",
+                "AXIS_OCI_GENAI_REGION": "us-ashburn-1",
+                "AXIS_OCI_GENAI_MODEL": "test-model",
+                "AXIS_OCI_GENAI_PROJECT_OCID": "ocid1.generativeaiproject.oc1..testonly",
+            },
+        ):
+            config = load_provider_config()
+        self.assertEqual(config.auth_mode, "oci_signing")
+
+    def test_api_key_mode_client_sends_the_key_and_never_signs(self):
+        """The client must carry the bearer key, must not attach OCI signing
+        auth, and must not send a project header it has no value for."""
+        with _EnvSandbox(
+            remove=("AXIS_OCI_GENAI_PROJECT_OCID", "AXIS_OCI_GENAI_REGION", "AXIS_OCI_GENAI_BASE_URL"),
+            set_values={
+                "AXIS_API_KEY": "test-key-value",
+                "AXIS_BASE_URL": "https://api.example.invalid/v1",
+                "AXIS_MODEL": "some-model",
+            },
+        ):
+            config = load_provider_config()
+            client = provider_config.build_async_openai_client(config)
+
+        self.assertEqual(client.api_key, "test-key-value")
+        self.assertIsNone(client.project)
+        # An OCI-signed client installs httpx auth; a keyed one must not.
+        self.assertIsNone(getattr(client._client, "auth", None))
+
+    def test_api_key_mode_passes_the_project_ocid_when_one_is_set(self):
+        """The OCI GenAI endpoint accepts key + project together (this is the
+        shape of the sample call the key was issued with), so a project OCID
+        set alongside a key must still reach the client."""
+        with _EnvSandbox(
+            remove=("AXIS_BASE_URL", "AXIS_MODEL"),
+            set_values={
+                "AXIS_API_KEY": "test-key-value",
+                "AXIS_OCI_GENAI_BASE_URL": "https://inference.generativeai.us-ashburn-1.oci.oraclecloud.com/openai/v1",
+                "AXIS_OCI_GENAI_MODEL": "openai.gpt-5.6-sol",
+                "AXIS_OCI_GENAI_PROJECT_OCID": "ocid1.generativeaiproject.oc1..testonly",
+            },
+        ):
+            config = load_provider_config()
+            client = provider_config.build_async_openai_client(config)
+
+        self.assertEqual(config.auth_mode, "api_key")
+        self.assertEqual(client.api_key, "test-key-value")
+        self.assertEqual(client.project, "ocid1.generativeaiproject.oc1..testonly")
+        self.assertIsNone(getattr(client._client, "auth", None))
+
+    def test_api_key_is_redacted_from_the_repr(self):
+        """A ProviderConfig lands in tracebacks and probe reports. The key
+        must not travel with it."""
+        with _EnvSandbox(
+            remove=("AXIS_OCI_GENAI_PROJECT_OCID", "AXIS_OCI_GENAI_REGION", "AXIS_OCI_GENAI_BASE_URL"),
+            set_values={
+                "AXIS_API_KEY": "super-secret-value",
+                "AXIS_BASE_URL": "https://api.example.invalid/v1",
+                "AXIS_MODEL": "some-model",
+            },
+        ):
+            config = load_provider_config()
+        self.assertNotIn("super-secret-value", repr(config))
+        self.assertEqual(config.api_key, "super-secret-value")
 
 
 # ---------------------------------------------------------------------------
