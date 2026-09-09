@@ -457,7 +457,12 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
         detail = error.get("detail") if isinstance(error.get("detail"), dict) else {}
         if not record.success and detail.get("consecutiveUiFailures", 0) >= 2:
             raise ToolFailed(record.error or "The element is still unavailable after recovery.")
-        if not record.success and record.code in TOOL_FAILED_CODES:
+        terminal_failure = (
+            record.executed
+            and error.get("retryable") is False
+            and RECOVERY_POLICY.get(record.code or "") not in {"reconcile_tab", "replan"}
+        )
+        if not record.success and (record.code in TOOL_FAILED_CODES or terminal_failure):
             raise ToolFailed(record.error or "This browser operation cannot be retried.")
         return result
 

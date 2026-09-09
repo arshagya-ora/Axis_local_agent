@@ -1,17 +1,101 @@
-# Python-generated files
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
 __pycache__/
-*.py[oc]
+*.py[cod]
+*.egg-info/
 build/
 dist/
 wheels/
-*.egg-info
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
-# Virtual environments
-.venv
+# ---------------------------------------------------------------------------
+# Virtual environments (recreate with `uv sync` — see README.md)
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
 
-# Phase 0 compatibility-probe output (generated per run; not a frozen
-# artifact like axis-agent/contracts/browser_tool_contract.json)
-axis-agent/reports/
-
-# Local environment values (see axis-agent/.env.example for the template)
+# ---------------------------------------------------------------------------
+# Secrets and machine-specific configuration
+#
+# NOTHING here is committed. `axis-agent/.env.example` is the template; every
+# real value is either environment-specific or a credential. See the
+# "Credentials" section of README.md for what each teammate needs and where
+# it comes from.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
 axis-agent/.env
+*.pem
+*.key
+key.pem
+.oci/
+.browser-agent-bridge.env
+
+# ---------------------------------------------------------------------------
+# Local agent / editor tooling — personal to whoever is working on the repo,
+# and full of absolute paths from their machine.
+# ---------------------------------------------------------------------------
+.claude/
+.codex/
+.cursor/
+.idea/
+.vscode/
+*.code-workspace
+
+# ---------------------------------------------------------------------------
+# Run output: everything AXIS or the bridge produces while running. All of it
+# is regenerated per run and none of it is a reviewable source artifact.
+# ---------------------------------------------------------------------------
+# Phase 0 compatibility-probe reports (generated per run).
+axis-agent/reports/
+# browser_capture_evidence output: screenshots, PDFs, DOM snapshots, traces.
+axis-agent/artifacts/
+artifacts/
+# browser_downloads output.
+downloads/
+# Pydantic Evals run output.
+axis-agent/evals/reports/
+axis-agent/evals/results/
+# Ad-hoc trace/debug logs from `--debug` runs.
+*.log
+axis_run_*.txt
+axis_trace_*.json
+
+# Browser Agent Bridge runtime state: site knowledge the extension writes as
+# it browses, and the generated skill script bundle.
+browser-agent-bridge-main/runtime/site-patterns/*
+!browser-agent-bridge-main/runtime/site-patterns/.gitkeep
+browser-agent-bridge-main/skills/browser-agent-bridge/scripts/
+browser-agent-bridge-main/node_modules/
+*.crx
+*.zip
+
+# ---------------------------------------------------------------------------
+# Scratch / local-only notes. Working notes, phase writeups, and design
+# scratchpads stay on the machine that wrote them; the committed docs are
+# README.md, axis-agent/README.md, and axis-agent/manual_test_prompts.md.
+# ---------------------------------------------------------------------------
+scratch/
+scratchpad/
+notes/
+tmp/
+TODO.md
+NOTES.md
+SCRATCH.md
+*_NOTES.md
+*_SCRATCH.md
+PHASE_*.md
+P0_P3_*.md
+*.local.md
+
+# ---------------------------------------------------------------------------
+# OS noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini

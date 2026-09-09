@@ -10,8 +10,9 @@ The AXIS planner/navigator runtime imports `browser_tools.py`. It keeps six
 semantic tools eager (`tabs`, `observe`, `act`, `navigate`, `wait`, `assert`),
 progressively adds evidence, diagnostics, and downloads only when relevant,
 and keeps capability negotiation, site-pattern lookup, popup registration, and
-debug recording/tracing inside `BrowserRuntime`. Its P0-P3 behavior and state
-machine are documented in [P0_P3_IMPLEMENTATION.md](P0_P3_IMPLEMENTATION.md).
+debug recording/tracing inside `BrowserRuntime`. Setup, running, and evaluation
+instructions live in the [root README](../README.md); the runtime's own
+configurable values are documented inline in [axis.yaml](axis.yaml).
 
 The remainder of this README documents `browser_agent_tools.py`, the older
 eight-tool compatibility layer and its legacy tests. The active AXIS runtime
