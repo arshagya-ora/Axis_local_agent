@@ -1,4 +1,4 @@
-# AXIS — a browser agent that drives your real Chrome
+# AXIS — Install Instructions and Usage.
 
 AXIS is a two-agent (planner + navigator) browser automation agent. It does not
 launch a throwaway test browser. It drives **the Chrome you already have open**,
