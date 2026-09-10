@@ -20,6 +20,7 @@ class ServiceError(Exception):
 
 class Store:
     def __init__(self, path: str | Path):
+        self.path = Path(path) if str(path) != ':memory:' else None
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -49,6 +50,15 @@ class Store:
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS retired_requests (id TEXT PRIMARY KEY);
         """)
+        if 'attachments' not in {row[1] for row in self.db.execute('PRAGMA table_info(messages)')}:
+            self.db.execute("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
+        self.db.commit()
+
+    @staticmethod
+    def decode_message(row):
+        item = dict(row)
+        item['attachments'] = json.loads(item.get('attachments') or '[]')
+        return item
 
     @contextmanager
     def transaction(self):
@@ -99,7 +109,8 @@ class Store:
             return {"items": [dict(r) for r in rows[:50]], "has_more": len(rows) > 50}
 
     def task(self, task_id):
-        row = self.db.execute("SELECT data FROM tasks WHERE id=?", (task_id,)).fetchone()
+        with self.lock:
+            row = self.db.execute("SELECT data FROM tasks WHERE id=?", (task_id,)).fetchone()
         if row is None:
             raise ServiceError("not_found", "Task no longer exists.", 404)
         return json.loads(row[0])
@@ -130,19 +141,21 @@ class Store:
         if self.db.execute('SELECT 1 FROM retired_requests WHERE id=?', (request_id,)).fetchone():
             raise ServiceError('stale_state', 'This instruction was already accepted, and its history was deleted. A retry cannot execute it again.')
         row = self.db.execute("SELECT * FROM messages WHERE client_request_id=?", (request_id,)).fetchone()
-        return dict(row) if row else None
+        return self.decode_message(row) if row else None
 
-    def message(self, conversation_id, task_id, text, request_id, intent, delivery="applied", role="user"):
+    def message(self, conversation_id, task_id, text, request_id, intent, delivery="applied", role="user", attachments=None):
         message = dict(id=uuid4().hex, conversation_id=conversation_id, task_id=task_id, role=role, text=text,
                        created_at=time.time(), client_request_id=request_id, intent=intent, delivery=delivery)
         self.db.execute("""INSERT INTO messages (id,conversation_id,task_id,role,text,created_at,client_request_id,intent,delivery)
                         VALUES (:id,:conversation_id,:task_id,:role,:text,:created_at,:client_request_id,:intent,:delivery)""", message)
+        message['attachments'] = attachments or []
+        self.db.execute('UPDATE messages SET attachments=? WHERE id=?', (json.dumps(message['attachments']), message['id']))
         self.event(conversation_id, task_id, "message", {"message": message})
         return message
 
     def delivery(self, message_id, state):
         self.db.execute("UPDATE messages SET delivery=? WHERE id=?", (state, message_id))
-        row = dict(self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone())
+        row = self.decode_message(self.db.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone())
         self.event(row["conversation_id"], row["task_id"], "message", {"message": row})
 
     @staticmethod
@@ -167,7 +180,7 @@ class Store:
             conversation = self.conversation(conversation_id)
             rows = self.db.execute("SELECT * FROM messages WHERE conversation_id=? AND ordinal<? ORDER BY ordinal DESC LIMIT 51",
                                    (conversation_id, before or 2**63-1)).fetchall()
-            messages = [dict(row) for row in reversed(rows[:50])]
+            messages = [self.decode_message(row) for row in reversed(rows[:50])]
             task_ids = list(dict.fromkeys(message["task_id"] for message in messages if message["task_id"]))
             tasks = [self.task(task_id) for task_id in task_ids]
             return dict(conversation=conversation, messages=messages, tasks=tasks,
@@ -181,6 +194,8 @@ class Store:
                 task = json.loads(row[0])
                 if task["status"] not in TERMINAL or task.get('owns_runtime'):
                     task.update(status="interrupted", owns_runtime=False, current_activity="The AXIS process ended. Start a new task to continue from saved context.", ended_at=time.time())
+                    if task.get('workflow', {}).get('counts'):
+                        task['current_activity'] = 'The process ended. Recover the saved workflow to reconcile its last step and continue.'
                     self.update_task(task)
             for row in self.db.execute("SELECT id FROM messages WHERE delivery='accepted'").fetchall():
                 self.delivery(row[0], "not_applied")

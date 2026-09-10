@@ -1,5 +1,7 @@
 import { el, icon, button } from "./dom.js";
 import { STATUS, TERMINAL, ownsRuntime } from "./state.js";
+import { renderActivity, activityText } from "./activity.js";
+import { renderMarkdown } from "./markdown.js";
 
 export function duration(ms) {
   const seconds = Math.floor((ms || 0) / 1000);
@@ -45,6 +47,10 @@ export function renderChat(root, state, actions) {
     ]);
   }
   const shown = new Set();
+  const lastAnswer = new Map();
+  for (const message of state.messages)
+    if (message.role === "assistant" && state.tasks[message.task_id]?.status === "completed")
+      lastAnswer.set(message.task_id, message.id);
   for (const message of state.messages) {
     nodes.push([
       `message-${message.id}`,
@@ -59,7 +65,11 @@ export function renderChat(root, state, actions) {
           const values = JSON.parse(message.text);
           text = `Extend budget: +${values.requests} model requests, +${values.steps} steps, +${values.actions} actions`;
         }
-        node.append(document.createTextNode(text));
+        node.append(message.role === "assistant" ? renderMarkdown(text) : document.createTextNode(text));
+        for (const ref of message.attachments || []) {
+          const file = state.tasks[message.task_id]?.attachments?.find(x => x.id === ref.attachment_id);
+          node.append(el("p", "metadata", `${file?.filename || 'Attached file'} · ${ref.role}`));
+        }
         if (["follow_up", "extend_budget"].includes(message.intent))
           node.append(
             el(
@@ -79,7 +89,8 @@ export function renderChat(root, state, actions) {
     if (
       message.task_id &&
       !shown.has(message.task_id) &&
-      state.tasks[message.task_id]
+      state.tasks[message.task_id] &&
+      (!lastAnswer.has(message.task_id) || lastAnswer.get(message.task_id) === message.id)
     ) {
       shown.add(message.task_id);
       addTask(state.tasks[message.task_id]);
@@ -112,6 +123,7 @@ export function renderChat(root, state, actions) {
         : null;
       const focusLabel =
         focused?.getAttribute("aria-label") || focused?.textContent;
+      const focusPhase = focused?.dataset.phase;
       const replacement = create();
       replacement.dataset.key = key;
       replacement.dataset.version = version;
@@ -119,10 +131,10 @@ export function renderChat(root, state, actions) {
       node = replacement;
       if (focused) {
         const match =
-          [...node.querySelectorAll("button")].find(
+          [...node.querySelectorAll("button, summary")].find(
             (item) =>
-              (item.getAttribute("aria-label") || item.textContent) ===
-              focusLabel,
+              focusPhase ? item.dataset.phase === focusPhase :
+                (item.getAttribute("aria-label") || item.textContent) === focusLabel,
           ) || node.querySelector(".disclosure");
         match?.focus({ preventScroll: true });
       }
@@ -141,21 +153,13 @@ export function renderChat(root, state, actions) {
 }
 function taskCard(task, state, actions) {
   const expanded = state.expanded[task.id] === true;
-  const card = el("article", `task-card${expanded ? "" : " collapsed"}`);
+  const card = el("article", `task-card${expanded ? "" : " collapsed"}${task.status === "completed" ? " task-completed" : ""}`);
   card.setAttribute(
     "aria-label",
     `${task.title}: ${STATUS[task.status] || task.status}`,
   );
-  const summary = el("div", "task-summary"),
-    symbol = el("div", "task-symbol"),
-    heading = el("div", "task-heading");
-  symbol.append(icon(task.status === "completed" ? "check" : "file"));
-  heading.append(
-    el("h2", "", task.title),
-    el("p", "metadata", task.current_activity),
-  );
-  summary.append(symbol, heading);
-  card.append(summary);
+  const summary = el("div", "task-summary");
+  summary.append(el("p", "task-current", activityText(task.current_activity)));
   const metrics = el("div", "task-metrics");
   metrics.append(
     el("span", `badge ${task.status}`, STATUS[task.status] || task.status),
@@ -166,6 +170,8 @@ function taskCard(task, state, actions) {
     ),
   );
   card.append(metrics);
+  if (task.execution_mode) card.append(el("p", "metadata", task.execution_mode === "automatic" ? "Automatic mode" : "Approval mode"));
+  if (task.status !== "completed" || expanded) card.append(summary);
   if (["active", "pausing", "stopping"].includes(task.status))
     card.querySelector(".task-meta").dataset.liveTask = task.id;
   if (expanded) {
@@ -189,11 +195,7 @@ function taskCard(task, state, actions) {
         ),
       );
     if (page.items.length) {
-      const list = el("ol", "activity");
-      for (const item of page.items) {
-        if (item.payload?.text) list.append(el("li", "", item.payload.text));
-      }
-      card.append(list);
+      card.append(renderActivity(task.id, page, state));
     }
     if (task.result?.limitations?.length)
       for (const limitation of task.result.limitations)
@@ -215,6 +217,14 @@ function taskCard(task, state, actions) {
   disclosure.setAttribute("aria-expanded", String(expanded));
   controls.append(disclosure);
   const buttons = el("div");
+  if (task.status === "interrupted" && Object.keys(task.workflow?.counts || {}).length && !state.active)
+    buttons.append(button("Recover workflow", () => actions.control(task, "resume")));
+  if (task.workflow && (task.status !== "completed" || expanded)) {
+    const counts = task.workflow.counts;
+    const uncovered = task.workflow.uncovered_sections?.length || 0;
+    if (Object.values(counts).some(value => value > 0) || uncovered)
+      card.append(el("p", "metadata workflow-summary", `Workflow: ${counts.verified || 0} verified · ${(counts.pending || 0) + (counts.running || 0)} pending · ${counts.skipped || 0} not applicable${uncovered ? ` · ${uncovered}${task.workflow.more_uncovered ? '+' : ''} sections to plan` : ''}`));
+  }
   if (state.active?.id === task.id && ownsRuntime(task)) {
     if (task.status === "active")
       buttons.append(button("Pause", () => actions.control(task, "pause")));

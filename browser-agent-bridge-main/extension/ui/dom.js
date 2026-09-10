@@ -1,4 +1,5 @@
 const paths = {
+  attachment: "M21 11l-8 8a6 6 0 0 1-8.5-8.5l9-9a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 0 1-2.8-2.8l8.5-8.5",
   history: "M12 8v4l3 2 M21 12a9 9 0 1 1-3-6.7 M21 3v5h-5",
   edit: "M15 5l4 4 M14 4l3-2 5 5-3 3-9 9-5 1 1-5z M10 3H4v17h17v-7",
   settings:

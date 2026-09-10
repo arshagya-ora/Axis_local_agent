@@ -1,4 +1,6 @@
 import { AxisApi } from "./ui/api.js";
+import { reconcilePending } from "./ui/pending.js";
+import { mountAttachments, attachmentRefs, sameAttachments, clearSentAttachments } from "./ui/attachments/composer.js";
 import {
   createState,
   applySnapshot,
@@ -13,6 +15,7 @@ import { renderChat, duration } from "./ui/chat.js";
 import { mountHistory } from "./ui/history.js";
 import { applyAppearance, mountSettings } from "./ui/settings.js";
 import { mountApprovals } from "./ui/approvals.js";
+import { renderExecutionApproval } from "./ui/execution.js";
 
 const $ = (selector) => document.querySelector(selector),
   api = new AxisApi(),
@@ -43,10 +46,12 @@ const saved =
 for (const key of [
   "selected",
   "drafts",
+  "attachmentDrafts",
   "views",
   "expanded",
   "pending",
   "extensions",
+  "executionMode",
 ])
   if (saved[key] !== undefined) state[key] = saved[key];
 state.selected ||= crypto.randomUUID();
@@ -58,6 +63,7 @@ if (view) {
   state.context = view.context;
 }
 mode.value = state.mode;
+const attachmentComposer = mountAttachments($("#attachment-composer"), api, state, { save, error, changed: renderComposer });
 function error(text) {
   feedback($("#workspace-error"), text, true);
 }
@@ -119,9 +125,12 @@ function scheduleDraw(receivedActivity = false) {
 }
 timeline.addEventListener("focusout", () => scheduleDraw());
 function renderConnection() {
+  renderExecutionApproval($("#execution-approval"), state.active, api, error);
   const connected = state.connected && bridge.state === "connected",
     label = $("#connection-button");
-  label.textContent = !state.connected
+  label.textContent = !api.token || state.pairingRequired
+    ? "Setup required"
+    : !state.connected
     ? "Service offline"
     : state.stream === "reconnecting"
       ? "Reconnecting"
@@ -143,6 +152,13 @@ function renderConnection() {
     !state.active || state.active.conversation_id === state.selected;
 }
 function renderComposer() {
+  const live = state.active?.conversation_id === state.selected ? state.active : null;
+  $("#execution-mode").value = live?.execution_mode || state.executionMode || "approval";
+  $("#pending-instruction").hidden = !state.pending;
+  $("#pending-preview").textContent = state.pending
+    ? state.pending.body.text.slice(0, 180)
+    : "";
+  $("#retry-instruction").disabled = sending || !state.connected;
   const current =
     state.active?.conversation_id === state.selected ? state.active : null;
   if (state.mode === "follow_up" && (!current || state.target !== current.id)) {
@@ -181,20 +197,24 @@ function renderComposer() {
     );
   }
   const hint = $("#composer-hint");
-  hint.textContent = !state.connected
+  hint.textContent = !api.token || state.pairingRequired
+    ? "Pair the local AXIS service in Settings to get started."
+    : !state.connected
     ? "Connect AXIS in Settings to start a browser task."
     : state.mode === "follow_up"
       ? "Instructions apply at the next safe step."
       : state.context
         ? "A bounded saved outcome will accompany this new task."
         : "Enter to send · Shift+Enter for a new line";
-  if (current && state.mode === "new_task")
+  if (state.connected && current && state.mode === "new_task")
     hint.textContent =
       "A task owns this browser. Use Current task to send a follow-up.";
-  if (current?.status === "limit_reached")
+  if (state.connected && current?.status === "limit_reached")
     hint.textContent =
       "Extend the task’s budget to resume, or Stop to release this browser.";
-  $("#send").disabled = sending;
+  const unavailable = !state.connected || !api.token || state.pairingRequired;
+  $("#send").disabled = sending || attachmentComposer.uploading || unavailable;
+  attachmentComposer.render(sending || Boolean(state.pending) || unavailable);
   input.readOnly = sending;
 }
 function openSettings() {
@@ -224,6 +244,7 @@ function positionApprovals() {
   else if (!$("#settings-view").hidden)
     $("#settings-view .toolbar").after(region);
   else $("#return-active").after(region);
+  region.after($("#execution-approval"));
 }
 async function selectConversation(id, { fresh = false } = {}) {
   rememberView(state, scroller.scrollTop);
@@ -457,7 +478,8 @@ input.addEventListener("keydown", (event) => {
 });
 $("#composer").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (sending || !input.value.trim()) return;
+  if (!state.connected || !api.token || state.pairingRequired) return;
+  if (sending || attachmentComposer.uploading || !input.value.trim()) return;
   const text = input.value.trim(),
     conversationId = state.selected;
   if (text.startsWith("/extend")) {
@@ -491,20 +513,27 @@ $("#composer").addEventListener("submit", async (event) => {
   }
   const body = {
     text,
+    execution_mode: state.executionMode || "approval",
+    attachments: attachmentRefs(state.attachmentDrafts[conversationId]),
     intent: state.mode,
     client_request_id: crypto.randomUUID(),
     ...(state.mode === "follow_up" ? { task_id: state.target } : {}),
     ...(state.context ? { context_task_id: state.context } : {}),
   };
+  if (!body.context_task_id && state.mode === "new_task" && /^(continue|resume|restart)(\s+(the\s+)?same(\s+(thing|task|work))?)?[.!]?$/i.test(text)) {
+    const previous = Object.values(state.tasks).filter(task => ["cancelled", "interrupted"].includes(task.status)).at(-1);
+    if (previous) body.context_task_id = previous.id;
+  }
   if (state.pending) {
     const previous = state.pending;
     if (
       previous.conversationId !== conversationId ||
       previous.body.text !== text ||
-      previous.body.intent !== body.intent
+      previous.body.intent !== body.intent ||
+      !sameAttachments(previous.body.attachments, body.attachments)
     ) {
       error(
-        "The previous instruction has not been acknowledged. Restore its draft and retry it first; the same request ID prevents duplicate browser work.",
+        "Resolve the previous submission using Retry previous instruction. Your current draft is kept.",
       );
       return;
     }
@@ -512,6 +541,44 @@ $("#composer").addEventListener("submit", async (event) => {
     body.task_id = previous.body.task_id;
     body.context_task_id = previous.body.context_task_id;
   }
+  await sendInstruction({ conversationId, body });
+});
+
+$("#retry-instruction").addEventListener("click", async () => {
+  if (sending || !state.pending) return;
+  sending = true;
+  renderComposer();
+  try {
+    await recoverPending();
+    if (state.pending) await sendInstruction(state.pending);
+  } catch (cause) {
+    error(cause.message);
+  } finally {
+    sending = false;
+    renderComposer();
+  }
+});
+
+async function recoverPending() {
+  const result = await reconcilePending(state, api);
+  if (!result) return;
+  // A newer draft must survive recovery of an older submission.
+  const { conversationId, body } = result.pending;
+  clearSentAttachments(state, conversationId, body.attachments);
+  if (state.drafts[conversationId]?.trim() === body.text)
+    state.drafts[conversationId] = "";
+  if (state.selected === conversationId && input.value.trim() === body.text)
+    input.value = "";
+  if (result.task) mergeTask(state, result.task);
+  error(result.status === "retired"
+    ? "The previous instruction was already accepted and its history deleted. It will not be sent again."
+    : "");
+  save();
+  renderComposer();
+}
+
+async function sendInstruction({ conversationId, body }) {
+  const text = body.text;
   sending = true;
   renderComposer();
   error("");
@@ -527,6 +594,7 @@ $("#composer").addEventListener("submit", async (event) => {
       { method: "POST", body },
     );
     state.pending = null;
+    clearSentAttachments(state, conversationId, body.attachments);
     if (input.value.trim() === text && state.selected === conversationId) {
       input.value = "";
       state.drafts[conversationId] = "";
@@ -547,6 +615,11 @@ $("#composer").addEventListener("submit", async (event) => {
     }
     if (cause.detail?.active_task) state.active = cause.detail.active_task;
     error(cause.message);
+    // The stream may still be live after a POST response is lost, so do not
+    // rely on a later reconnect to discover successful acceptance.
+    if (state.pending) {
+      try { await recoverPending(); } catch { /* Keep the retry control. */ }
+    }
   } finally {
     sending = false;
     renderComposer();
@@ -554,8 +627,20 @@ $("#composer").addEventListener("submit", async (event) => {
     input.focus();
     draft();
   }
-});
+}
 mountApprovals($("#approval-region"));
+$("#execution-mode").addEventListener("change", async () => {
+  const next = $("#execution-mode").value;
+  const current = state.active?.conversation_id === state.selected ? state.active : null;
+  try {
+    if (current) {
+      const task = await api.request(`/api/tasks/${current.id}/execution-mode`, { method: "PATCH", body: { execution_mode: next } });
+      mergeTask(state, task);
+    }
+    state.executionMode = next;
+    save(); draw();
+  } catch (cause) { error(cause.message); renderComposer(); }
+});
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "PING_SIDEPANEL") {
     sendResponse({ ok: true });
@@ -570,11 +655,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.axisTheme) applyAppearance();
-  if (changes.axisUiToken || changes.axisServiceUrl)
+  if (changes.axisUiToken || changes.axisServiceUrl) {
+    state.connected = false;
+    streamController?.abort();
+    draw();
     api
       .load()
       .then(connect)
       .catch((cause) => error(cause.message));
+  }
 });
 async function refreshBridge() {
   try {
@@ -596,8 +685,16 @@ async function connect() {
     const status = await api.request("/api/status");
     if (controller.signal.aborted) return;
     state.connected = true;
+    state.pairingRequired = false;
+    const feedbackText = $("#workspace-error").textContent;
+    if (feedbackText === "Pair the local AXIS service in Settings." ||
+        feedbackText === "Pairing credential was rejected." ||
+        feedbackText === "AXIS service is offline or unreachable. Check the service address and startup instructions.")
+      error("");
     state.active = status.active_task;
     state.stream = "connecting";
+    await recoverPending();
+    if (controller.signal.aborted) return;
     if (status.storage_error) error(status.storage_error);
     if (
       !state.conversation &&
@@ -659,14 +756,14 @@ async function connect() {
   } catch (cause) {
     if (controller.signal.aborted) return;
     state.stream = "reconnecting";
+    state.pairingRequired = cause.code === "not_paired" || cause.code === "unauthorized";
     if (
       cause.code === "not_paired" ||
       cause.code === "unauthorized" ||
       cause.code === "unavailable"
     )
       state.connected = false;
-    renderConnection();
-    renderComposer();
+    draw();
     reconnectTimer = setTimeout(connect, 3000);
   }
 }

@@ -71,6 +71,8 @@ def print_debug_event(event: AxisEvent) -> None:
             print(f"{at}   [OBSV] tab={d.get('tab')}{_took(d)}")
         elif phase == "vision_unavailable":
             print(f"{at}   [VISION] {d.get('reason')}")
+        elif phase in {"document_read", "document_error"}:
+            print(f"{at}   [DOCUMENT] {d.get('operation')} {d.get('error') or 'completed'}")
         elif phase in ("tab_list", "tab_create", "tab_selected"):
             icon = "OK  " if d.get("success", True) else "FAIL"
             print(f"{at}   [{icon}] {phase}  {_kv(d, 'tabs', 'tab', 'url')}")
@@ -80,7 +82,7 @@ def print_debug_event(event: AxisEvent) -> None:
 
     if event.kind == "planner_decision":
         print(f"  decision={d.get('decision')}{_took(d)}  {_kv(d, 'reason')}")
-        for key in ("plan_summary", "next_goal", "success_condition", "verification", "remaining_work", "final_answer"):
+        for key in ("plan_summary", "next_goal", "success_condition", "verification", "remaining_work", "document_request", "attachment_uses", "final_answer"):
             if d.get(key):
                 print(f"  {key}: {d[key]}")
         for item in d.get("evidence") or []:

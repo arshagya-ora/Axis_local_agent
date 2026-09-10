@@ -32,7 +32,7 @@ export class AxisApi {
     this.url = parsed.origin;
     this.token = token.trim();
   }
-  async request(path, { method = "GET", body, signal, stream = false } = {}) {
+  async request(path, { method = "GET", body, signal, stream = false, binary = false } = {}) {
     if (!this.token)
       throw new ApiError(
         "Pair the local AXIS service in Settings.",
@@ -44,10 +44,10 @@ export class AxisApi {
         method,
         headers: {
           Authorization: `Bearer ${this.token}`,
-          ...(body ? { "Content-Type": "application/json" } : {}),
+          ...(body ? { "Content-Type": binary ? "application/octet-stream" : "application/json" } : {}),
         },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: signal || AbortSignal.timeout(10000),
+        body: body ? (binary ? body : JSON.stringify(body)) : undefined,
+        signal: signal || AbortSignal.timeout(binary ? 120000 : 10000),
         cache: "no-store",
         credentials: "omit",
       });

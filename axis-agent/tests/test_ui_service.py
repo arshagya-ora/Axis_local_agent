@@ -118,7 +118,7 @@ def submit(client, conversation_id, **kwargs):
 
 def test_authentication_origin_host_and_body_limits(service):
     client, _, _ = service
-    for path in ['/api/status', '/api/events', '/api/conversations', '/api/settings']:
+    for path in ['/api/status', '/api/events', '/api/conversations', '/api/settings', '/api/requests/test']:
         assert client.get(path, headers={'Authorization': ''}).status_code == 401
         assert client.get(path, headers={'Origin': 'https://evil.example'}).status_code == 403
         assert client.get(path, headers={'Host': 'evil.example'}).status_code == 403
@@ -144,6 +144,30 @@ def test_duplicate_busy_and_active_delete(service):
     assert client.delete(f'/api/conversations/{cid}').json()['code'] == 'busy'
     assert runner.orchestrator.state.task_id == task_id
     assert submit(client, cid, client_request_id=request_id, text='Different request').status_code == 409
+
+
+def test_request_lookup_recovers_acceptance_outside_paging_and_deleted_history(service):
+    client, runner, store = service
+    cid = conversation(client)
+    request_id = uuid4().hex
+    path = f'/api/requests/{request_id}'
+    assert client.get(path).json() == {'status': 'unknown'}
+    assert runner.orchestrator is None
+    task_id = submit(client, cid, client_request_id=request_id).json()['task']['id']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
+    with store.transaction():
+        for index in range(60):
+            store.message(cid, task_id, f'Later outcome {index}', None, 'outcome', role='assistant')
+    assert all(m['client_request_id'] != request_id for m in store.snapshot(cid)['messages'])
+    found = client.get(path).json()
+    assert found['status'] == 'accepted'
+    assert found['message']['client_request_id'] == request_id
+    assert found['task']['id'] == task_id
+    assert runner.orchestrator.starts == 1
+    client.post(f'/api/tasks/{task_id}/control', json={'action': 'stop'})
+    wait_for(lambda: runner.future.done())
+    assert client.delete(f'/api/conversations/{cid}').status_code == 200
+    assert client.get(path).json() == {'status': 'retired'}
 
 
 def test_pause_resume_and_followup_are_serial_and_keep_identity(service):
@@ -365,6 +389,8 @@ def test_stop_waits_for_real_synchronous_tool_before_releasing_owner(tmp_path):
     with TestClient(create_app(store,runner,token=TOKEN,origin=ORIGIN),base_url='http://127.0.0.1:8766',headers=HEADERS) as client:
         cid=conversation(client)
         task_id=submit(client,cid).json()['task']['id']
+        approval = wait_for(lambda: runner.active().get('pending_approval'))
+        assert client.post(f'/api/tasks/{task_id}/approvals/{approval["id"]}', json={'decision':'approve'}).status_code == 200
         assert entered.wait(2)
         client.post(f'/api/tasks/{task_id}/control',json={'action':'stop'})
         time.sleep(.05)

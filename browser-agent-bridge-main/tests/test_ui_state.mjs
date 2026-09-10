@@ -9,6 +9,17 @@ import {
   mergeTask,
 } from "../extension/ui/state.js";
 
+test("completion collapses activity once without overriding later user expansion", () => {
+  const state = createState();
+  state.selected = "c";
+  state.expanded.task = true;
+  mergeTask(state, { id: "task", conversation_id: "c", status: "completed", updated_at: 1 });
+  assert.equal(state.expanded.task, false);
+  state.expanded.task = true;
+  mergeTask(state, { id: "task", conversation_id: "c", status: "completed", updated_at: 2 });
+  assert.equal(state.expanded.task, true);
+});
+
 test("a late command response cannot resurrect a completed task", () => {
   const state = createState();
   state.selected = "c";

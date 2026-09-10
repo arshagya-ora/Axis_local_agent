@@ -102,6 +102,7 @@ class AxisDeps:
 
     browser: BrowserRuntime
     gate: "StepGate"
+    documents: Any = None
 
 
 def _command_operation(kwargs: dict[str, Any]) -> str | None:
@@ -173,6 +174,19 @@ def _refusal(tab: Any, code: str, message: str) -> dict[str, Any]:
     }
 
 
+def _observed_effect_target(runtime, tab, locator):
+    """Bind locator approvals to browser-observed identity, not model labels."""
+    result = runtime._rpc('locator.count', {'tabId': runtime.tab(tab).raw_id,
+                          **bt._locator_params(locator)}, tab=tab)
+    elements = result.get('elements') or []
+    if result.get('count') != 1 or len(elements) != 1:
+        raise ToolFailed('The change needs one unambiguous observed target. Inspect the page and choose a unique control.')
+    element = elements[0]
+    keys = ('tagName', 'id', 'name', 'role', 'type', 'text', 'ariaLabel', 'placeholder',
+            'accessibleName', 'href', 'formAction', 'formMethod', 'disabled', 'editable')
+    return {key: element[key] for key in keys if key in element}
+
+
 @dataclass
 class StepGate:
     """Per-navigator-step execution gate. One instance per step.
@@ -185,6 +199,7 @@ class StepGate:
     remaining_total_actions: int
     approval_actions: frozenset[str] = frozenset()
     approval: Callable[[str, str | None, dict[str, Any]], bool] | None = None
+    effect_authorizer: Callable[[str, str | None, dict[str, Any]], bool] | None = None
     forbidden_actions: frozenset[str] = frozenset()
     mutation_allowed: bool = True
     is_paused: Callable[[], bool] = lambda: False
@@ -291,7 +306,17 @@ class StepGate:
             self.non_retryable = True
             self._interrupt("the task is read-only")
             return refuse("POLICY_DENIED", "The current task does not allow page mutations.")
-        if operation in self.approval_actions:
+        if self.effect_authorizer is not None:
+            if not self.effect_authorizer(tool, operation, {**(approval_detail or {}),
+                    'mandatory_approval': operation in self.approval_actions,
+                    'arguments': {key: value.model_dump(mode='json') if hasattr(value, 'model_dump') else value for key, value in kwargs.items()}}):
+                self.stopped = 'paused'
+                self._interrupt('the action requires authorization')
+                return refuse('APPROVAL_DENIED', 'Action not authorized; the task is paused.')
+            if self.is_cancelled() or self.is_paused():
+                self.stopped = 'cancelled' if self.is_cancelled() else 'paused'
+                return refuse('RUN_PAUSED', 'The task changed while approval was pending.')
+        if operation in self.approval_actions and self.effect_authorizer is None:
             approved = True
             if self.approval is not None:
                 approved = bool(self.approval(tool, operation, approval_detail or {"tab": tab}))
@@ -468,6 +493,15 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             named.setdefault("tab", rest[0])
         tab = named.get("tab")
         command = named.get("command")
+        if isinstance(command, bt.Upload) and deps.documents:
+            try:
+                resolved = deps.documents.resolve_uploads(command.files)
+            except (ValueError, OSError) as error:
+                raise ModelRetry(str(error)) from error
+            command = command.model_copy(update={'files': resolved})
+            kwargs['command'] = command
+            # Keep attachment IDs in model-visible action history. Only the
+            # browser executor receives the resolved filesystem paths.
         target = getattr(command, "target", None)
         target_type = getattr(target, "kind", None)
         target_text = getattr(command, "url", None)
@@ -496,18 +530,38 @@ def guarded(function: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, 
             "origin": current_url.split("/", 3)[:3] if isinstance(current_url, str) else None,
             "target": target_text,
             "target_type": target_type,
-            "upload_filenames": getattr(command, "files", None),
+            "upload_filenames": getattr(named.get('command'), "files", None),
             "expected_effect": _command_operation(named),
             "reason": "This action is configured to require user approval.",
         }
         if isinstance(detail["origin"], list):
             detail["origin"] = "/".join(detail["origin"])
+        effect_locator = None
+        if deps.gate.effect_authorizer and target_type == 'locator' and function.__name__ == 'browser_act' and _command_operation(named) not in {'hover', 'scroll'}:
+            effect_locator = getattr(target, 'locator', None) or getattr(command, 'locator', None)
+            detail['observed_target'] = _observed_effect_target(deps.browser, tab, effect_locator)
+            observed = detail['observed_target']
+            detail['target'] = ' '.join(str(observed.get(key) or '') for key in ('role', 'accessibleName', 'ariaLabel', 'text', 'name', 'type')).strip()
         refusal = deps.gate.check(function.__name__, named, detail)
         if refusal is not None:
             error = refusal.get("error") if isinstance(refusal.get("error"), dict) else {}
             if error.get("code") in TOOL_FAILED_CODES:
                 raise ToolFailed(error.get("message") or "This browser operation is not retryable.")
             return refusal
+        if deps.gate.effect_authorizer is not None and tab and function.__name__ in {'browser_act', 'browser_visual'} and _command_operation(named) not in {'capture', 'scroll', 'hover'}:
+            deps.browser.reconcile_tabs()
+            if deps.browser.tab(tab).url != current_url:
+                deps.gate._interrupt('the destination changed while authorizing the action')
+                return _refusal(tab, 'STALE_STATE', 'The destination changed. Observe the current page and request a fresh approval.')
+            if effect_locator and _observed_effect_target(deps.browser, tab, effect_locator) != detail['observed_target']:
+                deps.gate._interrupt('the observed target changed while authorizing the action')
+                return _refusal(tab, 'STALE_STATE', 'The target changed. Observe the page and request a fresh approval.')
+            if isinstance(command, bt.Upload) and deps.documents:
+                try:
+                    deps.documents.resolve_uploads(named['command'].files)
+                except ValueError as error:
+                    deps.gate._interrupt(str(error))
+                    return _refusal(tab, 'UPLOAD_DENIED', str(error))
         browser_ctx = dataclasses.replace(ctx, deps=deps.browser)
         started = time.perf_counter()
         with deps.gate.lock:

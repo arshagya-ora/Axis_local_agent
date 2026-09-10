@@ -22,7 +22,9 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 import uvicorn
 
-from axis.models import AxisConfig
+from axis.models import AxisConfig, AttachmentRef
+from axis.attachments.api import routes as attachment_routes
+from axis.attachments.store import AttachmentStore
 from axis.console import configure_console
 from axis.ownership import RuntimeOwnership
 from axis.ui_runner import Runner
@@ -42,6 +44,16 @@ class MessageInput(Input):
     client_request_id: str = Field(pattern=r'^[a-zA-Z0-9_-]{16,80}$')
     task_id: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9_-]{16,80}$')
     context_task_id: str | None = Field(default=None, pattern=r'^[a-zA-Z0-9_-]{16,80}$')
+    attachments: list[AttachmentRef] = Field(default_factory=list, max_length=8)
+    execution_mode: Literal['approval', 'automatic'] = 'approval'
+
+
+class ModeInput(Input):
+    execution_mode: Literal['approval', 'automatic']
+
+
+class ApprovalInput(Input):
+    decision: Literal['approve', 'deny']
 
 
 class ConversationInput(Input):
@@ -116,6 +128,9 @@ class LocalClientMiddleware:
         credential = headers.get(b'authorization', b'').decode('latin-1')
         if not hmac.compare_digest(credential, f'Bearer {self.token}'):
             return await JSONResponse({'code': 'unauthorized', 'message': 'Pairing credential was rejected.'}, status_code=401)(scope, receive, send_cors)
+        if scope['method'] == 'POST' and re.fullmatch(r'/api/conversations/[a-zA-Z0-9_-]{16,80}/attachments', scope['path']):
+            # The attachment route enforces its own byte limit while streaming.
+            return await self.app(scope, receive, send_cors)
         # Bound even chunked request bodies before parsing or entering routes.
         body = bytearray()
         while True:
@@ -139,13 +154,17 @@ class LocalClientMiddleware:
 
 def create_app(store, runner, *, token, origin, port=8766):
     commands = threading.RLock()
+    import tempfile
+    temporary = tempfile.TemporaryDirectory(prefix='axis-attachments-') if store.path is None else None
+    attachments = AttachmentStore(store, Path(temporary.name) if temporary else store.path.parent / 'attachments')
+    runner.attachments = attachments
 
     async def status(request):
         with store.lock:
             cursor = store.cursor()
         return JSONResponse(dict(ready=not runner.storage_error, storage_error=runner.storage_error,
                                  active_task=runner.active(), cursor=cursor,
-                                 capabilities={'pause': True, 'follow_up': True, 'extend_budget': True, 'history': True, 'restart_recovery': False}))
+                                 capabilities={'pause': True, 'follow_up': True, 'extend_budget': True, 'history': True, 'restart_recovery': False, 'attachments': True, 'workflow_recovery': True}))
 
     async def conversations(request):
         if request.method == 'POST':
@@ -169,7 +188,9 @@ def create_app(store, runner, *, token, origin, port=8766):
                 raise ServiceError('busy', 'Stop the active or paused task before deleting this conversation.', active_task=active)
             store.db.execute('INSERT OR IGNORE INTO retired_requests SELECT client_request_id FROM messages WHERE conversation_id=? AND client_request_id IS NOT NULL', (conversation_id,))
             store.db.execute('DELETE FROM conversations WHERE id=?', (conversation_id,))
-            return JSONResponse({'deleted': True})
+            store.db.execute('DELETE FROM embedding_cache')
+        await asyncio.to_thread(attachments._collect_orphans)
+        return JSONResponse({'deleted': True})
 
     async def submit(request):
         body = await read_input(request, MessageInput)
@@ -182,6 +203,20 @@ def create_app(store, runner, *, token, origin, port=8766):
     async def task(request):
         with store.lock:
             return JSONResponse(store.task(request.path_params['task_id']))
+
+    async def request_status(request):
+        # Lookup is independent of conversation paging and never starts work.
+        with store.lock:
+            try:
+                message = store.accepted(request.path_params['request_id'])
+            except ServiceError as error:
+                if error.code != 'stale_state':
+                    raise
+                return JSONResponse({'status': 'retired'})
+            if message is None:
+                return JSONResponse({'status': 'unknown'})
+            return JSONResponse({'status': 'accepted', 'message': message,
+                                 'task': store.task(message['task_id'])})
 
     async def control(request):
         body = await read_input(request, ControlInput)
@@ -196,6 +231,16 @@ def create_app(store, runner, *, token, origin, port=8766):
 
     async def activity(request):
         return JSONResponse(store.activity(request.path_params['task_id'], positive_query(request, 'before', 0)))
+
+    async def execution_mode(request):
+        body = await read_input(request, ModeInput)
+        with commands:
+            return JSONResponse(runner.change_mode(request.path_params['task_id'], body.execution_mode))
+
+    async def execution_approval(request):
+        body = await read_input(request, ApprovalInput)
+        with commands:
+            return JSONResponse(runner.approvals.decide(request.path_params['task_id'], request.path_params['approval_id'], body.decision))
 
     async def events(request):
         after = positive_query(request, 'after', 0)
@@ -253,14 +298,21 @@ def create_app(store, runner, *, token, origin, port=8766):
     async def lifespan(app):
         yield
         if await asyncio.to_thread(runner.close):
+            await asyncio.to_thread(attachments.close)
             store.close()
+            if temporary:
+                temporary.cleanup()
 
     app = Starlette(routes=[
+        *attachment_routes(attachments),
         Route('/api/status', status), Route('/api/conversations', conversations, methods=['GET', 'POST']),
+        Route('/api/requests/{request_id}', request_status),
         Route('/api/conversations/{conversation_id}', conversation, methods=['GET', 'PATCH', 'DELETE']),
         Route('/api/conversations/{conversation_id}/messages', submit, methods=['POST']),
         Route('/api/tasks/{task_id}', task), Route('/api/tasks/{task_id}/control', control, methods=['POST']),
         Route('/api/tasks/{task_id}/events', activity), Route('/api/events', events),
+        Route('/api/tasks/{task_id}/execution-mode', execution_mode, methods=['PATCH']),
+        Route('/api/tasks/{task_id}/approvals/{approval_id}', execution_approval, methods=['POST']),
         Route('/api/settings', settings, methods=['GET', 'PATCH'])
     ], exception_handlers={ServiceError: service_error, sqlite3.Error: storage_error}, lifespan=lifespan)
     app.add_middleware(LocalClientMiddleware, token=token, origin=origin, port=port)

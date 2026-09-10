@@ -16,6 +16,7 @@ from uuid import uuid4
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 from pydantic_ai import CancellationToken, RunUsage
+from axis.attachments.models import DocumentRequest
 
 # Bounds. Model output is never rejected for exceeding these — validators clip
 # instead, so a chatty model costs a truncation rather than a retry.
@@ -74,6 +75,20 @@ class GoalCheck(BaseModel):
         return self
 
 
+class AttachmentRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    attachment_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    role: Literal["auto", "reference", "instructions", "upload"] = "auto"
+
+
+class AttachmentUse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    attachment_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    operations: list[Literal["read", "upload", "execute"]] = Field(max_length=3)
+    user_evidence: str = Field(min_length=1, max_length=1000)
+    coverage: Literal["relevant", "all"] = "relevant"
+
+
 class SourceNote(BaseModel):
     """A proposed short excerpt, accepted only after runtime citation validation."""
 
@@ -90,7 +105,10 @@ class PlanDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    decision: Literal["browse", "complete", "ask_user", "fail"]
+    decision: Literal["browse", "document", "complete", "ask_user", "fail"]
+    document_request: DocumentRequest | None = None
+    attachment_uses: list[AttachmentUse] = Field(default_factory=list, max_length=8)
+    workflow_step_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
     plan_summary: str | None = None
     next_goal: str | None = None
     success_condition: str | None = None
@@ -229,8 +247,10 @@ class AssertionRecord(BaseModel):
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["observation", "extraction", "navigation", "navigator", "assertion", "screenshot", "download", "console", "network"]
+    kind: Literal["observation", "extraction", "document", "navigation", "navigator", "assertion", "screenshot", "download", "console", "network"]
     detail: str
+    attachment_id: str | None = None
+    location: str | None = None
     tab: str | None = None
     verified: bool = True
     id: str | None = None
@@ -248,6 +268,8 @@ class TaskFact(BaseModel):
     """A bounded browser result with provenance, never a model-authored claim."""
 
     source_url: str | None = None
+    attachment_id: str | None = None
+    location: str | None = None
     tab: str | None = None
     goal_id: str | None = None
     target: str = ""
@@ -378,6 +400,11 @@ class TaskRunState(BaseModel):
 
     task_id: str = Field(default_factory=lambda: uuid4().hex)
     original_request: str = ""
+    attachments: list[AttachmentRef] = Field(default_factory=list, max_length=8)
+    execution_kind: Literal["browser", "document"] = "browser"
+    document_coverage: dict[str, dict[str, list[list[int]]]] = Field(default_factory=dict)
+    document_units: dict[str, int] = Field(default_factory=dict)
+    document_complete_units: dict[str, set[str]] = Field(default_factory=dict)
     follow_ups: list[str] = Field(default_factory=list)
     requirements: TaskRequirements = Field(default_factory=TaskRequirements)
     bound_tab: str | None = None

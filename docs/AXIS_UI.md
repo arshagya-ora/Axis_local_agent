@@ -63,6 +63,56 @@ only to the local terminal; the panel's bounded activity, persisted display even
 and approval rules are unchanged. It does not enable HTTP request-body logging or
 provider SDK debug logging. Continue sending instructions through the extension.
 
+## Attach files
+
+Use **Attach files** or drag files onto the composer. AXIS reads XLSX, DOCX, PPTX,
+searchable PDF, MD, TXT, and CSV files and can upload preserved originals to a
+website during a task. Attach files and describe the goal: there is no required
+per-file role selector. New files use `auto`; AXIS can read a file and upload its
+preserved original in the same task. Uploads do not wait for extraction, while
+required reads do. The UI shows processing status and removal controls.
+
+The planner declares task-scoped uses with quoted user-request evidence. File
+contents are reference data unless the user delegates instruction execution.
+Requests to configure every entry require source-linked coverage and verified
+workflow results. Legacy upload-only files remain restricted. Unreadable content
+cannot support a summary; three unsuccessful document attempts stop with a
+specific blocker, retaining the task context.
+
+### Execution modes
+
+The compact composer selector defaults to **Approval** and remembers the user's
+preference. Each new task snapshots its mode. In both modes, inspection and local
+preparation run automatically.
+
+- **Approval:** before a browser change, review its exact destination, target,
+  arguments/content, original-file IDs and verification condition. Approvals are
+  action-sized batches, not blanket permission for the remainder of a task.
+  Creating a remote draft, autosaving its fields, and uploading files are changes.
+- **Automatic:** clearly scoped changes can proceed without the extra execution
+  prompt. Ambiguous destinations or effects still require review. Browser
+  permissions, mandatory configured approvals and prohibitions still apply.
+  A draft-only request does not authorize sending.
+
+Changing an active task's mode is an explicit UI action. It applies at the next
+action boundary, invalidates outstanding approvals, and never undoes earlier
+changes. If the change interrupts a waiting approval, resume the preserved task.
+Stop invalidates approvals. A sidebar reconnect restores a pending prompt; a
+service restart invalidates grants and marks live work interrupted. Decisions are
+authenticated and idempotent; approval is consumed before execution, never replayed.
+
+API additions are `execution_mode: approval | automatic` on message submission,
+`PATCH /api/tasks/{id}/execution-mode`, and
+`POST /api/tasks/{id}/approvals/{approval_id}` with `decision: approve | deny`.
+Task JSON fields and the approval table are additive; old history stays readable.
+Legacy tasks without a mode retain their existing runtime policy.
+
+Interrupted tasks with a saved document workflow provide **Recover workflow**.
+Recovery retains verified steps and reconciles the last running step with the
+website. Ordinary tasks retain the restart behavior described below.
+See the [attachment guide](../axis-agent/axis/attachments/README.md) for setup,
+limits, retrieval, original-file uploads, and verification commands.
+
 ## Controls and continuity
 
 - **New conversation** creates a separate workspace. **New task** creates fresh
@@ -84,12 +134,21 @@ provider SDK debug logging. Continue sending instructions through the extension.
   evidence. A follow-up alone never grants more budget.
 - **Use saved outcome** starts a fresh task with at most 800 characters of the
   chosen outcome as context, bounded together with the new instruction. Historical
-  tasks never continue an unrelated live orchestrator.
+  tasks never continue an unrelated live orchestrator. For cancelled/interrupted
+  work, restarting instead carries the original request, attachments, inferred
+  uses, restrictions and verified workflow progress, with fresh approvals.
+  A bare “continue the same thing” targets the latest cancelled/interrupted task
+  in the current conversation when there is no live task.
 - History supports title search, paging, load, rename, and delete. Deleting an
   owned conversation requires stopping its task first. Deletion removes the chat
   and events; request-ID tombstones prevent an old network retry from executing
   deleted work again.
 - Panel closure and stream reconnection reload authoritative task snapshots.
+  Unconfirmed submissions are checked against the service by request ID when
+  reconnecting. Accepted submissions are cleared automatically, including those
+  in another conversation or older history pages. Otherwise the composer shows
+  the previous instruction and **Retry previous instruction**. Retry uses the
+  original conversation, task target, and request ID and preserves a newer draft.
   Activity uses resumable authenticated fetch/SSE, sequence deduplication, and
   bounded batches. Slow subscribers receive a resync instruction. The rendered
   view retains at most 50 messages and 30 activity entries per loaded task; older
@@ -98,7 +157,7 @@ provider SDK debug logging. Continue sending instructions through the extension.
 
 Restarting Python restores history but marks owned work **Interrupted**. It does
 not reconstruct live browser objects, continuation tokens, or model run state, and
-never replays browser actions. Resume and budget extension require the same live
+never replays browser actions. For ordinary tasks, Resume and budget extension require the same live
 Python process. Saved cited answers are retained as inert text, up to the agent's
 64,000-character maximum; no private planner reasoning or raw page dumps are
 forwarded as activity. Reported artifacts are descriptive records, not arbitrary
@@ -123,7 +182,38 @@ existing allow/deny/session semantics. Approvals appear in the current panel vie
 including Settings or History, and reconcile decisions made in another window.
 Prompts without a trustworthy task association are labelled **Browser bridge
 approval**. Agent-side configured gates retain their existing policy; the UI does
-not create a blanket bypass or a second approval authority.
+not create a blanket bypass. Task execution approvals described above are an
+additional gate and cannot override bridge decisions.
+
+## Sidebar polish
+
+The sidebar uses a unified light/dark header, compact task cards, consistent spacing,
+and quieter history controls. Task titles are not repeated inside the activity view,
+and empty workflow counters are omitted. Cards place a plain status indicator and
+timing above the current action, group activity into a quiet inset, and separate
+task controls in the footer. The composer has one focus border, with
+the attachment button, task selector, and send button in one bottom row; its hint
+sits below the input surface. Running uses a mint badge; completed uses a neutral
+badge with a green indicator. Existing task controls and conversation flows remain.
+
+Expanded task activity is grouped into collapsible Planning, Browsing, Evidence,
+and Result sections. Other lifecycle events appear under Activity. Each section
+counts its loaded activity entries as steps (not model requests or browser actions),
+and each entry shows its recorded local time. Older pages retain their paging
+controls; counts describe only the loaded page. Section choices and keyboard focus
+survive live updates while the panel is open. New events carry a bounded display
+category, and older history uses known public event types and labels.
+
+Completed tasks place their answer before a compact activity summary. Activity
+collapses on completion and can be reopened. Assistant answers render a safe
+Markdown subset: paragraphs, headings, emphasis, lists, quotations, code, and
+HTTP(S) links. Rendering creates DOM nodes rather than inserting HTML; raw HTML
+and unsupported link protocols remain text. Stored answer content is unchanged.
+
+The HTML, JavaScript, and CSS were already valid UTF-8; the reported mojibake was
+PowerShell decoding output incorrectly. Extension editor settings now explicitly
+specify UTF-8. Source checks reject invalid UTF-8 and common mojibake sequences;
+the browser check also asserts actual arrows, ellipses, separators, and apostrophes.
 
 ## Verification
 
@@ -135,6 +225,7 @@ node --test browser-agent-bridge-main/tests/*.mjs
 uv run python axis-agent/scripts/ui_browser_check.py
 uv run python axis-agent/scripts/ui_native_check.py
 uv run python axis-agent/scripts/ui_fixture_smoke.py
+uv run python axis-agent/scripts/attachment_fixture_check.py --executable PATH_TO_CHROMIUM
 ```
 
 Create the `tmp` directory first if absent. Playwright is a development-only
@@ -157,6 +248,13 @@ and bridge, with a firewall restricting it to local fixture tabs.
 Screenshots and JSON evidence are written to `artifacts/axis-ui/`. Test records
 never seed production conversations. UI screenshots from the deterministic test
 are development fixtures, not claims of completed browser work.
+
+The attachment fixture uses a scripted model, the real serialized UI runner and
+approval endpoints, and a Playwright-backed local RPC adapter. It extracts a
+PowerPoint, creates a local mail draft, autosaves its source-grounded summary,
+and checks the uploaded original's SHA-256. Approval mode requires three exact
+action approvals; Automatic needs none. Neither run sends. This is a local
+regression test, not a test against a Gmail account or a live model provider.
 
 ### Delivery checklist
 

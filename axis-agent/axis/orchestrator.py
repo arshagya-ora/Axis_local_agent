@@ -8,6 +8,7 @@ the process.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -277,6 +278,8 @@ class AxisOrchestrator:
         self._downloads_enabled = config.tools.downloads
         self._visual_enabled = False
         self._base_navigator = navigator
+        self.documents = None  # Set by the UI runner for tasks with attachments.
+        self.recovery_counts = None
 
     @property
     def memory(self) -> TaskRunState | None:
@@ -338,10 +341,19 @@ class AxisOrchestrator:
             tab.task_created = False
         if task_id is not None:
             self.state.task_id = task_id
+        if self.documents:
+            from axis.models import AttachmentRef
+            self.state.attachments = [AttachmentRef(attachment_id=a['id'], role=a['role']) for a in self.documents.store.catalog(self.state.task_id)]
         self.browser.task_started_wallclock = self.state.started_wallclock
         self.browser.visual_enabled = False
         self.browser.invalidate_visual()
         self.state.status = "paused" if self._prestart_paused else "active"
+        if self.recovery_counts:
+            self.state.counters.total_steps = self.recovery_counts.get('total_steps', 0)
+            self.state.counters.browser_actions = self.recovery_counts.get('browser_actions', 0)
+            self.state.usage.requests = self.recovery_counts.get('model_requests', 0)
+            self.state.last_error = 'Recovered workflow. Reobserve browser state before retrying any running step.'
+            self.recovery_counts = None
         self._set_navigator_tools()
         try:
             return await self._loop()
@@ -600,6 +612,13 @@ class AxisOrchestrator:
     async def _loop(self) -> AxisResult:
         state = self.state
         assert state is not None
+        document_progress = self.documents.progress() if self.documents else {}
+        document_stalls = document_progress.get('attempts', 0)
+        document_results = set(document_progress.get('signatures', []))
+        if self.documents and self.documents.last_result is None and not any(item.kind == 'document' for item in state.evidence):
+            # A reconstructed task needs fresh source content in model context.
+            # Preserve failures, but permit re-reading evidence lost with the process.
+            document_results.clear()
         while True:
             stop = self._stop_reason()
             if stop is not None:
@@ -612,8 +631,23 @@ class AxisOrchestrator:
             state.counters.planner_passes += 1
             state.counters.navigator_steps_since_plan = 0
             self._emit("planner_decision", **plan.model_dump(), duration_ms=state.plan_ms)
+            if self.documents and plan.attachment_uses:
+                try:
+                    self.documents.configure_uses(plan.attachment_uses, state.original_request + '\n' + '\n'.join(self.documents.context().get('user_followups', [])))
+                except ValueError as error:
+                    return self._result('needs_user', reason=str(error), answer=str(error))
 
             if plan.decision == "complete":
+                if self.documents:
+                    errors = self.documents.completion_errors()
+                    if errors:
+                        state.last_error = "Completion rejected: " + " ".join(errors)
+                        document_stalls += 1
+                        self.documents.progress(document_stalls, document_results)
+                        self._emit('status', phase='document_error', error=state.last_error[:600], attempt=document_stalls, operation='completion')
+                        if document_stalls >= 3:
+                            return self._result('needs_user', reason=state.last_error[:600], answer=state.last_error[:600])
+                        continue
                 if plan.final_answer and len(plan.final_answer) > self.config.run.final_answer_max_chars:
                     state.last_error = f"Shorten the answer to {self.config.run.final_answer_max_chars} characters while preserving required sources."
                     continue
@@ -631,6 +665,46 @@ class AxisOrchestrator:
                                     reason=plan.reason)
             if plan.decision == "fail":
                 return self._result("failed", evidence=plan.evidence, reason=plan.reason)
+
+            if plan.decision == "document":
+                try:
+                    if not self.documents or not plan.document_request:
+                        raise ValueError("Document access requires task attachments and an executable document_request.")
+                    result = await asyncio.to_thread(self.documents.execute, plan.document_request)
+                    if 'items' in result and not result['items']:
+                        raise ValueError('The document request found no useful source content. Check the file, section IDs or search terms.')
+                    normalized = dict(result)
+                    if 'items' in normalized:
+                        normalized['items'] = sorted(normalized['items'], key=lambda item: str(item.get('id', '')))
+                    import hashlib
+                    signature = hashlib.sha256(json.dumps(normalized, sort_keys=True, default=str).encode()).hexdigest()
+                    if signature in document_results:
+                        raise ValueError('The document request returned no new information. Use the retained result or choose a different operation.')
+                    document_results.add(signature)
+                    document_stalls = 0
+                    self.documents.progress(document_stalls, document_results)
+                    if result.get('operation') == 'read':
+                        for item in result['items']:
+                            evidence = state.add_evidence('document', item['text'])
+                            evidence.attachment_id = item['attachment_id']
+                            evidence.location = item['location']
+                    state.last_error = None
+                    self._emit('status', phase='document_read', operation=plan.document_request.operation)
+                except (ValueError, RuntimeError) as error:
+                    from axis.attachments.runtime import DocumentRestriction
+                    state.last_error = str(error)[:600]
+                    document_stalls += 1
+                    if self.documents:
+                        self.documents.progress(document_stalls, document_results)
+                    self._emit('status', phase='document_error', error=state.last_error,
+                               attempt=document_stalls, operation=plan.document_request.operation if plan.document_request else 'missing')
+                    if isinstance(error, DocumentRestriction):
+                        return self._result('needs_user', reason=state.last_error, answer=state.last_error)
+                    if document_stalls >= 3:
+                        reason = 'Document work stopped after three attempts without progress: ' + state.last_error
+                        return self._result('needs_user', reason=reason, answer=reason)
+                state.counters.total_steps += 1
+                continue
 
             if (state.remaining_work or state.requirements.min_sources) and (
                     self._run_limits().max_model_requests - int(state.usage.requests)
@@ -654,6 +728,21 @@ class AxisOrchestrator:
             state.current_goal = self._preserve_literal_urls(plan.next_goal)
             state.current_success_condition = plan.success_condition
             state.repair_attempted = False
+
+            if self.documents:
+                workflow = self.documents.workflow()
+                if workflow['next_steps'] and not plan.workflow_step_id:
+                    state.last_error = 'Choose the first pending workflow_step_id for browser execution.'
+                    continue
+                if plan.workflow_step_id:
+                    if plan.verification is None:
+                        state.last_error = 'Workflow execution requires a concrete verification postcondition.'
+                        continue
+                    try:
+                        self.documents.begin(plan.workflow_step_id, state.current_goal_id, plan.verification)
+                    except ValueError as error:
+                        state.last_error = str(error)
+                        continue
 
             try:
                 await self._navigator_burst()
@@ -726,6 +815,11 @@ class AxisOrchestrator:
                         for p in pending) + "."
                 elif not known or any(ref not in known for ref in outcome.evidence_ids):
                     rejection = "Unknown or unverified evidence reference; cite runtime evidence IDs."
+                if not rejection and self.documents and self.documents.current_step:
+                    try:
+                        self.documents.verified(state, self._matches_goal_check)
+                    except ValueError as error:
+                        rejection = str(error)
                 if rejection:
                     outcome.status = "continue"
                     outcome.reason = rejection
@@ -824,6 +918,9 @@ class AxisOrchestrator:
             "remaining_browser_actions": max(0, run.max_browser_actions - state.counters.browser_actions),
             "remaining_model_requests": max(0, run.max_model_requests - int(state.usage.requests)),
         }
+        if self.documents:
+            context['documents'] = self.documents.context()
+        context['execution_mode'] = getattr(self, 'execution_mode', 'automatic')
         if self.tab is not None and self.tab in self.browser.tabs:
             context["browser"] = {
                 "tab": self.tab,
@@ -912,6 +1009,7 @@ class AxisOrchestrator:
             remaining_total_actions=max(0, run.max_browser_actions - task.counters.browser_actions),
             approval_actions=frozenset(self.config.tools.approval_required_actions),
             approval=self.approval,
+            effect_authorizer=getattr(self, 'effect_authorizer', None),
             forbidden_actions=frozenset(task.requirements.forbidden_actions),
             mutation_allowed=task.requirements.mutation_allowed,
             is_paused=lambda: bool(self.state and self.state.status == "paused"),
@@ -927,10 +1025,12 @@ class AxisOrchestrator:
             ),
             on_record=self._register_action,
         )
-        deps = AxisDeps(browser=self.browser, gate=gate)
+        deps = AxisDeps(browser=self.browser, gate=gate, documents=self.documents)
         self._emit("status", phase="navigator_step_started", goal=state.goal)
         prompt = format_as_xml(state.model_dump(exclude_none=True,
             exclude={"recent_actions": {"__all__": {"extracted_data"}}}), root_tag="browser_state")
+        if self.documents:
+            prompt += '\n' + format_as_xml(self.documents.context(), root_tag='task_documents')
         model_prompt = [prompt, self.browser.visual_content(state.screenshot)] if state.screenshot else prompt
         started = time.monotonic()
         try:
@@ -1142,8 +1242,19 @@ class AxisOrchestrator:
         if current and current.url and current.url.rstrip("/") == url.rstrip("/"):
             state.direct_navigation_done = True
             return
+        command = bt.Open(operation='open', url=url)
+        gate = StepGate(max_actions=1,
+                        remaining_total_actions=max(0, self._run_limits().max_browser_actions-state.counters.browser_actions),
+                        approval_actions=frozenset(self.config.tools.approval_required_actions), approval=self.approval,
+                        effect_authorizer=getattr(self, 'effect_authorizer', None),
+                        forbidden_actions=frozenset(state.requirements.forbidden_actions),
+                        is_paused=lambda: state.status == 'paused', is_cancelled=lambda: state.status == 'cancelled')
+        refusal = gate.check('browser_navigate', {'tab':tab,'command':command},
+                             {'tab':tab,'target':url,'current_url':current.url if current else None,'expected_effect':'navigate'})
+        if refusal:
+            raise _Stop(self._result(gate.stopped or 'needs_user', reason=self._envelope_error(refusal)))
         result = bt.browser_navigate(
-            browser_context(self.browser), tab, bt.Open(operation="open", url=url),
+            browser_context(self.browser), tab, command,
         )
         error = result.get("error") if isinstance(result.get("error"), dict) else {}
         record = ActionRecord(
@@ -1194,7 +1305,7 @@ class AxisOrchestrator:
         run = self._run_limits()
         tab = self._ensure_tab()
         self._arm_diagnostics(tab)
-        self._maybe_direct_navigate(tab)
+        await asyncio.to_thread(self._maybe_direct_navigate, tab)
         if self.config.tools.debug_recording and not state.debug_telemetry_started:
             self.browser.start_debug_telemetry(tab)
             state.debug_telemetry_started = bool(self.browser.debug_recording or self.browser.debug_trace)

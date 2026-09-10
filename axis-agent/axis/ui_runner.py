@@ -17,7 +17,10 @@ from uuid import uuid4
 from axis.bootstrap import build_orchestrator
 from axis.console import print_debug_event, print_event, print_result
 from axis.models import AxisConfig, AxisEvent, AxisResult
+from axis.models import AttachmentRef
+from axis.attachments.runtime import DocumentSession
 from axis.ui_store import Store, ServiceError, TERMINAL
+from axis.execution import ExecutionApprovals
 
 log = logging.getLogger(__name__)
 
@@ -37,10 +40,28 @@ def public_activity(event: AxisEvent) -> str | None:
         return {'continue': 'Browser step finished', 'goal_reached': 'Checking browser result',
                 'blocked': 'Browser step blocked', 'ask_user': 'Input requested', 'failed': 'Browser step failed'}.get(detail.get('status'))
     if event.kind == 'status':
-        return {'planner_started': 'Planning the next step', 'navigator_step_started': 'Working in the browser',
+        if detail.get('phase') == 'document_error':
+            return f"Document issue ({detail.get('attempt', 1)}/3): {str(detail.get('error', 'Document operation failed'))[:600]}"
+        return {'document_read': 'Read attachment or updated workflow progress',
+                'planner_started': 'Planning the next step', 'navigator_step_started': 'Working in the browser',
                 'observed': 'Read browser context', 'tab_selected': 'Selected a browser tab',
                 'tab_create': 'Opened a browser tab', 'vision_unavailable': 'Visual input unavailable'}.get(detail.get('phase'))
     return None  # final results are persisted authoritatively after the runner returns
+
+
+def public_phase(event: AxisEvent) -> str:
+    """A bounded display category; never forward raw event details."""
+    if event.kind == 'planner_decision' or event.detail.get('phase') == 'planner_started':
+        return 'Planning'
+    if event.detail.get('phase') in {'observed', 'document_read', 'document_error'}:
+        return 'Evidence'
+    if event.kind == 'browser_action' and event.detail.get('tool') in {'browser_capture_evidence', 'browser_observe'}:
+        return 'Evidence'
+    if event.kind in {'browser_action', 'navigator_step'} or event.detail.get('phase') in {
+        'navigator_step_started', 'tab_selected', 'tab_create', 'vision_unavailable'
+    }:
+        return 'Browsing'
+    return 'Activity'
 
 
 def safe_result(result: AxisResult) -> dict:
@@ -69,6 +90,21 @@ class Runner:
         self.requested: str | None = None
         self.storage_error: str | None = None
         self.closed = False
+        self.attachments = None
+        self.approvals = ExecutionApprovals(self)
+
+    def change_mode(self, task_id, mode):
+        with self.lock, self.store.transaction():
+            if task_id != self.active_id:
+                raise ServiceError('stale_state', 'Only the live task can change execution mode.')
+            task = self.store.task(task_id)
+            task['execution_mode'] = mode
+            task['mode_revision'] = task.get('mode_revision', 0) + 1
+            if self.orchestrator:
+                self.orchestrator.execution_mode = mode
+            self.store.save_task(task)
+            self.approvals.invalidate(task_id)
+            return self.store.task(task_id)
 
     def active(self):
         with self.lock, self.store.lock:
@@ -90,6 +126,8 @@ class Runner:
             self.store.conversation(conversation_id)
             previous = self.store.accepted(body.client_request_id)
             if previous:
+                if previous.get('attachments', []) != [r.model_dump() for r in body.attachments]:
+                    raise ServiceError('invalid_input', 'This request ID was already used with different attachments.')
                 if (previous['conversation_id'], previous['text'], previous['intent']) != (conversation_id, body.text, body.intent) or (body.intent == 'follow_up' and previous['task_id'] != body.task_id):
                     raise ServiceError('invalid_input', 'This request ID was already used for a different instruction.')
                 return dict(message=previous, task=self.store.task(previous['task_id']), duplicate=True)
@@ -99,11 +137,17 @@ class Runner:
                                        active_task=self.store.task(self.active_id))
                 task_id = uuid4().hex
                 task = dict(id=task_id, conversation_id=conversation_id, title=body.text[:80], status='active',
+                            instruction=body.text, execution_mode=body.execution_mode, mode_revision=0, plan_revision=0,
                             owns_runtime=True,
                             current_activity='Accepted; preparing the agent', created_at=time.time(), updated_at=time.time(),
                             ended_at=None, counters={'browser_actions': 0, 'total_steps': 0}, result=None, browser_context=None,
                             limits=self.config.run.model_dump())
                 self.store.save_task(task)
+                if self.attachments and body.attachments:
+                    self.attachments.link(task_id, conversation_id, body.attachments)
+                    task['attachments'] = self.attachments.catalog(task_id)
+                    task['instruction'] = body.text
+                    self.store.save_task(task)
                 conversation = self.store.conversation(conversation_id)
                 if conversation['title'] == 'New conversation':
                     self.store.db.execute('UPDATE conversations SET title=? WHERE id=?', (body.text[:80], conversation_id))
@@ -113,10 +157,34 @@ class Runner:
                     if source['conversation_id'] != conversation_id:
                         raise ServiceError('invalid_input', 'Saved context must belong to this conversation.', 422)
                     outcome = (source.get('result') or {}).get('answer') or source.get('current_activity', '')
+                    if source['status'] in {'cancelled', 'interrupted'}:
+                        original = source.get('instruction')
+                        if not original:
+                            row = self.store.db.execute("SELECT text FROM messages WHERE task_id=? AND intent='new_task' ORDER BY ordinal LIMIT 1", (source['id'],)).fetchone()
+                            original = row[0] if row else source['title']
+                        instruction = original + '\n\nRestart request: ' + body.text + '\nPrior execution ended; inspect current website state before repeating any change.'
+                        if self.attachments:
+                            refs = [AttachmentRef(attachment_id=a['id'], role=a['role']) for a in self.attachments.catalog(source['id'])]
+                            refs = list({r.attachment_id: r for r in [*refs, *body.attachments]}.values())
+                            self.attachments.link(task_id, conversation_id, refs)
+                            task['attachments'] = self.attachments.catalog(task_id)
+                            self.store.db.execute('INSERT OR IGNORE INTO document_reads SELECT ?,section_id FROM document_reads WHERE task_id=?', (task_id, source['id']))
+                            prior = self.store.db.execute('SELECT * FROM workflow_steps WHERE task_id=? ORDER BY ordinal', (source['id'],)).fetchall()
+                            task['prior_progress'] = [{'instruction': row['instruction'], 'status': row['status'], 'expected_result': row['expected_result']} for row in prior]
+                            for row in prior:
+                                self.store.db.execute('''INSERT INTO workflow_steps
+                                    (id,task_id,section_id,ordinal,instruction,expected_result,status,evidence,verification)
+                                    VALUES (?,?,?,?,?,?,?,?,?)''', (uuid4().hex, task_id, row['section_id'], row['ordinal'],
+                                    row['instruction'], row['expected_result'], row['status'] if row['status'] in {'verified','skipped'} else 'pending',
+                                    row['evidence'], row['verification']))
+                        task['attachment_uses'] = source.get('attachment_uses', {})
+                        task['instruction'] = instruction
+                        self.store.save_task(task)
+                        outcome = ''
                     available = max(0, 4000-len(instruction)-60)
-                    if available:
+                    if available and outcome:
                         instruction += '\n\nSaved prior outcome (context only):\n' + outcome[:min(800, available)]
-                message = self.store.message(conversation_id, task_id, body.text, body.client_request_id, body.intent)
+                message = self.store.message(conversation_id, task_id, body.text, body.client_request_id, body.intent, attachments=[r.model_dump() for r in body.attachments])
                 self.store.event(conversation_id, task_id, 'status', {'task': task, 'text': task['current_activity']})
                 # Publish execution only after acceptance has committed (below).
                 next_run = ('start', (instruction, self.config.model_copy(deep=True)), task_id)
@@ -130,7 +198,9 @@ class Runner:
                     raise ServiceError('invalid_input', 'Follow-up target belongs to another conversation.', 422)
                 if self.pending or self.requested == 'stop':
                     raise ServiceError('busy', 'An instruction or stop request is already pending. Keep this draft until it is applied.', active_task=task)
-                message = self.store.message(conversation_id, body.task_id, body.text, body.client_request_id, body.intent, 'accepted')
+                if self.attachments:
+                    self.attachments.validate_refs(conversation_id, body.attachments, body.task_id)
+                message = self.store.message(conversation_id, body.task_id, body.text, body.client_request_id, body.intent, 'accepted', attachments=[r.model_dump() for r in body.attachments])
                 next_run = ('follow_up', message, body.task_id)
         # Reacquire only after transaction commit. API routes call submit under
         # the service command lock, so another request cannot reserve in this gap.
@@ -193,6 +263,17 @@ class Runner:
     def control(self, task_id, action):
         with self.lock, self.store.lock:
             task = self.store.task(task_id)
+            if action == 'resume' and task['status'] == 'interrupted' and task.get('workflow', {}).get('counts'):
+                if self.active_id:
+                    raise ServiceError('busy', 'Stop the current task before recovering this workflow.')
+                self.active_id, self.requested = task_id, None
+                task.update(status='active', owns_runtime=True, current_activity='Recovering saved workflow; reconciling browser state')
+                self.store.update_task(task)
+                config = self.config.model_copy(deep=True)
+                # Retain cumulative usage through a new model/browser session.
+                config.run = type(config.run).model_validate(task['limits'])
+                self.future = asyncio.run_coroutine_threadsafe(self._execute('recover', (task['instruction'], config)), self.loop)
+                return task
             if self.active_id != task_id:
                 if action == 'stop' and task['status'] in TERMINAL:
                     return task
@@ -214,6 +295,7 @@ class Runner:
                 self.loop.call_soon_threadsafe(self._apply_control, task_id, 'pause')
             else:
                 self.requested = 'stop'
+                self.approvals.invalidate(task_id)
                 if self.pending:
                     with self.store.transaction():
                         self.store.delivery(self.pending['id'], 'not_applied')
@@ -239,6 +321,11 @@ class Runner:
         # independently allowlisted mapping below reaches SQLite/HTTP/SSE.
         self._print_diagnostic(self.event_printer, event)
         text = public_activity(event)
+        if event.kind == 'planner_decision' and self.active_id:
+            with self.lock, self.store.transaction():
+                task = self.store.task(self.active_id)
+                task['plan_revision'] = task.get('plan_revision', 0) + 1
+                self.store.save_task(task)
         if not text:
             return
         with self.lock:
@@ -252,20 +339,30 @@ class Runner:
                 task['updated_at'] = time.time()
                 if state:
                     task['counters'] = {key: getattr(state.counters, key) for key in ('browser_actions', 'total_steps')}
+                    task['counters']['model_requests'] = int(state.usage.requests)
+                    if self.attachments and getattr(self.orchestrator, 'documents', None):
+                        task['workflow'] = self.orchestrator.documents.workflow()
                     task['duration_ms'] = int((time.time()-task['created_at'])*1000)
                     browser = state.last_browser_state
                     if browser:
                         task['browser_context'] = {'tab': browser.tab, 'title': (browser.title or 'Browser tab')[:200]}
-                self.store.update_task(task, event.kind, {'text': text})
+                self.store.update_task(task, event.kind, {'text': text, 'phase': public_phase(event)})
             except (OSError, ValueError, RuntimeError, sqlite3.Error):
                 self._storage_failed()
 
     async def _execute(self, mode, value):
         task_id = self.active_id
         try:
-            if mode == 'start':
+            if mode in {'start', 'recover'}:
                 value, config = value
                 self.orchestrator = self.factory(config, on_event=self._event)
+                self.orchestrator.effect_authorizer = self.approvals.authorize
+                self.orchestrator.execution_mode = self.store.task(task_id).get('execution_mode', 'automatic')
+                self.orchestrator.approval = lambda tool, operation, detail: self.approvals.authorize(tool, operation, detail, mandatory=True)
+                if self.attachments and self.attachments.catalog(task_id):
+                    self._attach_documents(task_id)
+                    if mode == 'recover':
+                        self.orchestrator.recovery_counts = self.store.task(task_id).get('counters', {})
             while True:
                 with self.lock:
                     if self.requested == 'stop':
@@ -276,6 +373,17 @@ class Runner:
                         self.requested = None
                         value = pending['text']
                         with self.store.transaction():
+                            self.approvals.invalidate(task_id)
+                            task = self.store.task(task_id)
+                            task['instruction'] = task.get('instruction', '') + '\nFollow-up: ' + value
+                            self.store.save_task(task)
+                            if self.attachments and pending.get('attachments'):
+                                self.attachments.link(task_id, pending['conversation_id'], [AttachmentRef.model_validate(x) for x in pending['attachments']])
+                                self._attach_documents(task_id)
+                                task = self.store.task(task_id)
+                                task['attachments'] = self.attachments.catalog(task_id)
+                                task['instruction'] = task.get('instruction') or self.orchestrator.state.original_request
+                                self.store.save_task(task)
                             self.store.delivery(pending['id'], 'applied')
                         self._request_status('active', 'Applying the accepted instruction')
                 self._print_diagnostic(self.event_printer, AxisEvent(kind='status', detail={
@@ -292,7 +400,7 @@ class Runner:
                         browser_actions=state.counters.browser_actions if state else 0,
                         total_steps=state.counters.total_steps if state else 0,
                         model_requests=int(state.usage.requests) if state else 0)
-                elif mode == 'start':
+                elif mode in {'start', 'recover'}:
                     result = await self.orchestrator.start_task(value, task_id=task_id)
                 elif mode == 'resume':
                     result = await self.orchestrator.resume_run()
@@ -333,13 +441,21 @@ class Runner:
             except (OSError, sqlite3.Error):
                 self._storage_failed()
 
+    def _attach_documents(self, task_id):
+        self.orchestrator.documents = DocumentSession(self.attachments, task_id)
+        # Runtime path checks still apply after resolving task-scoped file IDs.
+        if hasattr(self.orchestrator, 'browser'):
+            self.orchestrator.browser.upload_roots = tuple(self.attachments.path(a['id']).parent for a in self.attachments.catalog(task_id))
+
     def _finish(self, task_id, result):
         task = self.store.task(task_id)
         task.update(status=result.status, current_activity=result.reason[:1000], result=safe_result(result),
                     owns_runtime=result.status not in TERMINAL or result.status == 'limit_reached',
                     updated_at=time.time(), ended_at=time.time() if result.status in TERMINAL else None,
-                    counters={'browser_actions': result.browser_actions, 'total_steps': result.total_steps}, duration_ms=int((time.time()-task['created_at'])*1000))
+                    counters={'browser_actions': result.browser_actions, 'total_steps': result.total_steps, 'model_requests': result.model_requests}, duration_ms=int((time.time()-task['created_at'])*1000))
         state = self.orchestrator.state if self.orchestrator else None
+        if getattr(self.orchestrator, 'documents', None):
+            task['workflow'] = self.orchestrator.documents.workflow()
         if state:
             outputs = [item for item in state.evidence if item.kind in {'screenshot', 'download'}]
             outputs += state.downloads

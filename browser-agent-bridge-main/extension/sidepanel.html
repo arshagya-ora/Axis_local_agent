@@ -56,6 +56,7 @@
         aria-label="Browser bridge approvals"
         hidden
       ></section>
+      <section id="execution-approval" aria-label="Task action approval" aria-live="polite" hidden></section>
       <main id="conversation" tabindex="-1" aria-label="Conversation">
         <div id="timeline"></div>
       </main>
@@ -63,8 +64,14 @@
         ↓ New activity
       </button>
       <div class="composer-wrap">
+        <div id="pending-instruction" class="notice" role="status" hidden>
+          <p>Delivery of a previous instruction is unconfirmed.</p>
+          <p id="pending-preview"></p>
+          <button id="retry-instruction" type="button">Retry previous instruction</button>
+        </div>
         <p id="workspace-error" class="feedback error" role="alert" hidden></p>
         <form id="composer" class="composer">
+          <div id="attachment-composer"></div>
           <div id="context-chip" class="context-chip" hidden></div>
           <label class="sr-only" for="instruction">Instruction</label
           ><textarea
@@ -74,6 +81,12 @@
             placeholder="Ask or add an instruction…"
           ></textarea>
           <div class="composer-controls">
+            <div id="attachment-action"></div>
+            <label class="sr-only" for="execution-mode">Execution mode</label>
+            <select id="execution-mode" title="Approval asks before website changes; Automatic acts within your request.">
+              <option value="approval">Approval</option>
+              <option value="automatic">Automatic</option>
+            </select>
             <label class="sr-only" for="message-mode">Message target</label
             ><select id="message-mode">
               <option value="new_task">New task</option>
@@ -86,10 +99,10 @@
               data-icon="send"
             ></button>
           </div>
+        </form>
           <p id="composer-hint" class="composer-hint">
             Connect AXIS in Settings to start a browser task.
           </p>
-        </form>
       </div>
     </div>
     <section

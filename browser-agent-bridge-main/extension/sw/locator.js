@@ -1734,6 +1734,8 @@ export function createLocatorHandlers({
             tagName: element.tagName.toLowerCase(),
             id: element.id || '',
             href: (element.closest?.('a[href]') || element).href || '',
+            formAction: element.formAction || element.form?.action || '',
+            formMethod: element.formMethod || element.form?.method || '',
             download: (element.closest?.('a[href]') || element).hasAttribute('download'),
             name: element.getAttribute('name') || '',
             role: inferredRole(element),

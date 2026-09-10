@@ -28,6 +28,11 @@ export function mergeTask(state, task) {
   state.taskVersions ||= {};
   if ((state.taskVersions[task.id] || 0) > (task.updated_at || 0)) return false;
   state.taskVersions[task.id] = task.updated_at || 0;
+  state.completedSeen ||= {};
+  if (task.status === "completed" && !state.completedSeen[task.id]) {
+    state.expanded[task.id] = false;
+    state.completedSeen[task.id] = true;
+  }
   state.taskVersions = Object.fromEntries(
     Object.entries(state.taskVersions).slice(-100),
   );
@@ -51,9 +56,11 @@ export function createState() {
     active: null,
     expanded: {},
     drafts: {},
+    attachmentDrafts: {},
     views: {},
     selected: null,
     mode: "new_task",
+    executionMode: "approval",
     target: null,
     context: null,
     pending: null,
@@ -135,9 +142,11 @@ export function persistentState(state) {
   return {
     selected: state.selected,
     drafts: Object.fromEntries(Object.entries(state.drafts).slice(-20)),
+    attachmentDrafts: Object.fromEntries(Object.entries(state.attachmentDrafts || {}).slice(-20)),
     views: state.views,
     expanded: Object.fromEntries(Object.entries(state.expanded).slice(-100)),
     pending: state.pending,
+    executionMode: state.executionMode || "approval",
     extensions: state.extensions || {},
   };
 }
