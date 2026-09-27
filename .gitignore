@@ -57,6 +57,7 @@ axis-agent/reports/
 # browser_capture_evidence output: screenshots, PDFs, DOM snapshots, traces.
 axis-agent/artifacts/
 artifacts/
+docs/architecture/*.visual-check.*
 # browser_downloads output.
 downloads/
 # Pydantic Evals run output.

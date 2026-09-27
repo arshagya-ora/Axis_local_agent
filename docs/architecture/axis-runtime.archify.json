@@ -1,0 +1,253 @@
+{
+    "schema_version":  1,
+    "diagram_type":  "architecture",
+    "meta":  {
+                 "title":  "AXIS runtime architecture",
+                 "locale":  "en",
+                 "quality_profile":  "showcase",
+                 "viewBox":  [
+                                 1200,
+                                 750
+                             ]
+             },
+    "components":  [
+                       {
+                           "id":  "panel",
+                           "type":  "frontend",
+                           "label":  "AXIS side panel",
+                           "sublabel":  "Chrome extension UI",
+                           "pos":  [
+                                       70,
+                                       255
+                                   ],
+                           "size":  [
+                                        170,
+                                        76
+                                    ]
+                       },
+                       {
+                           "id":  "service",
+                           "type":  "backend",
+                           "label":  "UI service",
+                           "sublabel":  "Loopback API :8766",
+                           "pos":  [
+                                       340,
+                                       255
+                                   ],
+                           "size":  [
+                                        170,
+                                        76
+                                    ]
+                       },
+                       {
+                           "id":  "agents",
+                           "type":  "backend",
+                           "label":  "Planner + Navigator",
+                           "sublabel":  "Task orchestration",
+                           "pos":  [
+                                       610,
+                                       255
+                                   ],
+                           "size":  [
+                                        180,
+                                        76
+                                    ]
+                       },
+                       {
+                           "id":  "runtime",
+                           "type":  "security",
+                           "label":  "BrowserRuntime",
+                           "sublabel":  "Tool + policy gate",
+                           "pos":  [
+                                       880,
+                                       255
+                                   ],
+                           "size":  [
+                                        170,
+                                        76
+                                    ]
+                       },
+                       {
+                           "id":  "host",
+                           "type":  "backend",
+                           "label":  "Native host",
+                           "sublabel":  "Loopback bridge :8765",
+                           "pos":  [
+                                       880,
+                                       495
+                                   ],
+                           "size":  [
+                                        170,
+                                        76
+                                    ]
+                       },
+                       {
+                           "id":  "worker",
+                           "type":  "backend",
+                           "label":  "Extension worker",
+                           "sublabel":  "Chrome control",
+                           "pos":  [
+                                       610,
+                                       495
+                                   ],
+                           "size":  [
+                                        170,
+                                        76
+                                    ]
+                       },
+                       {
+                           "id":  "tab",
+                           "type":  "external",
+                           "label":  "Active web tab",
+                           "sublabel":  "Website + page content",
+                           "pos":  [
+                                       340,
+                                       495
+                                   ],
+                           "size":  [
+                                        170,
+                                        76
+                                    ]
+                       },
+                       {
+                           "id":  "provider",
+                           "type":  "external",
+                           "label":  "Model provider",
+                           "sublabel":  "Configured endpoint",
+                           "pos":  [
+                                       610,
+                                       35
+                                   ],
+                           "size":  [
+                                        180,
+                                        76
+                                    ]
+                       }
+                   ],
+    "boundaries":  [
+                       {
+                           "kind":  "security-group",
+                           "label":  "Local Python process",
+                           "wraps":  [
+                                         "service",
+                                         "agents",
+                                         "runtime"
+                                     ],
+                           "pad":  22
+                       },
+                       {
+                           "kind":  "security-group",
+                           "label":  "Native Messaging host",
+                           "wraps":  [
+                                         "host"
+                                     ],
+                           "pad":  20
+                       },
+                       {
+                           "kind":  "security-group",
+                           "label":  "Untrusted website",
+                           "wraps":  [
+                                         "tab"
+                                     ],
+                           "pad":  20
+                       },
+                       {
+                           "kind":  "region",
+                           "label":  "External model service",
+                           "wraps":  [
+                                         "provider"
+                                     ],
+                           "pad":  20
+                       }
+                   ],
+    "connections":  [
+                        {
+                            "id":  "panelApi",
+                            "from":  "panel",
+                            "to":  "service",
+                            "label":  "HTTP + SSE",
+                            "variant":  "emphasis"
+                        },
+                        {
+                            "id":  "dispatch",
+                            "from":  "service",
+                            "to":  "agents",
+                            "label":  "task dispatch",
+                            "variant":  "emphasis"
+                        },
+                        {
+                            "id":  "guardedTools",
+                            "from":  "agents",
+                            "to":  "runtime",
+                            "label":  "guarded tools",
+                            "variant":  "emphasis"
+                        },
+                        {
+                            "id":  "bridgeRpc",
+                            "from":  "runtime",
+                            "to":  "host",
+                            "label":  "JSON-RPC :8765",
+                            "variant":  "emphasis",
+                            "fromSide":  "bottom",
+                            "toSide":  "top",
+                            "labelAt":  [
+                                            965,
+                                            345
+                                        ]
+                        },
+                        {
+                            "id":  "nativeMessaging",
+                            "from":  "host",
+                            "to":  "worker",
+                            "label":  "Native Messaging",
+                            "variant":  "emphasis"
+                        },
+                        {
+                            "id":  "browserControl",
+                            "from":  "worker",
+                            "to":  "tab",
+                            "label":  "Chrome APIs",
+                            "variant":  "emphasis"
+                        },
+                        {
+                            "id":  "modelCalls",
+                            "from":  "provider",
+                            "to":  "agents",
+                            "label":  "model calls",
+                            "variant":  "dashed",
+                            "fromSide":  "bottom",
+                            "toSide":  "top",
+                            "labelAt":  [
+                                            700,
+                                            180
+                                        ]
+                        }
+                    ],
+    "cards":  [
+                  {
+                      "dot":  "cyan",
+                      "title":  "Primary path",
+                      "items":  [
+                                    "Side panel tasks reach the orchestrator; the CLI shares it.",
+                                    "Guarded navigator tools verify browser actions."
+                                ]
+                  },
+                  {
+                      "dot":  "emerald",
+                      "title":  "Local state",
+                      "items":  [
+                                    "The UI service stores conversations in local SQLite.",
+                                    "Pairing and bridge tokens stay separate and local."
+                                ]
+                  },
+                  {
+                      "dot":  "rose",
+                      "title":  "Trust boundaries",
+                      "items":  [
+                                    "The loopback API checks extension origin and bearer token.",
+                                    "BrowserRuntime gates bridge calls on policy and approval.",
+                                    "Web content is untrusted; model calls leave the device."
+                                ]
+                  }
+              ]
+}

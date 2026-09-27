@@ -4,9 +4,21 @@ Python browser-control layers that let an LLM-based agent drive Chrome tabs
 through [Browser Agent Bridge](../browser-agent-bridge-main) without exposing
 the bridge's ~150-method raw JSON-RPC surface.
 
+The active runtime pairs a tool-free planner with a browser navigator. A shared
+orchestrator handles tasks from either the Chrome side panel or the CLI, and
+`BrowserRuntime` guards every browser tool call. Start with the
+[project overview](../README.md) or inspect the
+[runtime architecture](../docs/architecture/axis-runtime.html).
+
+| Task in progress | Completed answer |
+| :---: | :---: |
+| <img src="../docs/images/axis-workspace-dark.png" alt="AXIS task running in the dark side panel" width="280"> | <img src="../docs/images/axis-answer.png" alt="AXIS completed answer in the side panel" width="280"> |
+
+*Illustrative screenshots from the local UI fixture.*
+
 ## Browser UI setup
 
-Follow the [UI setup instructions in the main README](../README.md#browser-ui-setup)
+Follow the [setup instructions in the main README](../README.md#get-started)
 for extension installation, service startup and pairing. Once dependencies and
 credentials are configured, start the service from this directory:
 
@@ -29,10 +41,9 @@ uv run python -m axis.cli --help
 uv run python -m axis.cli --debug --max-requests 120 --max-steps 60 --max-actions 120
 ```
 
-The [complete CLI usage reference](../README.md#complete-cli-usage) documents
-every flag, its default, configuration precedence, and runnable examples.
-The [interactive command reference](../README.md#interactive-commands-and-budget-continuation)
-covers `/continue`, `/new`, and `/extend`.
+Use `uv run python -m axis.cli --help` for the current flags and defaults.
+In an interactive process, `/continue` retains task context, `/new` starts
+a fresh task, and `/extend` adds explicit request, step, and action budget.
 
 ## Long research tasks
 
