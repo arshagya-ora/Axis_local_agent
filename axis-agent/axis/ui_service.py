@@ -31,7 +31,7 @@ from axis.ui_runner import Runner
 from axis.ui_store import Store, ServiceError
 
 DATA_DIR = Path(__file__).resolve().parents[1] / '.axis-ui'
-EXTENSION_MANIFEST = Path(__file__).resolve().parents[2] / 'browser-agent-bridge-main' / 'extension' / 'manifest.json'
+EXTENSION_MANIFEST = Path(__file__).resolve().parents[2] / 'browser-agent-bridge' / 'extension' / 'manifest.json'
 
 
 class Input(BaseModel):

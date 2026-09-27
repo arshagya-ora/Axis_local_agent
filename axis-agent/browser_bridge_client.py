@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copied verbatim from browser-agent-bridge-main/scripts/browser_bridge_client.py
+# Copied verbatim from browser-agent-bridge/scripts/browser_bridge_client.py
 # (see that file's git history for upstream changes). Axis Agent's
 # browser_agent_tools.py imports BrowserBridgeClient / BrowserBridgeError /
 # .rpc() from this module unmodified — do not add wrapper logic here; put

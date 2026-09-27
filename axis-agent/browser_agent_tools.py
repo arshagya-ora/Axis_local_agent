@@ -1,7 +1,7 @@
 """Axis Agent browser tool layer.
 
 Wraps the Browser Agent Bridge's ~150-method JSON-RPC surface (see
-``browser-agent-bridge-main/extension/service-worker.js``, the authoritative
+``browser-agent-bridge/extension/service-worker.js``, the authoritative
 method registry) behind eight bounded, LLM-facing semantic tools:
 
     browser_observe          (browser.observe)
@@ -1217,7 +1217,7 @@ class ExternalFirewallScopeProvider(ScopeProvider):
 # Bridge-method mappings
 # =====================================================================
 # Every mapping below was verified line-by-line against
-# browser-agent-bridge-main/extension/service-worker.js (the method
+# browser-agent-bridge/extension/service-worker.js (the method
 # registry) and the relevant extension/sw/*.js handler. See the README for
 # notes on the two corrections made to the brief's suggested fallback list
 # (no non-ref locator.hover exists; check/uncheck's ref path is

@@ -56,7 +56,7 @@ def main():
     parser.add_argument('--output', type=Path, default=AGENT.parent / 'tmp' / 'attachment-feature-check')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    extension = AGENT.parent / 'browser-agent-bridge-main' / 'extension'
+    extension = AGENT.parent / 'browser-agent-bridge' / 'extension'
     identifier, token = extension_id(), secrets.token_urlsafe(32)
     with tempfile.TemporaryDirectory(prefix='attachment-ui-', dir=AGENT.parent / 'tmp') as directory:
         history = Store(Path(directory) / 'history.sqlite3')

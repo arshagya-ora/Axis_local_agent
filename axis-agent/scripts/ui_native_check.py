@@ -23,7 +23,7 @@ def main():
     from playwright.sync_api import sync_playwright
     output=AGENT.parent/'artifacts'/'axis-ui'
     output.mkdir(parents=True,exist_ok=True)
-    extension=AGENT.parent/'browser-agent-bridge-main'/'extension'
+    extension=AGENT.parent/'browser-agent-bridge'/'extension'
     identifier=extension_id()
     report={'checks':[]}
     with socket.socket() as reserve:

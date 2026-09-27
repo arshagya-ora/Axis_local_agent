@@ -2,7 +2,7 @@
 
 This directory owns file ingestion, document reading, hybrid search, and saved
 workflow progress. The extension controls live separately in
-`browser-agent-bridge-main/extension/ui/attachments/`. Integration with the existing
+`browser-agent-bridge/extension/ui/attachments/`. Integration with the existing
 planner, browser executor, and UI service is deliberately small; there is no
 additional agent, database server, or orchestration framework.
 
@@ -159,7 +159,7 @@ From the repository root:
 
 ```powershell
 uv run python -m pytest axis-agent/tests/test_attachments.py -q
-node --test browser-agent-bridge-main/tests/test_ui_attachments.mjs
+node --test browser-agent-bridge/tests/test_ui_attachments.mjs
 ```
 
 The tests cover all parser formats, exact values and original bytes, independent

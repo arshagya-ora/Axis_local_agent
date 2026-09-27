@@ -72,10 +72,10 @@ axis_trace_*.json
 
 # Browser Agent Bridge runtime state: site knowledge the extension writes as
 # it browses, and the generated skill script bundle.
-browser-agent-bridge-main/runtime/site-patterns/*
-!browser-agent-bridge-main/runtime/site-patterns/.gitkeep
-browser-agent-bridge-main/skills/browser-agent-bridge/scripts/
-browser-agent-bridge-main/node_modules/
+browser-agent-bridge/runtime/site-patterns/*
+!browser-agent-bridge/runtime/site-patterns/.gitkeep
+browser-agent-bridge/skills/browser-agent-bridge/scripts/
+browser-agent-bridge/node_modules/
 *.crx
 *.zip
 

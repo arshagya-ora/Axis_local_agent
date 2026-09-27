@@ -8,7 +8,7 @@ in the bridge. Python owns execution, so closing the panel does not stop a task.
 ## Start and pair
 
 1. Follow the existing root README for provider credentials and native-host setup.
-   Reload the unpacked extension from `browser-agent-bridge-main/extension` after
+   Reload the unpacked extension from `browser-agent-bridge/extension` after
    updating this checkout. Its identity and permission declarations are preserved.
 2. From the repository root, run `uv sync`. Start the UI service **instead of** an
    interactive CLI against this runtime:
@@ -231,7 +231,7 @@ From the repository root:
 
 ```powershell
 uv run pytest -q --basetemp tmp/pytest-ui
-node --test browser-agent-bridge-main/tests/*.mjs
+node --test browser-agent-bridge/tests/*.mjs
 uv run python axis-agent/scripts/ui_browser_check.py
 uv run python axis-agent/scripts/ui_native_check.py
 uv run python axis-agent/scripts/ui_fixture_smoke.py

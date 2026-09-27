@@ -1,9 +1,9 @@
 # Axis Agent — Browser Tool Layer
 
-<img src="../browser-agent-bridge-main/extension/icon.svg" alt="AXIS cursor orbit logo" width="56">
+<img src="../browser-agent-bridge/extension/icon.svg" alt="AXIS cursor orbit logo" width="56">
 
 Python browser-control layers that let an LLM-based agent drive Chrome tabs
-through [Browser Agent Bridge](../browser-agent-bridge-main) without exposing
+through [Browser Agent Bridge](../browser-agent-bridge) without exposing
 the bridge's ~150-method raw JSON-RPC surface.
 
 The active runtime pairs a tool-free planner with a browser navigator. A shared

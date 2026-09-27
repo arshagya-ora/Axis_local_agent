@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="browser-agent-bridge-main/extension/icon.svg" alt="AXIS cursor orbit logo" width="88">
+  <img src="browser-agent-bridge/extension/icon.svg" alt="AXIS cursor orbit logo" width="88">
 </p>
 <h1 align="center">AXIS</h1>
 <p align="center"><strong>A browser assistant for the Chrome session you already use</strong></p>
@@ -54,15 +54,15 @@ On macOS or Linux, use `cp axis-agent/.env.example axis-agent/.env`. Fill in `AX
 
 ### 2. Connect the Chrome bridge
 
-1. Open `chrome://extensions`, enable **Developer mode**, and **Load unpacked** from `browser-agent-bridge-main/extension`.
+1. Open `chrome://extensions`, enable **Developer mode**, and **Load unpacked** from `browser-agent-bridge/extension`.
 2. Copy the extension ID shown by Chrome.
 3. Install the native host from the repository root:
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File .\browser-agent-bridge-main\scripts\install-native-host-win.ps1 <extension-id>
+   powershell -ExecutionPolicy Bypass -File .\browser-agent-bridge\scripts\install-native-host-win.ps1 <extension-id>
    ```
 
-   On macOS or Linux, run `./browser-agent-bridge-main/scripts/install-native-host-unix.sh <extension-id>`.
+   On macOS or Linux, run `./browser-agent-bridge/scripts/install-native-host-unix.sh <extension-id>`.
 4. Reload the extension. In **Settings → Connection**, choose **Start bridge** and check that it connects.
 
 ### 3. Run the browser workspace
@@ -107,7 +107,7 @@ Conversation history lives in local SQLite; pairing data, provider settings, and
 | Path | What is inside |
 | --- | --- |
 | [`axis-agent/`](axis-agent/) | Planner, navigator, guarded browser tools, CLI, UI service, and tests |
-| [`browser-agent-bridge-main/`](browser-agent-bridge-main/) | Chrome extension, native messaging host, and bridge tests |
+| [`browser-agent-bridge/`](browser-agent-bridge/) | Chrome extension, native messaging host, and bridge tests |
 | [`axis-agent/axis.yaml`](axis-agent/axis.yaml) | Run limits, browser policy, and feature configuration |
 | [`axis-agent/evals/`](axis-agent/evals/) | Local workflow evaluation harness |
 | [`docs/AXIS_UI.md`](docs/AXIS_UI.md) | Workspace, pairing, attachments, approvals, and continuity |
@@ -116,12 +116,12 @@ Conversation history lives in local SQLite; pairing data, provider settings, and
 
 ```bash
 uv run python -m pytest axis-agent/tests -q
-cd browser-agent-bridge-main
+cd browser-agent-bridge
 node --test tests/*.mjs
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-The Python suite uses local fixtures and does not need Chrome or provider credentials. Component details are in the [agent](axis-agent/README.md), [bridge](browser-agent-bridge-main/README.md), [attachments](axis-agent/axis/attachments/README.md), and [evaluations](axis-agent/evals/README.md) guides.
+The Python suite uses local fixtures and does not need Chrome or provider credentials. Component details are in the [agent](axis-agent/README.md), [bridge](browser-agent-bridge/README.md), [attachments](axis-agent/axis/attachments/README.md), and [evaluations](axis-agent/evals/README.md) guides.
 
 ## Safety and privacy
 

@@ -36,7 +36,7 @@ def main():
     args=parser.parse_args()
     args.output.mkdir(parents=True,exist_ok=True)
     from playwright.sync_api import sync_playwright
-    extension=AGENT.parent/'browser-agent-bridge-main'/'extension'
+    extension=AGENT.parent/'browser-agent-bridge'/'extension'
     identifier=extension_id()
     token=secrets.token_urlsafe(32)
     with tempfile.TemporaryDirectory(prefix='axis-ui-',dir=AGENT.parent/'tmp') as directory:
