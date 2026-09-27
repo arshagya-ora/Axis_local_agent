@@ -1,5 +1,7 @@
 # Axis Agent — Browser Tool Layer
 
+<img src="../browser-agent-bridge-main/extension/icon.svg" alt="AXIS cursor orbit logo" width="56">
+
 Python browser-control layers that let an LLM-based agent drive Chrome tabs
 through [Browser Agent Bridge](../browser-agent-bridge-main) without exposing
 the bridge's ~150-method raw JSON-RPC surface.
@@ -10,9 +12,9 @@ orchestrator handles tasks from either the Chrome side panel or the CLI, and
 [project overview](../README.md) or inspect the
 [runtime architecture](../docs/architecture/axis-runtime.html).
 
-| Task in progress | Completed answer |
+| Approval checkpoint | Completed answer |
 | :---: | :---: |
-| <img src="../docs/images/axis-workspace-dark.png" alt="AXIS task running in the dark side panel" width="280"> | <img src="../docs/images/axis-answer.png" alt="AXIS completed answer in the side panel" width="280"> |
+| <img src="../docs/images/axis-approval.png" alt="AXIS approval prompt for a website change" width="280"> | <img src="../docs/images/axis-answer.png" alt="AXIS completed answer in the side panel" width="280"> |
 
 *Illustrative screenshots from the local UI fixture.*
 

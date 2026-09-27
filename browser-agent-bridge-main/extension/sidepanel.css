@@ -194,29 +194,9 @@ svg {
 .axis-mark {
   width: 25px;
   height: 25px;
-  position: relative;
   display: inline-block;
   flex-shrink: 0;
-}
-.axis-mark:before,
-.axis-mark:after {
-  content: "";
-  position: absolute;
-  background: currentColor;
-  border-radius: 3px;
-  bottom: 1px;
-}
-.axis-mark:before {
-  left: 4px;
-  width: 9px;
-  height: 25px;
-  transform: skew(-24deg);
-}
-.axis-mark:after {
-  right: 1px;
-  width: 9px;
-  height: 13px;
-  transform: skew(24deg);
+  background: url("icon.svg") center / contain no-repeat;
 }
 .icon-button {
   display: inline-flex;

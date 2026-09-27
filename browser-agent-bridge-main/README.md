@@ -1,5 +1,7 @@
 # Browser Agent Bridge
 
+<img src="extension/icon.svg" alt="AXIS cursor orbit logo" width="56">
+
 ### Chrome controls for the local AXIS runtime
 
 This directory contains the Manifest V3 extension and native messaging host that connect AXIS to an **already-open Chrome profile**. The extension provides the AXIS side panel and Settings UI. Its service worker and content scripts carry out the browser operations requested by the guarded Python runtime.
@@ -10,9 +12,9 @@ This directory contains the Manifest V3 extension and native messaging host that
 
 These screenshots use the local UI fixture and contain no live account data.
 
-| Answer and activity | Workspace in dark mode |
+| Answer and activity | Dark appearance |
 | :---: | :---: |
-| <img src="../docs/images/axis-answer.png" alt="Completed answer in the AXIS side panel" width="300"> | <img src="../docs/images/axis-workspace-dark.png" alt="Active task in the dark AXIS workspace" width="300"> |
+| <img src="../docs/images/axis-answer.png" alt="Completed answer in the AXIS side panel" width="300"> | <img src="../docs/images/axis-answer-dark.png" alt="Completed answer in the dark AXIS side panel" width="300"> |
 | **Connection and settings** | **Website change approval** |
 | <img src="../docs/images/axis-settings.png" alt="AXIS connection settings" width="300"> | <img src="../docs/images/axis-approval.png" alt="Action approval prompt in the side panel" width="300"> |
 

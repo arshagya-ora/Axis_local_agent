@@ -1,6 +1,8 @@
-# AXIS
-
-### A browser assistant for the Chrome session you already use
+<p align="center">
+  <img src="browser-agent-bridge-main/extension/icon.svg" alt="AXIS cursor orbit logo" width="88">
+</p>
+<h1 align="center">AXIS</h1>
+<p align="center"><strong>A browser assistant for the Chrome session you already use</strong></p>
 
 AXIS pairs a **planner** with a **navigator**. The planner decides what to do; the navigator observes and operates your open Chrome tabs through the bundled Browser Agent Bridge. A local service powers the side panel, while the CLI offers the same runtime from a terminal.
 
@@ -12,9 +14,9 @@ AXIS pairs a **planner** with a **navigator**. The planner decides what to do; t
 
 The Chrome side panel keeps the task, its progress, and the next action together. These are illustrative captures from the repository's local UI fixture.
 
-| Completed answer | Active workspace | Connection and settings |
+| Completed answer | Dark appearance | Connection and settings |
 | :---: | :---: | :---: |
-| <img src="docs/images/axis-answer.png" alt="AXIS side panel showing a completed answer and task activity" width="260"> | <img src="docs/images/axis-workspace-dark.png" alt="AXIS dark side panel showing an active task and composer" width="260"> | <img src="docs/images/axis-settings.png" alt="AXIS settings showing service and bridge connections" width="260"> |
+| <img src="docs/images/axis-answer.png" alt="AXIS side panel showing a completed answer and task activity" width="260"> | <img src="docs/images/axis-answer-dark.png" alt="AXIS completed answer in dark appearance" width="260"> | <img src="docs/images/axis-settings.png" alt="AXIS settings showing service and bridge connections" width="260"> |
 
 The workspace also supports [action-sized approval prompts](docs/images/axis-approval.png), attachments, conversation history, pause/resume, and light or dark appearance. The [UI guide](docs/AXIS_UI.md) covers these flows in detail.
 
