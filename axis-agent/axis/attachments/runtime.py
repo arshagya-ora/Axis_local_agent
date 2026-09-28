@@ -37,7 +37,13 @@ class DocumentSession(DocumentOverview, DocumentProgress):
             for use in uses:
                 self.store.require(self.task_id, use.attachment_id)
                 if normalized(use.user_evidence) not in normalized(request):
-                    raise ValueError('Attachment use must quote the user request, not document content.')
+                    inferred = self.inferred_uses().get(use.attachment_id)
+                    if inferred and set(use.operations) <= set(inferred['operations']):
+                        # Use the recorded user instruction, never a model quote
+                        # or text from the attachment, as authorization evidence.
+                        use = use.model_copy(update={'user_evidence': inferred['user_evidence'][:1000]})
+                    else:
+                        raise DocumentRestriction('Attachment use is not authorized by the user request. Clarify which file to use and whether it may be read.')
                 if 'execute' in use.operations and not constraints(self.store, self.task_id, use.attachment_id)['execute']:
                     raise ValueError('Following file instructions needs a user request delegating that work.')
                 if 'execute' in use.operations and re.search(r'\b(all|every|entire|complete)\b', request, re.I):
@@ -75,6 +81,8 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         overview = overview_request(messages[-1]) if messages else False
         enumeration = bool(re.search(r'\b(?:all|every)\b.*?\b(?:scenarios?|names?|entries|items|rows|sections?|paragraphs?|pages?|cells)\b', lower, re.S))
         read = overview or summary or enumeration or bool(re.search(r'\b(?:read|inspect|extract)\b', lower))
+        positive_use = re.sub(r"\b(?:do not|don't|never)\s+use\b[^.;\n]*", '', lower)
+        read = read or bool(re.search(r'\buse\b.{0,100}\b(?:attached|attachment|file|document|config(?:uration)?)\b', positive_use))
         upload = bool(re.search(r'\b(?:upload|attach)\b', lower))
         from .scope import requested_range
         uses = {}
@@ -140,6 +148,19 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         for item in catalog:
             item['warnings'] = item['warnings'][:6]
         workflow = self.workflow()
+        procedure_sources = []
+        for identifier, use in self._uses().items():
+            if 'execute' not in use['operations'] or self._reading_restricted(identifier):
+                continue
+            with self.store.history.lock:
+                rows = self.store.history.db.execute('''SELECT s.id,s.location,s.text FROM attachment_sections s
+                    JOIN document_reads r ON r.section_id=s.id AND r.task_id=?
+                    WHERE s.attachment_id=? ORDER BY s.ordinal LIMIT ?''',
+                    (self.task_id, identifier, 24-len(procedure_sources))).fetchall()
+            procedure_sources.extend(dict(section_id=row['id'], attachment_id=identifier,
+                location=row['location'], text=row['text'][:600]) for row in rows)
+            if len(procedure_sources) >= 24:
+                break
         current_source = None
         if self.current_step:
             step = next((x for x in workflow['next_steps'] if x['id'] == self.current_step), None)
@@ -153,6 +174,7 @@ class DocumentSession(DocumentOverview, DocumentProgress):
         return dict(attachments=catalog, uses=self._uses(), coverage=self.coverage(), findings=self.notes(),
                     overviews=[value for value in overviews if value],
                     prior_progress=self.store.history.task(self.task_id).get('prior_progress', []), workflow=workflow,
+                    procedure_sources=procedure_sources,
                     last_result=last_result, current_source=current_source,
                     user_followups=user_messages(self.store, self.task_id)[-5:], instructions=INSTRUCTIONS)
 
@@ -261,12 +283,34 @@ class DocumentSession(DocumentOverview, DocumentProgress):
             if operation == "plan" and not request.steps:
                 raise ValueError("Plan requires source-linked steps with expected results.")
             steps = [dict(section_id=key, instruction=request.reason, expected_result="Not applicable to the requested workflow") for key in request.section_ids] if operation == "skip" else [item.model_dump() for item in request.steps]
+            if operation == 'plan' and steps:
+                source_order = {}
+                for item in steps:
+                    row = history.db.execute('SELECT attachment_id,ordinal FROM attachment_sections WHERE id=?', (item['section_id'],)).fetchone()
+                    if row:
+                        source_order[item['section_id']] = (row['attachment_id'], row['ordinal'])
+                if len({value[0] for value in source_order.values()}) == 1:
+                    # Preserve the order written in a single procedure, while
+                    # retaining the planner's order for multiple actions in one section.
+                    steps.sort(key=lambda item: source_order.get(item['section_id'], ('', 0))[1])
             with history.transaction():
                 ordinal = history.db.execute("SELECT COALESCE(max(ordinal),0) FROM workflow_steps WHERE task_id=?", (self.task_id,)).fetchone()[0]
                 for item in steps:
                     owner = history.db.execute('SELECT attachment_id FROM attachment_sections WHERE id=?', (item['section_id'],)).fetchone()
                     if not owner:
                         raise ValueError('Unknown source section.')
+                    if operation == 'plan' and history.db.execute(
+                        'SELECT 1 FROM workflow_steps WHERE task_id=? AND section_id=? AND instruction=?',
+                        (self.task_id, item['section_id'], item['instruction'])).fetchone():
+                        continue  # An identical retry must not reorder or duplicate a step.
+                    if operation == 'plan':
+                        source_ordinal = history.db.execute('SELECT ordinal FROM attachment_sections WHERE id=?', (item['section_id'],)).fetchone()[0]
+                        later = history.db.execute('''SELECT 1 FROM workflow_steps w
+                            JOIN attachment_sections s ON s.id=w.section_id
+                            WHERE w.task_id=? AND s.attachment_id=? AND s.ordinal>? AND w.status!='skipped' LIMIT 1''',
+                            (self.task_id, owner[0], source_ordinal)).fetchone()
+                        if later:
+                            raise ValueError('Plan procedure steps in source order before executing later sections.')
                     self.store.require(self.task_id, owner[0])
                     self._check_read(owner[0])
                     if not constraints(self.store, self.task_id, owner[0])['execute']:

@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 from axis.ui_store import ServiceError
@@ -30,16 +30,23 @@ def automatic_scope(instruction, detail, operation):
     for name, domain in [('gmail', 'mail.google.com'), ('outlook', 'outlook.live.com')]:
         if name in request:
             named_hosts.add(domain)
-    if not host or host not in named_hosts:
+    application = re.search(r'\b([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,4})\s+GUI\b', instruction)
+    identity = (str(detail.get('application_title') or '') + ' ' + str(detail.get('current_url') or '')).casefold()
+    app_words = application.group(1).split() if application else []
+    while app_words and app_words[0].casefold() in {'from', 'in', 'inside', 'on', 'using', 'the', 'within'}:
+        app_words.pop(0)
+    app_matched = bool(app_words and host and all(word.casefold() in identity for word in app_words))
+    if not host or (host not in named_hosts and not app_matched):
         return False
     observed = detail.get('observed_target') or {}
     for destination in (observed.get('href'), observed.get('formAction')):
-        if destination and urlsplit(destination).hostname not in named_hosts:
+        if destination and urlsplit(urljoin(detail.get('current_url') or '', destination)).hostname not in named_hosts | ({host} if app_matched else set()):
             return False
+    if re.search(r'\b(password|secret|token|api key|credential|billing|payment)\b', target):
+        return False
     for effect, pattern in [('send', r'\bsend\b'), ('delete', r'\bdelete\b|\bremove\b'),
                             ('purchase', r'\bbuy\b|\bpurchase\b|\bcheckout\b')]:
-        if re.search(pattern, target) and (not re.search(pattern, request) or
-                (effect == 'send' and re.search(r'\bdraft\b|\bdo not send\b|\bdon.t send\b', request))):
+        if re.search(pattern, target):
             return False
     if operation in {'press', 'drag', 'type'}:
         return False  # keyboard/coordinate submission needs an explicit review
@@ -50,6 +57,9 @@ def automatic_scope(instruction, detail, operation):
             return False
     if operation == 'upload':
         return bool(re.search(r'\b(upload|attach)\b', request))
+    if app_matched:
+        return operation in {'click', 'dblclick', 'fill', 'check', 'uncheck', 'select'} and bool(
+            re.search(r'\b(open|click|fill|enter|configure|apply|update|create|change|set|select|submit|perform)\b', request))
     if re.search(r'\b(draft|compose|gmail|outlook)\b', request):
         if operation == 'click':
             return bool(re.search(r'\b(compose|new (?:message|mail)|attach|save draft)\b', target))
@@ -139,9 +149,16 @@ class ExecutionApprovals:
             upload_in_scope = operation != 'upload' or (files and all(
                 'upload' in task.get('attachment_uses', {}).get(item['id'], {}).get('operations', [])
                 or runner.attachments.require(task['id'], item['id']) == 'upload' for item in files))
+            tab = getattr(getattr(runner.orchestrator, 'browser', None), 'tabs', {}).get(detail.get('tab'))
+            if tab is not None:
+                detail = {**detail, 'application_title': getattr(tab, 'title', '')}
             if not mandatory and upload_in_scope and task.get('execution_mode', 'automatic') == 'automatic' and automatic_scope(instruction, detail, operation):
                 return True
+            reason = ('Policy requires approval for this action' if mandatory else
+                      'Action is outside Automatic scope' if task.get('execution_mode') == 'automatic' else
+                      'Task is in Approval mode')
             data = {'tool': tool, 'operation': operation, **detail, 'plan_revision': revision,
+                    'approval_reason': reason,
                     'files': files,
                     'task_id': task['id'], 'mode_revision': task.get('mode_revision', 0),
                     'verification': getattr(getattr(runner.orchestrator, 'state', None), 'current_verification', None)}
@@ -153,7 +170,7 @@ class ExecutionApprovals:
             self.store.db.execute('INSERT INTO execution_approvals VALUES (?,?,?,?,?,?,?)',
                                   (identifier, task['id'], fingerprint, encoded, 'pending', None, time.time()))
             task['pending_approval'] = {'id': identifier, 'fingerprint': fingerprint, 'actions': [data]}
-            task['current_activity'] = 'Approval needed before changing the website'
+            task['current_activity'] = f'Approval needed for {operation} on {detail.get("target") or "the website"}'[:200]
             self.store.update_task(task, payload={'text': task['current_activity']})
         # This callback runs in the browser tool worker, not the service/event loop.
         while True:

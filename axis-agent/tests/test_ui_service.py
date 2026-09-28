@@ -221,6 +221,27 @@ def test_control_remains_responsive_during_sync_call_and_stop_discards_followup(
     assert store.accepted(response.json()['message']['client_request_id'])['delivery'] == 'not_applied'
 
 
+def test_followup_interrupts_pending_approval_and_resumes_task(service):
+    from concurrent.futures import ThreadPoolExecutor
+    client, runner, store = service
+    cid = conversation(client)
+    task_id = submit(client, cid).json()['task']['id']
+    wait_for(lambda: runner.orchestrator and runner.orchestrator.state)
+    detail = {'current_url': 'https://example.test/', 'target': 'Settings',
+              'target_type': 'locator', 'tab': 'tab_1', 'arguments': {'command': {'action': 'click'}}}
+    with ThreadPoolExecutor() as pool:
+        approval = pool.submit(runner.approvals.authorize, 'browser_act', 'click', detail)
+        wait_for(lambda: runner.active().get('pending_approval'))
+        response = submit(client, cid, intent='follow_up', task_id=task_id, text='Use the updated setting')
+        assert response.status_code == 202
+        assert approval.result(2) is False
+        wait_for(lambda: runner.orchestrator.continuations == 1)
+        assert not runner.active().get('pending_approval')
+        runner.orchestrator.complete.set()
+        wait_for(lambda: runner.future.done())
+        assert store.accepted(response.json()['message']['client_request_id'])['delivery'] == 'applied'
+
+
 def test_restart_history_replay_paging_search_rename_and_delete(tmp_path):
     path = tmp_path/'history.sqlite3'
     store = Store(path)

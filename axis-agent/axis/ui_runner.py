@@ -359,6 +359,15 @@ class Runner:
                     if self.attachments and getattr(self.orchestrator, 'documents', None):
                         task['workflow'] = self.orchestrator.documents.workflow()
                     task['duration_ms'] = int((time.time()-task['created_at'])*1000)
+                duration = event.detail.get('duration_ms')
+                if isinstance(duration, (int, float)) and duration >= 0:
+                    timings = task.setdefault('timings', {'planner_ms': 0, 'navigator_ms': 0, 'browser_ms': 0})
+                    if event.kind == 'planner_decision':
+                        timings['planner_ms'] += int(duration)
+                    elif event.kind == 'navigator_step':
+                        timings['navigator_ms'] += int(duration)
+                    elif event.kind == 'browser_action':
+                        timings['browser_ms'] += int(duration)
                     browser = state.last_browser_state
                     if browser:
                         task['browser_context'] = {'tab': browser.tab, 'title': (browser.title or 'Browser tab')[:200]}

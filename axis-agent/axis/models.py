@@ -667,9 +667,9 @@ class ProviderOverrides(BaseModel):
 class RunConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    planner_interval_steps: int = Field(default=3, ge=1)
-    planner_max_interval_steps: int = Field(default=6, ge=1)
-    max_actions_per_step: int = Field(default=3, ge=1)
+    planner_interval_steps: int = Field(default=5, ge=1)
+    planner_max_interval_steps: int = Field(default=8, ge=1)
+    max_actions_per_step: int = Field(default=4, ge=1)
     max_total_steps: int = Field(default=30, ge=1)
     document_extra_steps: int = Field(default=30, ge=0, le=120)
     document_extension_steps: int = Field(default=5, ge=1, le=20)

@@ -10,7 +10,7 @@ from pydantic_ai import ModelHTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from axis.attachments.models import DocumentRequest, DocumentNote
+from axis.attachments.models import DocumentRequest, DocumentNote, WorkflowItem
 from axis.attachments.runtime import DocumentSession, DocumentRestriction
 from axis.models import AttachmentUse, AxisConfig, ActionRecord
 from axis.orchestrator import verify_completion
@@ -46,6 +46,25 @@ def workbook(files, cid, task):
     item = ingest(files, cid, 'results.xlsx', output.getvalue())
     link(files, cid, task, item, 'upload')  # old UI metadata cannot restrict it
     return item
+
+
+def test_configuration_scope_uses_user_prompt_and_procedure_order(documents):
+    files, cid, task = documents
+    item = ingest(files, cid, 'config.txt', b'Set timeout to 30.\nThen enable retries.')
+    link(files, cid, task, item)
+    prompt = 'Use attached config.txt to configure CNCC Core GUI.'
+    instruction(files, task, prompt)
+    session = DocumentSession(files, task)
+    session.configure_uses([AttachmentUse(attachment_id=item['id'], operations=['read', 'execute'],
+        user_evidence='Set timeout to 30.', purpose='execute')], prompt)
+    assert session._uses()[item['id']]['user_evidence'] == prompt
+    rows = session.execute(DocumentRequest(operation='read', attachment_id=item['id']))['items']
+    assert len(rows) == 2
+    assert [row['section_id'] for row in DocumentSession(files, task).context()['procedure_sources']] == [row['id'] for row in rows]
+    session.execute(DocumentRequest(operation='plan', steps=[
+        WorkflowItem(section_id=row['id'], instruction=row['text'], expected_result='Applied')
+        for row in reversed(rows)]))
+    assert [step['section_id'] for step in session.workflow()['next_steps']] == [row['id'] for row in rows]
 
 
 def test_exact_reported_prompt_reads_only_requested_cells_without_permission(documents):

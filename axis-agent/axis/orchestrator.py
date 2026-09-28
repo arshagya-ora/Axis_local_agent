@@ -57,6 +57,26 @@ _UNOBSERVABLE_PREFIXES = ("chrome://", "about:")
 # above. Matches the Google flow the project's own smoke test already treats
 # as a first-class target (scripts/browser_foundation_smoke.py).
 _FALLBACK_TAB_URL = "https://www.google.com/webhp?hl=en&pws=0"
+_GUI_ACTION = re.compile(r"\b(open|click|fill|enter|configure|apply|update|create|change|set|select|submit|perform|do)\b", re.I)
+_GUI_TARGET = re.compile(r"\b(?:current|open|this) (?:page|tab|website)\b|\b(?:gui|web app(?:lication)?|website)\b", re.I)
+_NAMED_GUI = re.compile(r"\b([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,4})\s+GUI\b")
+
+
+def gui_action_request(request: str) -> bool:
+    """Explicit page work must not be completed from model knowledge."""
+    if re.match(r'\s*(?:what|why|how|explain|describe|summari[sz]e|review|analy[sz]e)\b', request, re.I):
+        return False
+    return bool(_GUI_ACTION.search(request) and _GUI_TARGET.search(request))
+
+
+def named_gui(request: str) -> str | None:
+    match = _NAMED_GUI.search(request)
+    if not match:
+        return None
+    words = match.group(1).split()
+    while words and words[0].casefold() in {'from', 'in', 'inside', 'on', 'using', 'the', 'within'}:
+        words.pop(0)
+    return ' '.join(words) or None
 
 
 def _unobservable(url: str | None) -> bool:
@@ -320,12 +340,20 @@ class AxisOrchestrator:
     def pause(self) -> None:
         if self.state:
             self.state.status = "paused"
+            gate = getattr(self, '_active_gate', None)
+            if gate is None:
+                self.state.cancellation_token.cancel()
+            else:
+                with gate.lock:
+                    if gate.in_flight is None:
+                        self.state.cancellation_token.cancel()
         else:
             self._prestart_paused = True
 
     def resume(self) -> None:
         self._prestart_paused = False
         if self.state and self.state.status == "paused":
+            self.state.cancellation_token = type(self.state.cancellation_token)()
             self.state.status = "active"
 
     def cancel(self) -> None:
@@ -392,7 +420,8 @@ class AxisOrchestrator:
         try:
             return await self._loop()
         except RunCancelled:
-            return self._result("cancelled", reason="The user cancelled the run.")
+            return self._result("paused" if self.state and self.state.status == "paused" else "cancelled",
+                reason="The run is paused; state is preserved." if self.state and self.state.status == "paused" else "The user cancelled the run.")
         finally:
             self._close_telemetry()
 
@@ -411,7 +440,8 @@ class AxisOrchestrator:
         try:
             return await self._loop()
         except RunCancelled:
-            return self._result("cancelled", reason="The user cancelled the run.")
+            return self._result("paused" if self.state and self.state.status == "paused" else "cancelled",
+                reason="The run is paused; state is preserved." if self.state and self.state.status == "paused" else "The user cancelled the run.")
         finally:
             self._close_telemetry()
 
@@ -464,7 +494,8 @@ class AxisOrchestrator:
                 self._reconcile_bound_tab()
             return await self._loop()
         except RunCancelled:
-            return self._result("cancelled", reason="The user cancelled the run.")
+            return self._result("paused" if self.state and self.state.status == "paused" else "cancelled",
+                reason="The run is paused; state is preserved." if self.state and self.state.status == "paused" else "The user cancelled the run.")
         finally:
             self._close_telemetry()
 
@@ -687,6 +718,16 @@ class AxisOrchestrator:
                 plan = await self._plan()
             except _Stop as stopped:
                 return stopped.result
+
+            request = state.follow_ups[-1] if state.follow_ups else state.original_request
+            if gui_action_request(request) and plan.decision == 'complete' and not any(
+                action.success and action.tool in {'browser_act', 'browser_navigate', 'browser_visual'}
+                for action in state.actions):
+                routing_error = 'This request requires work in the named browser application. Select a matching tab and perform the action before answering.'
+                if state.last_error == routing_error:
+                    return self._result('failed', reason=routing_error, recoverable=True)
+                state.last_error = routing_error
+                continue
 
             state.counters.planner_passes += 1
             state.counters.navigator_steps_since_plan = 0
@@ -1008,6 +1049,8 @@ class AxisOrchestrator:
                 state.document_synthesis_only = True
             context['document_synthesis_only'] = state.document_synthesis_only
         context['execution_mode'] = getattr(self, 'execution_mode', 'automatic')
+        context['browser_action_required'] = gui_action_request(context['current_request'])
+        context['requested_application'] = named_gui(context['current_request'])
         if self.tab is not None and self.tab in self.browser.tabs:
             context["browser"] = {
                 "tab": self.tab,
@@ -1120,6 +1163,7 @@ class AxisOrchestrator:
             prompt += '\n' + format_as_xml(self.documents.context(), root_tag='task_documents')
         model_prompt = [prompt, self.browser.visual_content(state.screenshot)] if state.screenshot else prompt
         started = time.monotonic()
+        self._active_gate = gate
         try:
             try:
                 outcome = await self._run_agent(self.navigator, model_prompt, deps=deps)
@@ -1133,12 +1177,14 @@ class AxisOrchestrator:
                 self._emit("status", phase="vision_unavailable", reason=task.last_error)
                 outcome = await self._run_agent(self.navigator, prompt + "\n" + task.last_error, deps=deps)
         except BaseException:
+            self._active_gate = None
             task.browser_ms += gate.browser_ms
             task.tool_model_ms += gate.browser_ms
             task.step_ms = int((time.monotonic() - started) * 1000)
             self._commit_gate(gate)
             raise
         task.browser_ms += gate.browser_ms
+        self._active_gate = None
         task.tool_model_ms += gate.browser_ms
         task.step_ms = int((time.monotonic() - started) * 1000)
         return outcome, gate
@@ -1175,7 +1221,8 @@ class AxisOrchestrator:
             transient = status in {429, 500, 502, 503, 504}
             raise _Stop(self._result("failed", reason=reason, recoverable=transient and self.documents is not None)) from exc
         except RunCancelled:
-            state.status = "cancelled"
+            if state.status != "paused":
+                state.status = "cancelled"
             raise
         finally:
             state.model_ms += int((time.monotonic() - started) * 1000)
@@ -1285,7 +1332,8 @@ class AxisOrchestrator:
         assert state is not None
         ctx = browser_context(self.browser)
         tabs = self._reconcile_bound_tab()
-        if self.tab is not None:
+        application = named_gui(self._current_request()) if gui_action_request(self._current_request()) else None
+        if self.tab is not None and not application:
             cached = self.browser.tabs.get(self.tab)
             if cached is not None and not cached.closed and not _unobservable(cached.url):
                 return self.tab
@@ -1294,9 +1342,18 @@ class AxisOrchestrator:
             return next((t["tab"] for t in candidates if not _unobservable(t.get("url"))), None)
 
         chosen = None
+        if application:
+            words = [part.casefold() for part in application.split()]
+            matches = [item for item in tabs if not _unobservable(item.get('url')) and
+                       all(word in ((item.get('title') or '') + ' ' + (item.get('url') or '')).casefold() for word in words)]
+            if len(matches) == 1:
+                chosen = matches[0]['tab']
+            elif len(matches) != 1:
+                raise _Stop(self._result('needs_user', answer=f'Which controlled tab should I use for {application} GUI?',
+                    reason=f'Found {len(matches)} matching controlled tabs for {application} GUI.'))
         if self.config.browser.initial_tab == "focused":
             active = [t for t in tabs if t.get("active")]
-            chosen = observable(active) or (active[0]["tab"] if active else None)
+            chosen = chosen or observable(active) or (active[0]["tab"] if active else None)
         if chosen is None:
             chosen = observable(tabs) or (tabs[0]["tab"] if tabs else None)
         needs_new_tab = chosen is None or (

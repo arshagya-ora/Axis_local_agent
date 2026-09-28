@@ -109,7 +109,7 @@ class AttachmentStore:
     def accept(self, conversation_id, filename, staged: Path, size):
         filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
         if not filename or len(filename) > 180 or any(ord(c) < 32 for c in filename) or Path(filename).suffix.lower() not in ACCEPTED:
-            raise ServiceError("invalid_file", "Choose PDF, DOCX, PPTX, XLSX, MD, TXT, CSV, or a legacy Office file.", 422)
+            raise ServiceError("invalid_file", "Choose PDF, DOCX, PPTX, XLSX, MD, TXT, CSV, JSON, or a legacy Office file.", 422)
         # Store under a generated name; preserve a safe original basename for website uploads.
         filename = re.sub(r'[<>:"|?*]', "_", filename).rstrip(" .")
         if re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", filename):

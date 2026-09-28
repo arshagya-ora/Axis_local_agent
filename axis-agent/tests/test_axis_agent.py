@@ -7,6 +7,8 @@ executor rather than model behaviour.
 
 import json
 import sys
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -171,6 +173,46 @@ OBSERVE = ("browser_observe", {"tab": "tab_1"})
 # ---------------------------------------------------------------------------
 # 1-4: planner cadence
 # ---------------------------------------------------------------------------
+
+async def test_named_gui_request_requires_matching_controlled_tab():
+    script = Script([browse('Configure the CNCC timeout')])
+    orchestrator, bridge, _ = make(script)
+    result = await orchestrator.run('From CNCC Core GUI, configure the timeout.')
+    assert result.status == 'needs_user'
+    assert 'CNCC Core GUI' in result.reason
+    assert bridge.methods[-1] == 'tabs.list'
+    assert 'page.accessibilityTree' not in bridge.methods
+
+
+def test_pause_cancels_model_wait_but_preserves_inflight_browser_action():
+    orchestrator, _, config = make(Script([done()]))
+    orchestrator.state = config.new_memory('Inspect a page')
+    first = orchestrator.state.cancellation_token
+    orchestrator.pause()
+    assert first.cancelled
+    orchestrator.resume()
+    assert orchestrator.state.status == 'active'
+    assert orchestrator.state.cancellation_token is not first
+    gate = SimpleNamespace(lock=threading.RLock(), in_flight=('browser_act', {}, 0))
+    orchestrator._active_gate = gate
+    second = orchestrator.state.cancellation_token
+    orchestrator.pause()
+    assert not second.cancelled
+
+
+async def test_named_gui_request_uses_matching_tab_without_active_tab_phrase():
+    script = Script([browse('Inspect CNCC settings')], [{'outcome': {'status': 'ask_user', 'reason': 'Need a value'}}])
+    bridge = FakeBridge()
+    bridge.title = 'CNCC Core - Settings'
+    bridge.url = 'https://cncc.example/settings'
+    config = AxisConfig.load()
+    config.run.max_total_steps = 1
+    orchestrator, bridge, _ = make(script, bridge=bridge, config=config)
+    result = await orchestrator.run('From CNCC Core GUI, configure the timeout.')
+    assert 'page.accessibilityTree' in bridge.methods
+    assert 'tabs.create' not in bridge.methods
+    assert result.status == 'limit_reached'
+
 
 async def test_non_browser_question_completes_without_touching_the_browser():
     script = Script([done("Paris.")])

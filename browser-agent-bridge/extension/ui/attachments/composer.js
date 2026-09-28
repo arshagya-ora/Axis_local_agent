@@ -19,7 +19,7 @@ export function mountAttachments(root, api, state, { save, error, changed, focus
   const picker = el("input");
   picker.type = "file";
   picker.multiple = true;
-  picker.accept = ".pdf,.docx,.pptx,.xlsx,.md,.txt,.csv,.doc,.ppt,.xls";
+  picker.accept = ".pdf,.docx,.pptx,.xlsx,.md,.txt,.csv,.json,.doc,.ppt,.xls";
   picker.hidden = true;
   const add = button("Attach files", () => picker.click(), "attachment", "icon-button attachment-add");
   add.title = "Attach files";

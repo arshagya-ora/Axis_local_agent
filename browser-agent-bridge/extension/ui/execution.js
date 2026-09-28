@@ -10,6 +10,7 @@ export function renderExecutionApproval(root, task, api, onError) {
   card.append(el("h2", "", "Approve website change"), el("p", "", task.title));
   for (const action of pending.actions) {
     card.append(el("p", "", `${action.operation} · ${action.current_url || action.origin || "Destination not established"}`));
+    if (action.approval_reason) card.append(el("p", "metadata", action.approval_reason));
     if (action.target) card.append(el("p", "", `Target: ${action.target}`));
     const details = el("details");
     details.append(el("summary", "", "Review exact change and verification"));

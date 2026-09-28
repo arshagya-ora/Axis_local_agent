@@ -8,6 +8,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from axis.execution import automatic_scope
+from axis.orchestrator import gui_action_request, named_gui
+from axis.attachments.parsing import parse
 from axis.models import AttachmentRef, AttachmentUse
 from axis.attachments.models import DocumentRequest
 from axis.attachments.runtime import DocumentSession
@@ -64,6 +66,33 @@ def test_automatic_scope_does_not_invent_recipients_or_send_drafts():
     assert not automatic_scope('Prepare a Gmail draft', {**detail(), 'target_type': None}, 'click')
     assert not automatic_scope('Prepare a Gmail draft', detail('Settings'), 'click')
     assert not automatic_scope('Prepare a Gmail draft', detail('Account password', 'fill'), 'fill')
+
+
+def test_named_gui_action_routes_and_is_scoped_to_matching_tab():
+    request = 'From CNCC Core GUI, configure the timeout.'
+    assert gui_action_request(request)
+    assert named_gui(request) == 'CNCC Core'
+    action = {**detail('Timeout', 'fill'), 'current_url': 'https://cncc.example/settings',
+              'application_title': 'CNCC Core - Settings'}
+    assert automatic_scope(request, action, 'fill')
+    assert not automatic_scope(request, {**action, 'application_title': 'Other application'}, 'fill')
+    assert not automatic_scope(request, {**action, 'target': 'API key'}, 'fill')
+    assert automatic_scope(request, {**action, 'observed_target': {'href': '/settings/advanced'}}, 'click')
+    assert not automatic_scope(request, {**action, 'observed_target': {'href': 'https://other.example/'}}, 'click')
+    assert not gui_action_request('Explain how to configure CNCC Core GUI.')
+
+
+def test_json_attachment_parser_limits(tmp_path):
+    good = tmp_path / 'config.json'
+    good.write_text('{"timeout":30,"flags":[true,false]}', encoding='utf-8')
+    sections, warnings = parse(good)
+    assert not warnings and any('timeout' in row['location'] and row['text'] == '30' for row in sections)
+    good.write_text('{oops}', encoding='utf-8')
+    with pytest.raises(ValueError, match='malformed'):
+        parse(good)
+    good.write_text('[' * 34 + '0' + ']' * 34, encoding='utf-8')
+    with pytest.raises(ValueError, match='nesting'):
+        parse(good)
 
 
 def test_automatic_mode_and_draft_only_send_guard(service):

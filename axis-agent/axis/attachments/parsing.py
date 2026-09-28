@@ -16,7 +16,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_TEXT = 8_000_000
 MAX_SECTIONS = 20_000
 SECTION_CHARS = 1200  # Embedding input is split again by the actual tokenizer.
-READABLE = {".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".pdf"}
+READABLE = {".txt", ".md", ".csv", ".json", ".xlsx", ".docx", ".pptx", ".pdf"}
 ACCEPTED = READABLE | {".doc", ".ppt", ".xls"}
 
 
@@ -70,7 +70,24 @@ def parse(path: Path) -> tuple[list[dict], list[str]]:
             sections.append(dict(location=location + (f" [characters {start + 1}:{min(len(text), start + SECTION_CHARS)}]" if len(text) > SECTION_CHARS else ""),
                                  text=text[start:start + SECTION_CHARS], sheet=sheet, row_number=row, cells=cells if start == 0 else None))
 
-    if suffix in {".txt", ".md"}:
+    if suffix == ".json":
+        try:
+            document = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (ValueError, UnicodeError, RecursionError) as error:
+            raise ValueError("JSON file is malformed or is not UTF-8 encoded.") from error
+        def walk(value, location, depth=0):
+            if depth > 32:
+                raise ValueError("JSON nesting exceeds 32 levels.")
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    walk(child, f"{location}.{key}", depth + 1)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    walk(child, f"{location}[{index}]", depth + 1)
+            else:
+                add(location, json.dumps(value, ensure_ascii=False))
+        walk(document, "$")
+    elif suffix in {".txt", ".md"}:
         text = path.read_bytes().decode("utf-8-sig")
         heading = ""
         for index, line in enumerate(text.splitlines(), 1):
