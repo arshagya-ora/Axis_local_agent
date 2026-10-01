@@ -1,0 +1,449 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { test } from 'node:test';
+
+async function importDevtoolsModule() {
+  const networkSource = await readFile(new URL('../extension/sw/network-interceptors.js', import.meta.url), 'utf8');
+  const devtoolsSource = await readFile(new URL('../extension/sw/devtools.js', import.meta.url), 'utf8');
+  const source = [
+    networkSource.replaceAll('export ', ''),
+    devtoolsSource.replace("import { fetchPatternsForRules, harEntriesToRules } from './network-interceptors.js';\n\n", '')
+  ].join('\n');
+  const dataUrl = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
+  return import(dataUrl);
+}
+
+async function makeHandlers() {
+  const { createDevtoolsHandlers } = await importDevtoolsModule();
+  const calls = [];
+  let attachCount = 0;
+  const fetchInterceptorsByTab = new Map();
+  const interceptorStatusCalls = [];
+  const clearInterceptorCalls = [];
+  const interceptorEventsCalls = [];
+  const clearInterceptorEventsCalls = [];
+  const handlers = createDevtoolsHandlers({
+    assertTabId(value) {
+      if (!Number.isInteger(value)) throw new Error('bad tabId');
+      return value;
+    },
+    async assertTabAllowed() {},
+    async attachDebugger() {
+      attachCount += 1;
+    },
+    async cdp(tabId, method, params) {
+      calls.push({ tabId, method, params });
+      return {};
+    },
+    consoleEventsByTab: new Map(),
+    networkEventsByTab: new Map(),
+    fetchInterceptorsByTab,
+    interceptorStatus(tabId) {
+      interceptorStatusCalls.push(tabId);
+      return { tabId, rules: fetchInterceptorsByTab.get(tabId) || [] };
+    },
+    async clearInterceptors(tabId) {
+      clearInterceptorCalls.push(tabId);
+      fetchInterceptorsByTab.delete(tabId);
+      return { ok: true, tabId, rulesCount: 0 };
+    },
+    interceptorEvents(tabId, options) {
+      interceptorEventsCalls.push({ tabId, options });
+      return { tabId, events: [{ ruleId: 'rule-1' }] };
+    },
+    clearInterceptorEvents(tabId) {
+      clearInterceptorEventsCalls.push(tabId);
+      return { ok: true, tabId, eventsCount: 0 };
+    }
+  });
+  return {
+    handlers,
+    calls,
+    clearInterceptorCalls,
+    clearInterceptorEventsCalls,
+    interceptorEventsCalls,
+    interceptorStatusCalls,
+    fetchInterceptorsByTab,
+    get attachCount() {
+      return attachCount;
+    }
+  };
+}
+
+test('network.setInterceptors enables Fetch only for configured URL patterns', async () => {
+  const context = await makeHandlers();
+
+  const result = await context.handlers.networkSetInterceptors({
+    tabId: 7,
+    rules: [
+      {
+        urlPattern: '*api.example.test/user*',
+        action: 'mock',
+        method: 'get',
+        resourceType: 'XHR',
+        times: 1,
+        responseHeaders: { 'Content-Type': 'application/json' },
+        responseBody: '{"ok":true}'
+      },
+      {
+        urlPattern: '*cdn.example.test/*',
+        action: 'modifyHeaders',
+        methods: ['post', 'PUT'],
+        resourceTypes: ['Script', 'Fetch'],
+        requestHeaders: { 'X-Test': 123, Authorization: null }
+      },
+      {
+        urlPattern: '*api.example.test/user*',
+        action: 'block'
+      },
+      {
+        id: 'regex-api',
+        urlRegex: '^https://api\\.example\\.test/v\\d+/items/\\d+$',
+        action: 'block',
+        postDataRegex: '"operationName"\\s*:\\s*"GetItem"',
+        headerContains: { Authorization: 'Bearer ' },
+        headerRegex: { 'X-Tenant': '^tenant-\\d+$' },
+        resourceType: 'Fetch'
+      }
+    ]
+  });
+
+  assert.deepEqual(result, { ok: true, rulesCount: 4 });
+  assert.equal(context.attachCount, 1);
+  assert.equal(context.fetchInterceptorsByTab.get(7).length, 4);
+  assert.deepEqual(context.calls, [
+    {
+      tabId: 7,
+      method: 'Fetch.enable',
+      params: {
+        patterns: [
+          { urlPattern: '*api.example.test/user*', requestStage: 'Request', resourceType: 'XHR' },
+          { urlPattern: '*cdn.example.test/*', requestStage: 'Request', resourceType: 'Script' },
+          { urlPattern: '*cdn.example.test/*', requestStage: 'Request', resourceType: 'Fetch' },
+          { urlPattern: '*api.example.test/user*', requestStage: 'Request' },
+          { urlPattern: '*', requestStage: 'Request', resourceType: 'Fetch' }
+        ]
+      }
+    }
+  ]);
+  assert.deepEqual(context.fetchInterceptorsByTab.get(7)[0].methods, ['GET']);
+  assert.equal(context.fetchInterceptorsByTab.get(7)[0].times, 1);
+  assert.deepEqual(context.fetchInterceptorsByTab.get(7)[1].requestHeaders, { 'X-Test': '123', Authorization: null });
+  assert.deepEqual(context.fetchInterceptorsByTab.get(7)[1].methods, ['POST', 'PUT']);
+  assert.equal(context.fetchInterceptorsByTab.get(7)[3].urlRegex, '^https://api\\.example\\.test/v\\d+/items/\\d+$');
+  assert.equal(context.fetchInterceptorsByTab.get(7)[3].postDataRegex, '"operationName"\\s*:\\s*"GetItem"');
+  assert.deepEqual(context.fetchInterceptorsByTab.get(7)[3].headerContains, { Authorization: 'Bearer ' });
+  assert.deepEqual(context.fetchInterceptorsByTab.get(7)[3].headerRegex, { 'X-Tenant': '^tenant-\\d+$' });
+});
+
+test('network.setInterceptors rejects invalid rules before attaching debugger', async () => {
+  const context = await makeHandlers();
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ action: 'mock', responseCode: 700 }]
+    }),
+    /urlPattern or urlRegex/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlRegex: '[', action: 'block' }]
+    }),
+    /urlRegex/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlPattern: '*api*', postDataRegex: '[', action: 'block' }]
+    }),
+    /postDataRegex/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlPattern: '*api*', headerRegex: { 'X-Test': '[' }, action: 'block' }]
+    }),
+    /headerRegex/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlPattern: '*asset*', action: 'mock', responseBodyBase64: 'not base64!' }]
+    }),
+    /responseBodyBase64/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlPattern: '*asset*', action: 'mock', responseBody: 'text', responseBodyBase64: 'dGV4dA==' }]
+    }),
+    /responseBody or responseBodyBase64/
+  );
+
+  assert.equal(context.attachCount, 0);
+  assert.equal(context.calls.length, 0);
+  assert.equal(context.fetchInterceptorsByTab.has(7), false);
+});
+
+test('network.setInterceptors validates method and resourceType filters', async () => {
+  const context = await makeHandlers();
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlPattern: '*api*', action: 'block', methods: ['GET', ''] }]
+    }),
+    /method\[1\]/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlPattern: '*api*', action: 'block', resourceTypes: [] }]
+    }),
+    /resourceType/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [{ urlPattern: '*api*', action: 'block', times: 0 }]
+    }),
+    /times/
+  );
+
+  await assert.rejects(
+    context.handlers.networkSetInterceptors({
+      tabId: 7,
+      rules: [
+        { id: 'dup', urlPattern: '*one*', action: 'block' },
+        { id: 'dup', urlPattern: '*two*', action: 'block' }
+      ]
+    }),
+    /unique/
+  );
+
+  assert.equal(context.attachCount, 0);
+  assert.equal(context.calls.length, 0);
+});
+
+test('network.setInterceptors clears Fetch interception when rules are empty', async () => {
+  const context = await makeHandlers();
+  context.fetchInterceptorsByTab.set(7, [{ urlPattern: '*', action: 'block' }]);
+
+  const result = await context.handlers.networkSetInterceptors({ tabId: 7, rules: [] });
+
+  assert.deepEqual(result, { ok: true, rulesCount: 0 });
+  assert.equal(context.fetchInterceptorsByTab.has(7), false);
+  assert.deepEqual(context.calls, [{ tabId: 7, method: 'Fetch.disable', params: undefined }]);
+});
+
+test('network.setBlockedUrls validates URL pattern inputs', async () => {
+  const context = await makeHandlers();
+
+  await assert.rejects(
+    context.handlers.networkSetBlockedUrls({ tabId: 7, urls: ['*ok*', ''] }),
+    /urls\[1\]/
+  );
+
+  assert.equal(context.attachCount, 0);
+  assert.equal(context.calls.length, 0);
+});
+
+test('network.interceptors.status returns current interceptor state', async () => {
+  const context = await makeHandlers();
+  context.fetchInterceptorsByTab.set(7, [{ urlPattern: '*api*', action: 'mock', times: 2 }]);
+
+  const result = await context.handlers.networkInterceptorsStatus({ tabId: 7 });
+
+  assert.deepEqual(context.interceptorStatusCalls, [7]);
+  assert.deepEqual(result, { tabId: 7, rules: [{ urlPattern: '*api*', action: 'mock', times: 2 }] });
+  assert.equal(context.attachCount, 0);
+  assert.equal(context.calls.length, 0);
+});
+
+test('network.interceptors.clear removes current interceptor state', async () => {
+  const context = await makeHandlers();
+  context.fetchInterceptorsByTab.set(7, [{ urlPattern: '*api*', action: 'mock', times: 2 }]);
+
+  const result = await context.handlers.networkInterceptorsClear({ tabId: 7 });
+
+  assert.deepEqual(context.clearInterceptorCalls, [7]);
+  assert.deepEqual(result, { ok: true, tabId: 7, rulesCount: 0 });
+  assert.equal(context.fetchInterceptorsByTab.has(7), false);
+  assert.equal(context.attachCount, 0);
+  assert.equal(context.calls.length, 0);
+});
+
+test('network.interceptors.events returns recent match events', async () => {
+  const context = await makeHandlers();
+
+  const result = await context.handlers.networkInterceptorsEvents({ tabId: 7, limit: 5 });
+
+  assert.deepEqual(context.interceptorEventsCalls, [{ tabId: 7, options: { limit: 5 } }]);
+  assert.deepEqual(result, { tabId: 7, events: [{ ruleId: 'rule-1' }] });
+  assert.equal(context.attachCount, 0);
+  assert.equal(context.calls.length, 0);
+});
+
+test('network.interceptors.events normalizes filters', async () => {
+  const context = await makeHandlers();
+
+  await context.handlers.networkInterceptorsEvents({
+    tabId: 7,
+    limit: 999,
+    ruleId: 'route-1',
+    action: 'mock',
+    method: 'post',
+    urlContains: '/api/',
+    since: 123
+  });
+
+  assert.deepEqual(context.interceptorEventsCalls, [{
+    tabId: 7,
+    options: {
+      limit: 500,
+      ruleId: 'route-1',
+      action: 'mock',
+      method: 'POST',
+      urlContains: '/api/',
+      since: 123
+    }
+  }]);
+});
+
+test('network.interceptors.clearEvents clears recent match events', async () => {
+  const context = await makeHandlers();
+
+  const result = await context.handlers.networkInterceptorsClearEvents({ tabId: 7 });
+
+  assert.deepEqual(context.clearInterceptorEventsCalls, [7]);
+  assert.deepEqual(result, { ok: true, tabId: 7, eventsCount: 0 });
+  assert.equal(context.attachCount, 0);
+  assert.equal(context.calls.length, 0);
+});
+
+test('network.routeFromHAR installs mock rules and enables Fetch', async () => {
+  const { handlers, calls, fetchInterceptorsByTab } = await makeHandlers();
+  const har = {
+    log: {
+      entries: [
+        {
+          request: { method: 'GET', url: 'https://api.example.test/items' },
+          response: { status: 200, headers: [{ name: 'Content-Type', value: 'application/json' }], content: { text: '{"items":[]}' } }
+        }
+      ]
+    }
+  };
+
+  const result = await handlers.networkRouteFromHAR({ tabId: 9, har });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.rulesCount, 1);
+  assert.equal(result.entriesRouted, 1);
+  assert.equal(result.notFound, 'fallback');
+  assert.equal(fetchInterceptorsByTab.get(9).length, 1);
+  assert.equal(fetchInterceptorsByTab.get(9)[0].action, 'mock');
+  const enable = calls.find(call => call.method === 'Fetch.enable');
+  assert.ok(enable, 'expected Fetch.enable');
+  assert.ok(enable.params.patterns.some(pattern => pattern.urlPattern === 'https://api.example.test/items'));
+});
+
+test('network.routeFromHAR with an empty archive disables Fetch', async () => {
+  const { handlers, calls, fetchInterceptorsByTab } = await makeHandlers();
+  const result = await handlers.networkRouteFromHAR({ tabId: 9, har: { log: { entries: [] } } });
+  assert.equal(result.rulesCount, 0);
+  assert.equal(fetchInterceptorsByTab.has(9), false);
+  assert.ok(calls.some(call => call.method === 'Fetch.disable'));
+});
+test('cookies.get redacts values by default and includes metadata', async () => {
+  const { createDevtoolsHandlers } = await importDevtoolsModule();
+  const handlers = createDevtoolsHandlers({
+    assertTabId: (v) => v,
+    assertTabAllowed: async () => {},
+    attachDebugger: async () => {},
+    cdp: async (tabId, method) => method === 'Network.getCookies'
+      ? { cookies: [{ name: 'sid', value: 'super-secret-token', domain: '.x.com', path: '/', httpOnly: true, secure: true, sameSite: 'Lax', size: 25, session: true }] }
+      : {},
+    consoleEventsByTab: new Map(),
+    networkEventsByTab: new Map(),
+    fetchInterceptorsByTab: new Map()
+  });
+
+  const res = await handlers.cookiesGet({ tabId: 9 });
+  assert.equal(res.count, 1);
+  assert.equal(res.valuesIncluded, false);
+  const c = res.cookies[0];
+  assert.equal(c.name, 'sid');
+  assert.equal(c.value, undefined);            // value redacted by default
+  assert.equal(c.valueLength, 'super-secret-token'.length);
+  assert.equal(c.httpOnly, true);
+  assert.equal(c.domain, '.x.com');
+});
+
+test('cookies.get returns values only with includeValues:true and filters by name', async () => {
+  const { createDevtoolsHandlers } = await importDevtoolsModule();
+  const cookies = [
+    { name: 'sid', value: 'tok', domain: '.x.com', path: '/' },
+    { name: 'theme', value: 'dark', domain: '.x.com', path: '/' }
+  ];
+  const handlers = createDevtoolsHandlers({
+    assertTabId: (v) => v,
+    assertTabAllowed: async () => {},
+    attachDebugger: async () => {},
+    cdp: async (tabId, method) => method === 'Network.getCookies' ? { cookies } : {},
+    consoleEventsByTab: new Map(),
+    networkEventsByTab: new Map(),
+    fetchInterceptorsByTab: new Map()
+  });
+
+  const res = await handlers.cookiesGet({ tabId: 9, includeValues: true, name: 'sid' });
+  assert.equal(res.count, 1);
+  assert.equal(res.valuesIncluded, true);
+  assert.equal(res.cookies[0].name, 'sid');
+  assert.equal(res.cookies[0].value, 'tok');
+});
+
+test('network.getResponseBody forwards the CDP body and base64 flag', async () => {
+  const { createDevtoolsHandlers } = await importDevtoolsModule();
+  const calls = [];
+  const handlers = createDevtoolsHandlers({
+    assertTabId: (v) => v,
+    assertTabAllowed: async () => {},
+    attachDebugger: async () => {},
+    cdp: async (tabId, method, params) => {
+      calls.push({ method, params });
+      return method === 'Network.getResponseBody' ? { body: '{"x":1}', base64Encoded: false } : {};
+    },
+    consoleEventsByTab: new Map(),
+    networkEventsByTab: new Map(),
+    fetchInterceptorsByTab: new Map()
+  });
+
+  const res = await handlers.networkGetResponseBody({ tabId: 7, requestId: 'req-1' });
+  assert.equal(res.requestId, 'req-1');
+  assert.equal(res.base64Encoded, false);
+  assert.equal(res.body, '{"x":1}');
+  assert.equal(calls.find(c => c.method === 'Network.getResponseBody').params.requestId, 'req-1');
+});
+
+test('network.getResponseBody requires a requestId', async () => {
+  const { createDevtoolsHandlers } = await importDevtoolsModule();
+  const handlers = createDevtoolsHandlers({
+    assertTabId: (v) => v,
+    assertTabAllowed: async () => {},
+    attachDebugger: async () => {},
+    cdp: async () => ({}),
+    consoleEventsByTab: new Map(),
+    networkEventsByTab: new Map(),
+    fetchInterceptorsByTab: new Map()
+  });
+  await assert.rejects(handlers.networkGetResponseBody({ tabId: 7 }), /requestId/);
+});

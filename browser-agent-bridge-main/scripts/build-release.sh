@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+VERSION="$(jq -r '.version' "$ROOT_DIR/extension/manifest.json")"
+RELEASE_NAME="browser-agent-bridge-$VERSION"
+DIST_DIR="$ROOT_DIR/dist"
+RELEASE_DIR="$DIST_DIR/$RELEASE_NAME"
+LEGACY_ZIP_PATH="$DIST_DIR/browser-agent-bridge-$VERSION.zip"
+
+mkdir -p "$DIST_DIR"
+rm -f "$LEGACY_ZIP_PATH"
+rm -rf "$RELEASE_DIR"
+mkdir -p "$RELEASE_DIR"
+
+mkdir -p \
+  "$RELEASE_DIR/extension" \
+  "$RELEASE_DIR/native" \
+  "$RELEASE_DIR/runtime" \
+  "$RELEASE_DIR/scripts" \
+  "$RELEASE_DIR/docs" \
+  "$RELEASE_DIR/skills"
+
+cp -R "$ROOT_DIR/extension/." "$RELEASE_DIR/extension/"
+cp "$ROOT_DIR/native/host.py" "$RELEASE_DIR/native/"
+cp "$ROOT_DIR/native/host-wrapper.sh" "$RELEASE_DIR/native/"
+cp "$ROOT_DIR/native/host-wrapper.win.bat" "$RELEASE_DIR/native/"
+cp "$ROOT_DIR/native/com.local.browser_agent_bridge.json" "$RELEASE_DIR/native/"
+cp -R "$ROOT_DIR/runtime/site-patterns" "$RELEASE_DIR/runtime/"
+cp "$ROOT_DIR/scripts/install-native-host-unix.sh" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/scripts/install-native-host-macos.sh" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/scripts/install-native-host-win.ps1" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/scripts/rpc.sh" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/scripts/sync-skill-scripts.sh" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/scripts/ws-rpc.js" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/scripts/browser_bridge_client.py" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/scripts/doctor.py" "$RELEASE_DIR/scripts/"
+cp "$ROOT_DIR/README.md" "$RELEASE_DIR/"
+cp "$ROOT_DIR/README.zh-CN.md" "$RELEASE_DIR/"
+cp "$ROOT_DIR/docs/protocol.md" "$RELEASE_DIR/docs/"
+# The skill's scripts/ runtime clients are generated (gitignored); inject them
+# before bundling the skill so the release carries a usable portable skill.
+bash "$ROOT_DIR/scripts/sync-skill-scripts.sh"
+cp -R "$ROOT_DIR/skills/browser-agent-bridge" "$RELEASE_DIR/skills/"
+find "$RELEASE_DIR" -name '.DS_Store' -type f -delete
+find "$RELEASE_DIR/extension" -name '_metadata' -type d -prune -exec rm -rf {} +
+find "$RELEASE_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+cat > "$RELEASE_DIR/release.json" <<EOF
+{
+  "name": "browser-agent-bridge",
+  "version": "$VERSION",
+  "extensionDir": "extension",
+  "nativeHost": "native/host.py",
+  "installers": {
+    "macos": "scripts/install-native-host-unix.sh",
+    "linux": "scripts/install-native-host-unix.sh",
+    "windows": "scripts/install-native-host-win.ps1"
+  },
+  "doctor": "scripts/doctor.py",
+  "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+echo "$RELEASE_DIR"

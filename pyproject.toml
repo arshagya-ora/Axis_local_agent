@@ -1,0 +1,30 @@
+[project]
+name = "axis-agent"
+version = "0.1.0"
+description = "Axis: a typed Pydantic AI browser agent with whole-browser multi-tab control of the Browser Agent Bridge."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx==0.28.1",
+    "oci-openai==1.1.0",
+    "oci==2.185.1",
+    "openai==3.8.0",
+    "pydantic==2.13.5",
+    "pydantic-ai-slim[openai]==2.40.0",
+    "pyyaml==6.0.3",
+    "starlette>=1.6.0",
+    "uvicorn>=0.52.4",
+    "pypdf>=6.18,<7",
+    "python-docx>=1.2,<2",
+    "openpyxl>=3.1.5,<4",
+    "python-pptx>=1.0.2,<2",
+    "numpy>=2.2,<3",
+    "fastembed==0.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.62.0",
+    "pydantic-evals==2.40.0",
+    "pytest==8.4.2",
+]
